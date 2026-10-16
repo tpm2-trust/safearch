@@ -56,17 +56,12 @@ if /usr/lib/systemd/systemd-networkd-wait-online --any --timeout="$WAIT_ONLINE";
 else
 	msg "no link reported as online, trying anyway"
 fi
-# curl needs a resolver if a URL uses a host name. systemd-resolved is not in
-# the initrd, so take the DNS servers from networkd's DHCP leases. Best effort:
-# with an IP address in the URL (recommended) none of this is needed.
-if [ ! -s /etc/resolv.conf ]; then
-	# Can be a dangling symlink to systemd-resolved's stub; replace it.
-	rm -f /etc/resolv.conf
-	for dns in $(sed -n 's/^DNS=//p' /run/systemd/netif/leases/* 2>/dev/null | tr ' ' '\n'); do
-		echo "nameserver $dns" >>/etc/resolv.conf
-	done
-	[ -s /etc/resolv.conf ] && msg "resolver: $(tr '\n' ' ' </etc/resolv.conf)"
-fi
+# A host name in the URL needs no setup here: the initrd resolves it through
+# nss-resolve, which systemd-networkd answers over its resolve-hook socket
+# (enabled in mkosi's initrd) using the DNS servers from the DHCP lease. There
+# is no systemd-resolved in the initrd and no /etc/resolv.conf to write. If the
+# DHCP answer carries no usable DNS server, curl below says "Could not resolve
+# host" -- an IP address in the URL avoids the question entirely.
 
 # --- download and open ------------------------------------------------------
 

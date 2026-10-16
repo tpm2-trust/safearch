@@ -88,7 +88,7 @@ if [[ $VARIANT == network ]]; then
 		[[ $url == http://* || $url == https://* ]] || die "netboot URL must start with http:// or https://: $url"
 		host=${url#*//}; host=${host%%/*}; host=${host%%:*}
 		[[ $host =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || $host =~ ^\[ ]] ||
-			log "note: $host is a host name; the initrd resolves it from the DHCP lease (an IP address needs no DNS)"
+			log "note: $host is a host name; the initrd resolves it with the DNS servers from the DHCP lease, so that answer has to carry a resolver that knows it (an IP address needs no DNS at all)"
 		NETROOT+=("${url%/}/$VERSION/")
 		EXTRA+=(--kernel-command-line="safespace.netroot=${url%/}/$VERSION/")
 	done

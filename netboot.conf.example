@@ -8,10 +8,12 @@
 #   -> safespace.netroot=http://10.0.0.1/safespace/20261016-1830/
 #      and the initrd fetches .../20261016-1830/root.img and root.verity
 #
-# An IP address needs no DNS in the initrd; a host name is resolved from the
-# DHCP lease, which works but is one more thing that has to be right.
-# Several URLs (space separated) are tried in order, for a second server:
-#   NETROOT_URL="http://10.0.0.1/safespace/ http://10.0.0.2/safespace/"
+# An IP address needs no DNS at all. A host name works too: the initrd resolves
+# it with the DNS servers from its DHCP lease (see NETBOOT.md, "A host name
+# instead of an IP address").
+# Several URLs (space separated) are tried in order, which is also how to have
+# a name with an address as fallback:
+#   NETROOT_URL="http://boot.example.internal/safespace/ http://10.0.0.1/safespace/"
 # The URLs are part of the signed kernel command line; changing them means
 # rebuilding the image.
 NETROOT_URL=http://10.0.0.1/safespace/

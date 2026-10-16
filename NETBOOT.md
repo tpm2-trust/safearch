@@ -500,6 +500,36 @@ Notes:
 - Rotating keys means: `sudo ./secureboot-export.sh`, rebuild, publish, and re-seal the
   machines (the enrollment files carry a newer timestamp, so they replace the old ones).
 
+## A host name instead of an IP address
+
+Both URLs can be host names, and they are resolved by different parties:
+
+| URL | Who resolves it | What it needs |
+|---|---|---|
+| the boot file in the DHCP answer (option 67) | the **firmware** | a DNS server in the DHCP answer that the firmware's own resolver can use. It works on most firmware, but it is one more thing that can fail before anything of yours runs — an IP address here is the safest choice |
+| `safespace.netroot=` inside the UKI | the **initrd** | the same DNS servers from the initrd's own DHCP lease |
+
+In the initrd there is no systemd-resolved and no `/etc/resolv.conf` to fill in: curl resolves
+through nss-resolve, which **systemd-networkd** answers over its resolve-hook socket with the
+DNS servers from the DHCP lease. That path is part of mkosi's initrd and was verified in the
+QEMU lab (a name resolved and fetched over HTTP from inside the initrd). So a name works as
+soon as the DHCP answer carries a resolver that knows it, and `netroot` logs curl's own
+`Could not resolve host …` if it does not.
+
+A name is worth it when the server may move, because the URL is signed into the UKI and
+otherwise means a rebuild. Two practical notes:
+
+- Use a name you control in your own zone (`boot.example.internal`), not one that depends on
+  a search domain — the initrd resolves exactly the string in the URL.
+- `NETROOT_URL` takes several URLs, tried in order, so you can have both and let the name be
+  the first choice and a fixed address the fallback:
+
+  ```sh
+  NETROOT_URL="http://boot.example.internal/safespace/ http://10.0.0.1/safespace/"
+  ```
+
+  A failed lookup then costs a few seconds before the second URL is used, and nothing else.
+
 ## Rebuilding and rolling out a new image
 
 Everything that changes the image — packages, users, `mkosi.extra/`, a new package
@@ -636,8 +666,10 @@ already signed by the build; `sbctl sign` is only for systemd-boot itself.)
 - The URL is part of the signed command line: **moving the server means rebuilding**
   (or keeping the old address reachable). Use an address you can keep, and give a second
   URL in `NETROOT_URL` if you want a fallback server.
-- DNS in the initrd is best effort (taken from the DHCP lease, there is no
-  systemd-resolved). An IP address in the URL avoids the question.
+- Host names in the URLs are resolved with the DNS servers from the DHCP answer (in the
+  initrd through systemd-networkd, see
+  [A host name instead of an IP address](#a-host-name-instead-of-an-ip-address)); an IP
+  address needs no DNS at all.
 - The download is ~2 GiB per machine and boot. Over a 1 Gbit/s link that is ~20 s, over
   100 Mbit/s ~3 min. Many machines booting at once need the bandwidth on the server.
 - TFTP for the UKI is a fallback, not a plan: ~100 MiB over TFTP takes minutes.
