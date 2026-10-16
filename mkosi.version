@@ -1,0 +1,3 @@
+#!/bin/sh
+# ImageVersion = build timestamp, so every build gets its own output file.
+date +%Y%m%d-%H%M

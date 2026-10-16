@@ -1,0 +1,135 @@
+#!/bin/sh
+# Runs in mkosi's default initrd (bash as sh, coreutils, sed, kmod), started
+# by usb-bootdev.service, only with usbcore.authorized_default=0. The partition
+# to wait for is taken from, in this order: rd.usbroot=<PARTUUID>,
+# root=PARTUUID=..., roothash= (dm-verity: the root data partition's UUID is
+# the first 128 bits of the root hash), or the EFI variable LoaderDevicePartUUID
+# (the ESP the UKI was started from, set by systemd-stub).
+#
+# 1. Interfaces start unauthorized on every controller, so authorizing a device
+#    only configures it; no driver binds until we authorize an interface.
+# 2. Authorize all devices, but only hub (09) and mass-storage (08) interfaces.
+#    A HID interface on a "storage" stick (BadUSB) never gets a driver.
+#    The kernel does not probe drivers for an interface that becomes
+#    authorized later, so every authorized interface is passed to
+#    /sys/bus/usb/drivers_probe explicitly.
+# 3. Once the root partition exists, revoke every USB device that is not an
+#    ancestor of it. If root is not on USB at all, every USB device is revoked.
+#    The boot disk is then set read-only (blockdev --setro), so nothing can
+#    write to the stick, not even root.
+# 4. Restore interface_authorized_default=1 so devices that usbguard later
+#    allows work normally; new devices are still denied at device level.
+#
+# Progress goes to the kernel log, so it shows on the console and in
+# `journalctl -b -g usb-bootdev` after boot.
+
+U=/sys/bus/usb/devices
+TIMEOUT=30
+
+msg() { echo "usb-bootdev: $*" >/dev/kmsg; }
+
+cmdline=$(cat /proc/cmdline)
+arg() { printf '%s\n' "$cmdline" | tr ' ' '\n' | sed -n "s/^$1=//p" | tail -n 1; }
+
+partuuid=$(arg rd.usbroot)
+[ -n "$partuuid" ] || partuuid=$(arg root | sed -n 's/^PARTUUID=//p')
+if [ -z "$partuuid" ]; then
+	roothash=$(arg roothash)
+	if [ ${#roothash} -ge 32 ]; then
+		h=$(printf '%s' "$roothash" | cut -c1-32)
+		partuuid=$(printf '%s' "$h" | sed 's/^\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)$/\1-\2-\3-\4-\5/')
+	fi
+fi
+if [ -z "$partuuid" ]; then
+	# efivarfs: 4 bytes attributes, then the UUID as UTF-16LE.
+	var=/sys/firmware/efi/efivars/LoaderDevicePartUUID-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+	[ -r "$var" ] && partuuid=$(tail -c +5 "$var" | tr -d '\000')
+fi
+# by-partuuid links are lowercase.
+partuuid=$(printf '%s' "$partuuid" | tr 'A-F' 'a-f')
+[ -n "$partuuid" ] || { msg "cannot tell which partition to wait for, nothing to do"; exit 0; }
+part=/dev/disk/by-partuuid/$partuuid
+
+# udev loads these on the interface uevent anyway; loading them up front means
+# the explicit probe below finds the driver already registered.
+modprobe -a usb_storage uas 2>/dev/null
+
+describe() { # sysfs device dir
+	printf '%s %s:%s %s' "${1##*/}" "$(cat "$1/idVendor" 2>/dev/null)" \
+		"$(cat "$1/idProduct" 2>/dev/null)" "$(cat "$1/product" 2>/dev/null)"
+}
+
+authorize_pass() {
+	for hc in "$U"/usb*; do
+		[ -e "$hc/interface_authorized_default" ] && echo 0 >"$hc/interface_authorized_default"
+	done
+	for d in "$U"/*; do
+		case ${d##*/} in usb* | *:*) continue ;; esac
+		if [ "$(cat "$d/authorized" 2>/dev/null)" = 0 ]; then
+			echo 1 >"$d/authorized" && msg "configured $(describe "$d")"
+		fi
+	done
+	udevadm settle -t 5
+	probe=""
+	for i in "$U"/*:*; do
+		[ "$(cat "$i/authorized" 2>/dev/null)" = 0 ] || continue
+		case $(cat "$i/bInterfaceClass" 2>/dev/null) in
+			08 | 09)
+				echo 1 >"$i/authorized" && probe="$probe ${i##*/}"
+				;;
+		esac
+	done
+	# All needed interfaces first, then probe (Documentation/usb/authorization.rst).
+	for i in $probe; do
+		echo "$i" >/sys/bus/usb/drivers_probe 2>/dev/null
+		drv=$(readlink "$U/$i/driver" 2>/dev/null)
+		msg "authorized interface $i class $(cat "$U/$i/bInterfaceClass") driver ${drv##*/}"
+	done
+	udevadm settle -t 5
+}
+
+msg "waiting up to ${TIMEOUT}s for root partition $partuuid"
+n=0
+while [ ! -e "$part" ] && [ $n -lt $TIMEOUT ]; do
+	authorize_pass
+	[ -e "$part" ] && break
+	sleep 1
+	n=$((n + 1))
+done
+# One final pass picks up controllers that came up late.
+authorize_pass
+
+if [ -e "$part" ]; then
+	rootsys=$(readlink -f "/sys/class/block/$(basename "$(readlink -f "$part")")")
+	msg "root partition is $(readlink -f "$part") ($rootsys)"
+	# The stick is never written to: mark the whole boot disk and all its
+	# partitions read-only at block level, before anything opens them.
+	disk=$(basename "$(dirname "$rootsys")")
+	for dev in "$disk" $(cd "/sys/block/$disk" && ls -d "$disk"* 2>/dev/null); do
+		blockdev --setro "/dev/$dev" && msg "read-only: /dev/$dev"
+	done
+else
+	msg "root partition $partuuid NOT found after ${TIMEOUT}s, revoking all USB devices"
+	for d in "$U"/*; do
+		case ${d##*/} in usb* | *:*) continue ;; esac
+		msg "  seen: $(describe "$d") authorized=$(cat "$d/authorized")"
+	done
+	for i in "$U"/*:*; do
+		msg "  interface ${i##*/} class $(cat "$i/bInterfaceClass") authorized=$(cat "$i/authorized") driver $(basename "$(readlink "$i/driver" 2>/dev/null)" 2>/dev/null)"
+	done
+	rootsys=/nonexistent
+fi
+
+for d in "$U"/*; do
+	case ${d##*/} in usb* | *:*) continue ;; esac
+	[ -e "$d/authorized" ] || continue
+	case $rootsys in
+		"$(readlink -f "$d")"/*) msg "keeping $(describe "$d")" ;;
+		*) echo 0 >"$d/authorized" 2>/dev/null && msg "revoked $(describe "$d")" ;;
+	esac
+done
+
+for hc in "$U"/usb*; do
+	[ -e "$hc/interface_authorized_default" ] && echo 1 >"$hc/interface_authorized_default"
+done
+exit 0

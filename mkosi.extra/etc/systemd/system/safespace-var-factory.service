@@ -1,0 +1,17 @@
+# /var is an empty tmpfs (systemd.volatile=state). Fill it from the verified
+# copy in the read-only root before anything else uses /var.
+[Unit]
+Description=Populate volatile /var from /usr/share/factory/var
+DefaultDependencies=no
+RequiresMountsFor=/var
+Before=local-fs.target systemd-tmpfiles-setup.service systemd-journal-flush.service
+Conflicts=shutdown.target
+ConditionDirectoryNotEmpty=/usr/share/factory/var
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/cp -a --update=none /usr/share/factory/var/. /var/
+
+[Install]
+WantedBy=local-fs.target

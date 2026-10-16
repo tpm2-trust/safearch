@@ -1,0 +1,16 @@
+# Enabled by the initrd.target.wants symlink next to this file, not by an
+# [Install] section: the default initrd applies presets with "disable *".
+[Unit]
+Description=Authorize the USB path to the root partition
+DefaultDependencies=no
+ConditionKernelCommandLine=usbcore.authorized_default=0
+After=systemd-udev-trigger.service systemd-udevd.service
+Wants=systemd-udev-trigger.service
+Before=initrd-root-device.target cryptsetup-pre.target sysroot.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The script gives up after ~30s; never block the boot longer than this.
+TimeoutStartSec=90s
+ExecStart=/usr/local/lib/safespace/usb-bootdev

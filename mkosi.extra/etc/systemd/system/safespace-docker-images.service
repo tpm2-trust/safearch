@@ -1,0 +1,15 @@
+# Loads the images shipped on the (verified) stick into Docker's storage on
+# the data disk, whenever Docker starts.
+[Unit]
+Description=Load Docker images shipped on the stick
+Requires=docker.service
+After=docker.service
+ConditionDirectoryNotEmpty=/usr/share/safespace/docker-images
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/safespace/load-docker-images
+
+[Install]
+WantedBy=docker.service

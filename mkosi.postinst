@@ -1,0 +1,110 @@
+#!/bin/bash
+# mkosi post-installation script. Runs on the host with the image at
+# $BUILDROOT, after packages and mkosi.extra/ are in place and before mkosi
+# applies presets, runs locale-gen and builds the UKI.
+set -euo pipefail
+
+# shellcheck source=safespace.env
+source "$SRCDIR/safespace.env"
+log() { echo "safespace: $*"; }
+die() { echo "safespace: ERROR: $*" >&2; exit 1; }
+
+# --- users from users.conf ("username:ssh-public-key", one key per line) --------
+
+[[ -f $SRCDIR/users.conf ]] || die "users.conf missing: cp users.conf.example users.conf and add your ssh keys"
+declare -A KEYS=()
+USERS=()
+while IFS= read -r line; do
+	[[ $line =~ ^[[:space:]]*(#|$) ]] && continue
+	user=${line%%:*}
+	key=${line#*:}
+	[[ $line == *:* && $user =~ ^[a-z_][a-z0-9_-]*$ ]] || die "users.conf: bad line: $line"
+	[[ $key =~ ^(ssh-|ecdsa-|sk-) ]] || die "users.conf: '$user' has no valid ssh public key"
+	[[ -v KEYS[$user] ]] || USERS+=("$user")
+	KEYS[$user]+="$key"$'\n'
+done <"$SRCDIR/users.conf"
+((${#USERS[@]})) || die "users.conf defines no users"
+
+# Root (and with it /etc and /home) is read-only (dm-verity), so home
+# directories live on the writable /var partition: /home -> /var/home,
+# /root -> /var/roothome (as on Fedora Atomic).
+for link in home:var/home root:var/roothome; do
+	dir=$BUILDROOT/${link%%:*}
+	target=${link#*:}
+	if [[ ! -L $dir ]]; then
+		install -d "$BUILDROOT/$target"
+		[[ -d $dir ]] && cp -a "$dir/." "$BUILDROOT/$target/" && rm -rf "$dir"
+		ln -s "$target" "$dir"
+	fi
+done
+chmod 0700 "$BUILDROOT/var/roothome"
+
+# Groups such as docker come from sysusers.d; make sure they exist now.
+mkosi-chroot systemd-sysusers
+mkosi-chroot passwd -q -l root
+# ssh keys live in the verified /etc (AuthorizedKeysFile in
+# sshd_config.d/10-safespace.conf), not in the writable home directories.
+install -d -m 0755 "$BUILDROOT/etc/ssh/authorized_keys"
+for user in "${USERS[@]}"; do
+	log "creating user $user"
+	mkosi-chroot useradd -m -G "$USER_GROUPS" -s /bin/bash "$user"
+	# '*' = no password at all. Not '!' (locked): sshd refuses locked
+	# accounts even for key logins.
+	mkosi-chroot usermod -p '*' "$user"
+	printf '%s' "${KEYS[$user]}" >"$BUILDROOT/etc/ssh/authorized_keys/$user"
+	mkosi-chroot chown root:root "/etc/ssh/authorized_keys/$user"
+	chmod 0644 "$BUILDROOT/etc/ssh/authorized_keys/$user"
+done
+
+# --- sudo ----------------------------------------------------------------------
+
+mkosi-chroot chown -R root:root /etc/sudoers.d
+chmod 0750 "$BUILDROOT/etc/sudoers.d"
+chmod 0440 "$BUILDROOT/etc/sudoers.d/"*
+mkosi-chroot visudo -c -q || die "sudoers config is invalid"
+
+# --- usbguard: deny every new USB device ----------------------------------------
+# Devices present at boot keep the state the initrd left them in (only the
+# boot stick's storage interface).
+
+set_conf() { # file key value
+	if grep -qE "^#?$2=" "$1"; then
+		sed -i -E "s|^#?$2=.*|$2=$3|" "$1"
+	else
+		echo "$2=$3" >>"$1"
+	fi
+}
+conf=$BUILDROOT/etc/usbguard/usbguard-daemon.conf
+set_conf "$conf" AuthorizedDefault none
+set_conf "$conf" ImplicitPolicyTarget block
+set_conf "$conf" PresentDevicePolicy keep
+set_conf "$conf" PresentControllerPolicy keep
+set_conf "$conf" InsertedDevicePolicy apply-policy
+set_conf "$conf" IPCAllowedGroups wheel
+[[ -f $BUILDROOT/etc/usbguard/rules.conf ]] || install -m 600 /dev/null "$BUILDROOT/etc/usbguard/rules.conf"
+chmod 600 "$BUILDROOT/etc/usbguard/rules.conf"
+
+# --- VNC desktop -----------------------------------------------------------------
+
+VNC_USER=${VNC_USER:-${USERS[0]}}
+[[ -v KEYS[$VNC_USER] ]] || die "VNC_USER '$VNC_USER' is not defined in users.conf"
+generated=0
+if [[ -z ${VNC_PASSWORD:-} ]]; then
+	VNC_PASSWORD=$(mkosi-chroot openssl rand -base64 6)
+	generated=1
+fi
+log "VNC desktop for $VNC_USER on :$VNC_DISPLAY"
+vnc_dir=/home/$VNC_USER/.config/tigervnc
+install -d -m 700 "$BUILDROOT$vnc_dir"
+printf '%s\n' "$VNC_PASSWORD" | mkosi-chroot vncpasswd -f >"$BUILDROOT$vnc_dir/passwd"
+chmod 600 "$BUILDROOT$vnc_dir/passwd"
+mkosi-chroot chown -R "$VNC_USER:$VNC_USER" "/home/$VNC_USER/.config"
+echo ":$VNC_DISPLAY=$VNC_USER" >"$BUILDROOT/etc/tigervnc/vncserver.users"
+if ((generated)); then
+	# Files in $OUTPUTDIR end up in mkosi.output/.
+	(umask 077; printf '%s\n' "$VNC_PASSWORD" >"$OUTPUTDIR/${IMAGE_ID}_${IMAGE_VERSION}.vnc-password")
+	log "generated VNC password: mkosi.output/${IMAGE_ID}_${IMAGE_VERSION}.vnc-password"
+fi
+
+# Mount points in the read-only root (see /etc/fstab).
+install -d "$BUILDROOT/efi" "$BUILDROOT/var" "$BUILDROOT/opt/docker"

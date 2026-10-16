@@ -1,0 +1,6 @@
+# Docker uses its classic overlay2 store (see /etc/docker/daemon.json), so
+# images live under /opt/docker/engine. containerd's own state goes to the
+# data disk as well, never to the read-only root or the tmpfs /var.
+version = 3
+root = "/opt/docker/containerd"
+state = "/run/containerd"

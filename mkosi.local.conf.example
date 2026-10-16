@@ -1,0 +1,10 @@
+# Host-specific settings. Copy to mkosi.local.conf (ignored by git) on the
+# build host and adjust; mkosi merges it with mkosi.conf.
+#
+# Most of the build time goes into compressing the erofs root (zstd level 12).
+# mkfs.erofs uses 4 threads by default; set this to the host's core count
+# (nproc). --workers=0 does NOT mean "all cores", it means single-threaded.
+# Image and initrd compression (zstd -T0) already use all cores.
+
+[Build]
+Environment=SYSTEMD_REPART_MKFS_OPTIONS_EROFS=--workers=32

@@ -1,0 +1,5 @@
+# Docker images shipped on the stick. One per line:
+#   <local name:tag>  <source reference>
+# Pin the source by digest so a rebuild ships exactly the same image:
+#   myapp:1.0  docker.io/library/nginx@sha256:<digest>
+# Then run ./fetch-images.sh before `sudo mkosi build`.

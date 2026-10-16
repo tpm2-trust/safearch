@@ -1,0 +1,3 @@
+# Enforced for every vncserver session. VNC traffic is unencrypted and its
+# password weak, so only accept connections via an ssh tunnel.
+localhost

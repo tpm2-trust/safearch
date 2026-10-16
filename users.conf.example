@@ -1,0 +1,7 @@
+# Users created in the image: username:ssh-public-key
+# Copy to users.conf (not tracked by git) and put in your keys.
+# One key per line; repeat the username to give a user several keys.
+# Users get no password: login is via ssh key only, sudo is passwordless.
+#
+# alice:ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... alice@laptop
+# alice:sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5... alice@yubikey

@@ -1,0 +1,2 @@
+# mkosi runs locale-gen when this file has an active entry.
+en_US.UTF-8 UTF-8

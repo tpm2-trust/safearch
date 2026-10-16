@@ -1,0 +1,19 @@
+#!/bin/bash
+# Last step before the UKI and the disk image are generated.
+set -euo pipefail
+
+# systemd-resolved's stub resolver (left to the end so nothing overwrites it).
+ln -sf ../run/systemd/resolve/stub-resolv.conf "$BUILDROOT/etc/resolv.conf"
+
+# /var is a tmpfs at runtime (systemd.volatile=state). Move everything built
+# into /var (homes, pacman database, package state) to the verified factory
+# copy in /usr; safespace-var-factory.service copies it into the tmpfs on
+# every boot. Caches and logs are dropped.
+factory=$BUILDROOT/usr/share/factory/var
+rm -rf "$factory"
+install -d "$factory"
+rm -rf "$BUILDROOT"/var/cache/* "$BUILDROOT"/var/log/* "$BUILDROOT"/var/tmp/* \
+	"$BUILDROOT"/var/lib/pacman/sync
+cp -a "$BUILDROOT/var/." "$factory/"
+find "$BUILDROOT/var" -mindepth 1 -delete
+echo "safespace: /var moved to /usr/share/factory/var ($(du -sh "$factory" | cut -f1))"

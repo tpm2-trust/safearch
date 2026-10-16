@@ -1,0 +1,44 @@
+#!/bin/bash
+# Runs after the outputs exist in $OUTPUTDIR, before they move to mkosi.output/.
+set -euo pipefail
+
+# Firmware loads the whole UKI into memory over its own (slow) USB driver; a
+# few hundred MiB fails or stalls on many machines.
+limit_mib=100
+for uki in "$OUTPUTDIR"/*.efi; do
+	[[ -e $uki ]] || continue
+	bytes=$(stat -c %s "$uki")
+	echo "safespace: UKI $(basename "$uki"): $((bytes / 1048576)) MiB"
+	((bytes <= limit_mib * 1048576)) || { echo "safespace: ERROR: UKI larger than $limit_mib MiB" >&2; exit 1; }
+done
+
+# The keys shipped for safespace-seal must be the ones the UKI is signed with,
+# or a machine sealed from this stick refuses to boot it.
+keys=$SRCDIR/mkosi.extra/usr/share/safespace/secureboot
+if [[ ! -f $keys/db.pem ]]; then
+	echo "safespace: no Secure Boot keys in the image (safespace-seal disabled; run secureboot-export.sh)"
+	exit 0
+fi
+for uki in "$OUTPUTDIR"/*.efi; do
+	[[ -e $uki ]] || continue
+	signer=$(python3 -I - "$uki" <<-'EOF' | openssl pkcs7 -inform DER -print_certs | openssl x509 -noout -fingerprint -sha256
+		import struct, sys
+		d = open(sys.argv[1], 'rb').read()
+		opt = struct.unpack_from('<I', d, 0x3c)[0] + 24
+		dd = opt + (112 if struct.unpack_from('<H', d, opt)[0] == 0x20b else 96)
+		off, size = struct.unpack_from('<II', d, dd + 32)
+		if not size: sys.exit('UKI is not signed')
+		length = struct.unpack_from('<I', d, off)[0]
+		sys.stdout.buffer.write(d[off + 8:off + length])
+	EOF
+	)
+	shipped=$(openssl x509 -in "$keys/db.pem" -noout -fingerprint -sha256)
+	if [[ $signer != "$shipped" ]]; then
+		echo "safespace: ERROR: UKI is signed by a different key than the db.pem shipped for safespace-seal" >&2
+		echo "  UKI:     $signer" >&2
+		echo "  shipped: $shipped" >&2
+		echo "  Rerun secureboot-export.sh with the keys of SecureBootKey=, then rebuild." >&2
+		exit 1
+	fi
+	echo "safespace: UKI signed by the shipped db key (safespace-seal can enroll it)"
+done

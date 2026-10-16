@@ -1,0 +1,13 @@
+# Replaces Arch's sshdgenkeys.service, which writes to the read-only /etc/ssh.
+[Unit]
+Description=Generate SSH host keys in /var
+Before=sshd.service
+RequiresMountsFor=/var/lib
+ConditionPathExists=!/var/lib/sshd/etc/ssh/ssh_host_ed25519_key
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/install -d -m 0755 /var/lib/sshd/etc/ssh
+# -f: prefix for the key paths, so the keys land in /var/lib/sshd/etc/ssh/.
+ExecStart=/usr/bin/ssh-keygen -A -f /var/lib/sshd

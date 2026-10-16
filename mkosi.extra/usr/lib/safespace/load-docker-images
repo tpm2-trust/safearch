@@ -1,0 +1,18 @@
+#!/bin/bash
+# Load the image archives from /usr/share/safespace/docker-images (part of the
+# dm-verity protected root) into Docker, unless an image with exactly the
+# expected ID is already there. images.list is written by fetch-images.sh:
+#   <archive>.tar <image-id> <reference>
+set -euo pipefail
+dir=/usr/share/safespace/docker-images
+while read -r archive id ref; do
+	[[ -z $archive || $archive == \#* ]] && continue
+	if [[ $(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null || true) == "$id" ]]; then
+		echo "$ref: present ($id)"
+		continue
+	fi
+	echo "$ref: loading $archive"
+	docker load --quiet --input "$dir/$archive"
+	got=$(docker image inspect --format '{{.Id}}' "$ref")
+	[[ $got == "$id" ]] || { echo "$ref: loaded ID $got, expected $id" >&2; exit 1; }
+done <"$dir/images.list"

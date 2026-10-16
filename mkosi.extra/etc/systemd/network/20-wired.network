@@ -1,0 +1,8 @@
+# DHCP on physical ethernet ports only. Kind=!* skips virtual links such as
+# docker's veth pairs, which are also Type=ether.
+[Match]
+Kind=!*
+Type=ether
+
+[Network]
+DHCP=yes

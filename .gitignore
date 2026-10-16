@@ -1,0 +1,31 @@
+# Build outputs (mkosi.output/) and, from builds without OutputDirectory=,
+# outputs in the project root.
+mkosi.output/
+/initrd
+/initrd.cpio.zst
+/*.raw
+/*.raw.zst
+/*.efi
+/*.roothash
+/*.manifest
+/*.vnc-password
+/safespace-arch_*
+
+# Caches and mkosi's generated keys/tools.
+mkosi.cache/
+mkosi.pkgcache/
+mkosi.tools/
+mkosi.workspace/
+mkosi.key
+mkosi.crt
+
+# Per-host and per-user settings.
+mkosi.local.conf
+users.conf
+
+# Generated into the image tree by fetch-images.sh and secureboot-export.sh.
+mkosi.extra/usr/share/safespace/docker-images/
+mkosi.extra/usr/share/safespace/secureboot/
+
+# Test builds, VM disks, hwtest-image.sh output.
+mkosi.test/

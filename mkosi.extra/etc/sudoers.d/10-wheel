@@ -1,0 +1,2 @@
+# Users have no passwords (ssh keys only), so sudo cannot ask for one.
+%wheel ALL=(ALL:ALL) NOPASSWD: ALL

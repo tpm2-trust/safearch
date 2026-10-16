@@ -1,0 +1,4 @@
+# Defaults for every vncserver session, users can override in ~/.config/tigervnc/config.
+session=xfce
+geometry=1920x1080
+alwaysshared
