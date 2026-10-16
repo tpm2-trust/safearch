@@ -157,6 +157,12 @@ HTTP server for the files. The example below uses **dnsmasq** (DHCP, proxy-DHCP,
 and **nginx**, on a server at `10.0.0.1/24`. It stores nothing secret: everything in
 the tree is public and signed.
 
+For a first test the "server" can be the build host itself: publish into `mkosi.netboot/`,
+serve that directory with `python3 -m http.server` and let the LAN's DHCP server (or a
+proxy-DHCP dnsmasq) point at it — see
+[Quick one-off test on an existing LAN](#quick-one-off-test-on-an-existing-lan). The
+permanent setup below is the same thing with nginx and a fixed path.
+
 ```sh
 # Arch
 pacman -S --needed dnsmasq nginx
@@ -209,7 +215,27 @@ curl -I http://10.0.0.1/safespace/current/boot.efi    # 200 OK and a Content-Len
 `Content-Length` matters: the initrd uses it to size the tmpfs and to check that there
 is enough RAM before it starts downloading.
 
-### 3. DHCP and the boot file (dnsmasq)
+### 3. DHCP and the boot file
+
+Only two things have to reach the machine, whatever DHCP server you run:
+
+| DHCP option | HTTP boot (the fast path) | PXE/TFTP fallback |
+|---|---|---|
+| 60, vendor class identifier | `HTTPClient` | — |
+| 67, boot file name | `http://10.0.0.1/safespace/current/boot.efi` (full URL) | `safespace/current/boot.efi` (path under the TFTP root) |
+| 66 / `next-server` (siaddr) | — | `10.0.0.1`, the TFTP server |
+
+There is no third thing: no agent, no per-machine entry, no MAC list. The address the
+machine gets is its normal lease.
+
+**Send them only to the clients that asked for them.** A machine says what it is in its
+request: option 60 starts with `HTTPClient:Arch:00016` and option 93 (client
+architecture) is `16` for x86-64 UEFI HTTP boot, `7` or `9` for x86-64 UEFI PXE. A firmware
+that starts its PXE entry and receives an HTTP URL fails with `PXE-E23`, so the two answers
+must be kept apart — that is all the conditions in the examples below do. Legacy BIOS
+clients (option 93 = `0`) get no answer at all: the boot file is a UEFI binary.
+
+#### dnsmasq
 
 **Case A — dnsmasq is the DHCP server** for this network (e.g. a dedicated boot VLAN).
 `/etc/dnsmasq.d/netboot.conf`:
@@ -266,22 +292,73 @@ tftp-root=/srv/netboot
 log-dhcp
 ```
 
-Proxy mode reliably drives the **TFTP** path only. For HTTP boot the options have to
-come from the DHCP server that owns the network; whatever it runs, it has to send:
-
-| Option | Value |
-|---|---|
-| 60 (vendor class) | `HTTPClient` |
-| 67 (boot file name) | `http://10.0.0.1/safespace/current/boot.efi` |
-
-(`dhcpd` in ISC/Kea: `option vendor-class-identifier "HTTPClient";` and
-`filename "http://…/boot.efi";` in a class matching
-`substring(option vendor-class-identifier, 0, 10) = "HTTPClient"`.)
+Proxy mode reliably drives the **TFTP** path only: UEFI HTTP boot wants the URL and the
+vendor class from the DHCP server that owns the network.
 
 ```sh
 systemctl enable --now dnsmasq
 journalctl -u dnsmasq -f        # watch a client boot
 ```
+
+#### ISC dhcpd (`dhcpd.conf`)
+
+```
+option arch code 93 = unsigned integer 16;
+
+# UEFI HTTP boot: answer with the vendor class and the full URL.
+class "safespace-http" {
+    match if substring(option vendor-class-identifier, 0, 10) = "HTTPClient";
+    option vendor-class-identifier "HTTPClient";
+    filename "http://10.0.0.1/safespace/current/boot.efi";
+}
+
+# UEFI PXE (x86-64): a path under the TFTP root plus the TFTP server.
+class "safespace-pxe" {
+    match if option arch = 7 or option arch = 9;
+    filename "safespace/current/boot.efi";
+    next-server 10.0.0.1;
+}
+```
+
+The classes go next to the existing subnet declaration; the subnet keeps handing out
+addresses as before. (ISC dhcpd is no longer developed upstream — on a new server prefer
+Kea.)
+
+#### Kea (`kea-dhcp4.conf`)
+
+```json
+"client-classes": [
+  {
+    "name": "safespace-http",
+    "test": "substring(option[60].hex,0,10) == 'HTTPClient'",
+    "boot-file-name": "http://10.0.0.1/safespace/current/boot.efi",
+    "option-data": [
+      { "name": "vendor-class-identifier", "data": "HTTPClient" }
+    ]
+  },
+  {
+    "name": "safespace-pxe",
+    "test": "option[93].hex == 0x0007 or option[93].hex == 0x0009",
+    "next-server": "10.0.0.1",
+    "boot-file-name": "safespace/current/boot.efi"
+  }
+]
+```
+
+#### Routers, firewalls and Windows Server
+
+- **OPNsense / pfSense:** *Services → DHCPv4 → \[interface\]*. For the PXE path use
+  "Network booting": next-server `10.0.0.1`, filename `safespace/current/boot.efi`. For
+  HTTP boot add the two options under "Additional BOOTP/DHCP Options": number 60, type
+  string, value `HTTPClient`, and number 67, type string, value with the full URL.
+- **Windows Server DHCP:** option 067 (Bootfile Name) takes the URL; option 060 has to be
+  defined once (`netsh dhcp server add optiondef 60 HTTPClient STRING 0`) and then set to
+  `HTTPClient`. Put both into a DHCP *policy* whose condition is the vendor class
+  `HTTPClient*`, so other clients are unaffected.
+- **Consumer routers (Fritz!Box and friends)** usually cannot set options 60/67 at all. Use
+  the proxy-DHCP recipe in
+  [Quick one-off test on an existing LAN](#quick-one-off-test-on-an-existing-lan): it adds
+  only the boot answer and leaves the router's DHCP alone.
 
 ### 4. Firewall
 
