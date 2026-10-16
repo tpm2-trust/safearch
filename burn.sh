@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Write an image built by mkosi (mkosi.output/) to a USB stick / SD card.
+# Write a "usb" image built by mkosi (mkosi.output/) to a USB stick / SD card.
+# Images of the "network" variant have no ESP and are not written to a medium;
+# they are published with netboot-export.sh (see NETBOOT.md).
 #
 # Needs no Secure Boot keys and no package cache: the image is already signed.
 # Takes raw (.raw) or zstd-compressed (.raw.zst) images. Only blocks that
@@ -13,7 +15,7 @@ usage() {
 	cat <<EOF
 Usage: sudo $0 [IMAGE] DEVICE [--yes]
 
-  IMAGE      .raw or .raw.zst to write (default: the newest build in mkosi.output/)
+  IMAGE      .raw or .raw.zst to write (default: the newest usb build in mkosi.output/)
   DEVICE     whole target disk, e.g. /dev/sdb or /dev/mmcblk0
   --yes      do not ask for confirmation
 EOF
@@ -35,7 +37,7 @@ done
 case ${#ARGS[@]} in
 	1)
 		IMAGE=$(find "$HERE/mkosi.output" "$HERE" -maxdepth 1 -type f \( -name '*.raw.zst' -o -name '*.raw' \) \
-			-printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR == 1 { print $2 }' || true)
+			! -name '*-network_*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR == 1 { print $2 }' || true)
 		DEVICE=${ARGS[0]}
 		;;
 	2) IMAGE=${ARGS[0]}; DEVICE=${ARGS[1]} ;;
@@ -49,8 +51,10 @@ done
 
 # --- checks --------------------------------------------------------------------
 
-[[ -n $IMAGE && -e $IMAGE ]] || die "image ${IMAGE:-in mkosi.output/} not found (run: sudo mkosi build)"
+[[ -n $IMAGE && -e $IMAGE ]] || die "image ${IMAGE:-in mkosi.output/} not found (run: sudo ./build.sh usb)"
 IMAGE=$(readlink -f "$IMAGE")
+[[ $(basename "$IMAGE") == *-network_* ]] &&
+	die "$(basename "$IMAGE") is a network build (no ESP, nothing to boot from a medium): publish it with ./netboot-export.sh, see NETBOOT.md"
 if [[ $IMAGE == *.zst ]]; then
 	COMPRESSED=1
 	# mkosi compresses as a stream, so the zstd header has no content size.

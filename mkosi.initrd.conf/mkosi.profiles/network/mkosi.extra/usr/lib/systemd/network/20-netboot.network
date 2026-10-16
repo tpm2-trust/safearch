@@ -1,0 +1,10 @@
+# DHCP on physical ethernet ports only, for the netroot step in the initrd.
+# Kind=!* skips virtual links. The booted system configures the network again
+# with its own /etc/systemd/network/20-wired.network.
+# For a static setup, replace this file (it is part of the signed UKI).
+[Match]
+Kind=!*
+Type=ether
+
+[Network]
+DHCP=yes

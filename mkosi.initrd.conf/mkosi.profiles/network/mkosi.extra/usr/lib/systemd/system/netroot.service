@@ -1,0 +1,21 @@
+# Enabled by the initrd.target.wants symlink next to this file, not by an
+# [Install] section: the default initrd applies presets with "disable *".
+[Unit]
+Description=Fetch and verify the root image over the network
+DefaultDependencies=no
+ConditionKernelCommandLine=safespace.netroot
+# systemd-networkd does the DHCP (20-netboot.network), udev loads the NIC
+# drivers from the kernel modules initrd.
+Requires=systemd-networkd.service
+After=systemd-networkd.service systemd-udevd.service systemd-udev-trigger.service
+Wants=systemd-udev-trigger.service
+Before=initrd-root-device.target cryptsetup-pre.target veritysetup-pre.target sysroot.mount
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Must cover the download of the whole root image (a few hundred MiB to a few
+# GiB); the script's own curl timeout (MAX_TIME) is the real limit.
+TimeoutStartSec=1200s
+ExecStart=/usr/local/lib/safespace/netroot

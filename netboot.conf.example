@@ -1,0 +1,17 @@
+# Settings for the network variant (./build.sh network). Copy to netboot.conf
+# (not tracked by git) and set the URL of your netboot tree. Sourced as bash.
+#
+# NETROOT_URL: base URL under which the netboot server publishes the versions
+# (see NETBOOT.md). build.sh appends the image version, so the UKI it signs
+# always loads the root image of exactly that build:
+#   NETROOT_URL=http://10.0.0.1/safespace/
+#   -> safespace.netroot=http://10.0.0.1/safespace/20261016-1830/
+#      and the initrd fetches .../20261016-1830/root.img and root.verity
+#
+# An IP address needs no DNS in the initrd; a host name is resolved from the
+# DHCP lease, which works but is one more thing that has to be right.
+# Several URLs (space separated) are tried in order, for a second server:
+#   NETROOT_URL="http://10.0.0.1/safespace/ http://10.0.0.2/safespace/"
+# The URLs are part of the signed kernel command line; changing them means
+# rebuilding the image.
+NETROOT_URL=http://10.0.0.1/safespace/

@@ -9,7 +9,10 @@ mkosi.output/
 /*.roothash
 /*.manifest
 /*.vnc-password
-/safespace-arch_*
+/safespace-arch-*
+
+# Netboot tree staged by netboot-export.sh.
+mkosi.netboot/
 
 # Caches and mkosi's generated keys/tools.
 mkosi.cache/
@@ -22,6 +25,7 @@ mkosi.crt
 # Per-host and per-user settings.
 mkosi.local.conf
 users.conf
+netboot.conf
 
 # Generated into the image tree by fetch-images.sh and secureboot-export.sh.
 mkosi.extra/usr/share/safespace/docker-images/

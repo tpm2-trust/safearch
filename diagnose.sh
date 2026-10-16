@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Read-only check of a stick/SD card written from a mkosi image:
+# Read-only check of a stick/SD card written from a "usb" image (burn.sh):
 # ESP + signed UKI, dm-verity root (verified block by block), nothing writable.
 # Usage: sudo ./diagnose.sh /dev/sdX
 set -uo pipefail
@@ -89,8 +89,12 @@ if [[ -z $ROOTHASH ]]; then
 	bad "no roothash= on the kernel command line"
 else
 	ok "roothash=$ROOTHASH"
-	build=$(grep -lx "$ROOTHASH" "$HERE"/mkosi.output/*.roothash "$HERE"/*.roothash 2>/dev/null | head -1)
-	newest=$(ls -t "$HERE"/mkosi.output/*.roothash "$HERE"/*.roothash 2>/dev/null | head -1)
+	# usb builds only: a network build's root hash belongs to an image that is
+	# never written to a medium.
+	build=$(grep -lx "$ROOTHASH" "$HERE"/mkosi.output/*.roothash "$HERE"/*.roothash 2>/dev/null |
+		grep -v -- '-network_' | head -1)
+	newest=$(ls -t "$HERE"/mkosi.output/*.roothash "$HERE"/*.roothash 2>/dev/null |
+		grep -v -- '-network_' | head -1)
 	if [[ -z $build ]]; then
 		echo "  NOTE build: no matching *.roothash on this host"
 	elif [[ $build == "$newest" ]]; then

@@ -1,0 +1,165 @@
+#!/bin/sh
+# Runs in mkosi's default initrd of the network variant (bash as sh, coreutils,
+# sed, kmod, curl, veritysetup), started by netroot.service. It downloads the
+# root image and its dm-verity hash tree into a tmpfs and opens them as
+# /dev/mapper/root, which the signed kernel command line names as root=.
+#
+# Everything it trusts comes from the kernel command line inside the signed
+# UKI, nothing from the network:
+#   safespace.netroot=<url>/  base URL, may be given more than once (tried in
+#                             order); build.sh appends the image version, so a
+#                             UKI only ever loads the root it was signed with
+#   roothash=<hash>           dm-verity root hash (added by mkosi)
+# veritysetup refuses a hash tree that does not match roothash=, and dm-verity
+# then checks every block that is read, with --panic-on-corruption. A
+# manipulated or wrong server can therefore only keep the machine from
+# booting, never change what boots. Plain HTTP is enough for that; HTTPS only
+# adds confidentiality (and needs a certificate curl trusts).
+#
+# Files expected under each URL:
+#   root.img      the root partition (erofs, dm-verity data)
+#   root.verity   its dm-verity hash tree
+# Both are written by netboot-export.sh.
+#
+# Progress goes to the kernel log (so `journalctl -b -g netroot` has it after
+# boot) and to /dev/console, because the kernel log at info level does not
+# reach the screen once systemd has taken over the console -- and a netboot
+# that stalls is watched on the screen.
+
+WAIT_ONLINE=60          # seconds to wait for a DHCP address
+MAX_TIME=900            # seconds for one download
+DIR=/run/netroot        # tmpfs for the images; stays mounted after switch-root
+
+msg() {
+	echo "netroot: $*" >/dev/kmsg 2>/dev/null
+	echo "netroot: $*" >/dev/console 2>/dev/null
+	return 0
+}
+die() { msg "ERROR: $*"; exit 1; }
+
+cmdline=$(cat /proc/cmdline)
+args() { printf '%s\n' "$cmdline" | tr ' ' '\n' | sed -n "s/^$1=//p"; }
+
+urls=$(args safespace.netroot)
+[ -n "$urls" ] || { msg "no safespace.netroot= on the kernel command line, nothing to do"; exit 0; }
+roothash=$(args roothash | tail -n 1)
+[ -n "$roothash" ] || die "no roothash= on the kernel command line"
+
+modprobe -a loop dm-verity erofs 2>/dev/null
+
+# --- network ----------------------------------------------------------------
+# systemd-networkd is started by netroot.service and configures DHCP on every
+# physical ethernet port (20-netboot.network next to this script).
+msg "waiting up to ${WAIT_ONLINE}s for a DHCP address"
+if /usr/lib/systemd/systemd-networkd-wait-online --any --timeout="$WAIT_ONLINE"; then
+	msg "link up: $(ip -o -4 addr show scope global 2>/dev/null | tr -s ' ' | cut -d' ' -f2,4 | tr '\n' ' ')"
+else
+	msg "no link reported as online, trying anyway"
+fi
+# curl needs a resolver if a URL uses a host name. systemd-resolved is not in
+# the initrd, so take the DNS servers from networkd's DHCP leases. Best effort:
+# with an IP address in the URL (recommended) none of this is needed.
+if [ ! -s /etc/resolv.conf ]; then
+	# Can be a dangling symlink to systemd-resolved's stub; replace it.
+	rm -f /etc/resolv.conf
+	for dns in $(sed -n 's/^DNS=//p' /run/systemd/netif/leases/* 2>/dev/null | tr ' ' '\n'); do
+		echo "nameserver $dns" >>/etc/resolv.conf
+	done
+	[ -s /etc/resolv.conf ] && msg "resolver: $(tr '\n' ' ' </etc/resolv.conf)"
+fi
+
+# --- download and open ------------------------------------------------------
+
+size_of() { # url -> Content-Length of a 200 answer, or empty
+	# A HEAD request also prints the headers of an error page, so check the
+	# status code (curl appends it) before taking a Content-Length from it.
+	hdr=$(curl -sIL --max-time 30 -w 'status=%{http_code}' "$1" 2>/dev/null | tr -d '\r')
+	case $hdr in
+		*status=200) ;;
+		*) return 0 ;;
+	esac
+	printf '%s\n' "$hdr" |
+		sed -n 's/^[Cc]ontent-[Ll]ength:[[:space:]]*\([0-9][0-9]*\).*$/\1/p' | tail -n 1
+}
+
+get() { # url file
+	start=$(date +%s)
+	if ! out=$(curl -fsS --retry 3 --retry-delay 2 --max-time "$MAX_TIME" -o "$2" "$1" 2>&1); then
+		msg "download of $1 failed: $out"
+		return 1
+	fi
+	bytes=$(stat -c %s "$2")
+	secs=$(($(date +%s) - start))
+	[ "$secs" -gt 0 ] || secs=1
+	msg "got ${1##*/}: $((bytes / 1048576)) MiB in ${secs}s ($((bytes / 1048576 / secs)) MiB/s)"
+}
+
+cleanup() {
+	veritysetup close root 2>/dev/null
+	[ -n "$data" ] && losetup -d "$data" 2>/dev/null
+	[ -n "$hash" ] && losetup -d "$hash" 2>/dev/null
+	umount "$DIR" 2>/dev/null
+	data="" hash=""
+}
+
+data="" hash=""
+try() { # base url (without trailing slash)
+	base=$1
+	tmpfs_size="" tmpfs_size_opt=""
+	msg "fetching the root image from $base"
+
+	# Reserve RAM for both images before downloading: the root image stays in
+	# this tmpfs for as long as the machine runs, because it *is* the root
+	# filesystem (erofs, decompressed on read).
+	isize=$(size_of "$base/root.img")
+	vsize=$(size_of "$base/root.verity")
+	if [ -n "$isize" ] && [ -n "$vsize" ]; then
+		need_kb=$(((isize + vsize) / 1024 + 262144))
+		avail_kb=$(sed -n 's/^MemAvailable:[[:space:]]*\([0-9][0-9]*\) kB$/\1/p' /proc/meminfo)
+		[ -n "$avail_kb" ] || avail_kb=0
+		msg "root.img $((isize / 1048576)) MiB + root.verity $((vsize / 1048576)) MiB, $((avail_kb / 1024)) MiB RAM free"
+		if [ "$avail_kb" -gt 0 ] && [ "$avail_kb" -lt "$need_kb" ]; then
+			msg "not enough RAM: need $((need_kb / 1024)) MiB free, have $((avail_kb / 1024)) MiB"
+			return 1
+		fi
+		tmpfs_size=$((isize + vsize + 16777216))
+	else
+		msg "server does not report sizes (no Content-Length), using 90% of RAM for the images"
+		tmpfs_size_opt=90%
+	fi
+
+	mkdir -p "$DIR"
+	mount -t tmpfs -o "size=${tmpfs_size:-${tmpfs_size_opt}},mode=0700" netroot "$DIR" ||
+		{ msg "cannot mount the tmpfs for the images"; return 1; }
+
+	get "$base/root.verity" "$DIR/root.verity" || return 1
+	get "$base/root.img" "$DIR/root.img" || return 1
+
+	data=$(losetup -f --show -r "$DIR/root.img") || { msg "losetup for root.img failed"; return 1; }
+	hash=$(losetup -f --show -r "$DIR/root.verity") || { msg "losetup for root.verity failed"; return 1; }
+	# The root hash comes from the signed command line: this is the step that
+	# decides whether the downloaded image is the one that was signed.
+	if ! out=$(veritysetup open "$data" root "$hash" "$roothash" --panic-on-corruption 2>&1); then
+		msg "dm-verity refused the image (wrong build on the server?): $out"
+		return 1
+	fi
+	msg "root opened as /dev/mapper/root ($data = $DIR/root.img), verified against roothash=$(printf %.12s "$roothash")..."
+	# systemd waits for dev-mapper-root.device, which udev only marks ready
+	# once blkid has recognised the erofs on it.
+	udevadm settle -t 15
+	[ -e /dev/mapper/root ] || { msg "/dev/mapper/root did not appear"; return 1; }
+}
+
+for url in $urls; do
+	case $url in
+		http://* | https://*) ;;
+		*) msg "ignoring safespace.netroot=$url: not an http(s) URL"; continue ;;
+	esac
+	# Accept the URL with or without a trailing slash.
+	if try "${url%/}"; then
+		exit 0
+	fi
+	cleanup
+done
+
+die "no server provided a usable root image, tried: $(echo "$urls" | tr '\n' ' ')"

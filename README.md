@@ -1,16 +1,33 @@
 # safespace-arch with mkosi
 
-A Secure-Boot-signed Arch Linux system for USB sticks and SD cards, built with
+A Secure-Boot-signed Arch Linux system for USB sticks, SD cards and network boot on x86-64
+UEFI machines (no legacy BIOS), built with
 [mkosi](https://github.com/systemd/mkosi) (written for mkosi 27). The system is
-**read-only**: the stick is never written to at runtime. The root is protected by
+**read-only**: nothing is written to the boot medium at runtime. The root is protected by
 dm-verity, `/var` lives in RAM, and only disks mounted at runtime are writable. Docker
-images travel on the stick; Docker's storage lives on a data disk at `/opt/docker`.
+images travel in the image; Docker's storage lives on a data disk at `/opt/docker`.
 An XFCE desktop is available over VNC (through an ssh tunnel).
 
-> **Status:** tested in QEMU (OVMF, stick on emulated USB): boots with and without enforced
-> Secure Boot; dm-verity verified, stick read-only at block level; sealing with
-> `safespace-seal` (append and `--replace`) and booting the sealed VM. Boots on one real
-> machine (Secure Boot in Setup Mode).
+Two variants are built from the same configuration, selected with `./build.sh`:
+
+| | `usb` | `network` |
+|---|---|---|
+| Build | `sudo ./build.sh usb` | `sudo ./build.sh network` |
+| Boots from | a USB stick or SD card (ESP + root + verity on the medium) | UEFI HTTP (or PXE) boot: the firmware itself downloads the signed UKI, nothing is on the machine |
+| Root comes from | the medium, read-only and set read-only at block level | HTTP, into a tmpfs, opened through dm-verity with the signed root hash |
+| Written with | `sudo ./burn.sh /dev/sdX` | `./netboot-export.sh` onto a netboot server |
+| USB devices | the initrd authorizes only the path to the boot medium | nothing on USB is authorized at all (the NIC must be PCI/PCIe) |
+| Docs | this file | this file plus **[NETBOOT.md](NETBOOT.md)** |
+
+Everything else is identical: same packages, users, hardening, dm-verity root, volatile
+`/var`, Secure Boot signature and `safespace-seal`.
+
+> **Status:** usb variant tested in QEMU (OVMF, stick on emulated USB): boots with and
+> without enforced Secure Boot; dm-verity verified, stick read-only at block level; sealing
+> with `safespace-seal` (append and `--replace`) and booting the sealed VM. Boots on one real
+> machine (Secure Boot in Setup Mode). Network variant tested end to end in QEMU (OVMF,
+> no disk attached): DHCP → UEFI HTTP boot of the signed UKI → root image and hash tree over
+> HTTP → dm-verity against the signed root hash → login prompt. Not yet run on real hardware.
 
 ## Quick start
 
@@ -23,38 +40,55 @@ cp users.conf.example users.conf   # add your users and ssh keys
 # optional: safespace.env (VNC), docker-images.txt (images to ship)
 sudo ./secureboot-export.sh   # public keys for safespace-seal (see "Sealing")
 ./fetch-images.sh             # downloads the listed images (skip if none)
-sudo mkosi build              # -> mkosi.output/safespace-arch_<date-time>.raw.zst
-sudo ./burn.sh /dev/sdX       # writes the newest image to the stick
-sudo ./diagnose.sh /dev/sdX   # optional: verifies root on the stick block by block
 
-# on the machine, once per data disk (any disk except the stick):
+# variant usb: a stick or SD card
+sudo ./build.sh usb           # -> mkosi.output/safespace-arch-usb_<date-time>.raw.zst
+sudo ./burn.sh /dev/sdX       # writes the newest usb image to the medium
+sudo ./diagnose.sh /dev/sdX   # optional: verifies root on the medium block by block
+
+# variant network: UEFI HTTP/PXE boot (details and the server: NETBOOT.md)
+cp netboot.conf.example netboot.conf   # NETROOT_URL=http://SERVER/safespace/
+sudo ./build.sh network       # -> mkosi.output/safespace-arch-network_<date-time>.*
+./netboot-export.sh --rsync root@SERVER:/srv/netboot/safespace
+
+# on the machine, once per data disk (any disk except the boot medium):
 sudo mkfs.ext4 -L safespace-docker /dev/<datadisk>
 ```
 
-`sudo mkosi build` is needed because the signing key in `/var/lib/sbctl/keys/db/` is
-readable by root only.
+`build.sh` runs mkosi with the profile of the variant; root is needed because the
+signing key in `/var/lib/sbctl/keys/db/` is readable by root only. `mkosi` can still be
+called directly, but then the profile has to be given: `sudo mkosi --profile=usb build`
+(a build without a profile stops with an error).
 
-Not tracked by git, created per user or host: `users.conf`, `mkosi.local.conf`, the exported
-keys (`mkosi.extra/usr/share/safespace/secureboot/`), shipped images
-(`mkosi.extra/usr/share/safespace/docker-images/`), caches and outputs.
+Not tracked by git, created per user or host: `users.conf`, `netboot.conf`,
+`mkosi.local.conf`, the exported keys
+(`mkosi.extra/usr/share/safespace/secureboot/`), shipped images
+(`mkosi.extra/usr/share/safespace/docker-images/`), caches, outputs and the staged
+netboot tree (`mkosi.netboot/`).
 
-## The stick is never written to
+## The boot medium is never written to
 
 | Layer | How |
 |---|---|
-| Partitions | only ESP, root and root-verity. No writable partition, no growing |
+| Partitions | only ESP, root and root-verity (network variant: no partitions at all on the machine) |
 | Root (`/usr` and `/etc`) | erofs (read-only filesystem) on dm-verity. The root hash is part of the signed kernel command line, so any changed block fails to read |
 | `/var` | tmpfs (`systemd.volatile=state`), filled on every boot from the verified copy in `/usr/share/factory/var` (`safespace-var-factory.service`). Everything written there is gone after reboot |
 | ESP | never mounted (`efi`/`boot` mounts masked); no `loader/random-seed` on it, so systemd-boot writes nothing; `systemd-boot-update`, `systemd-boot-random-seed` and systemd-repart are masked |
-| Block level | after finding root, the initrd step `usb-bootdev` runs `blockdev --setro` on the stick and all its partitions, so the kernel refuses writes to it, even from root |
+| Block level | usb: after finding root, the initrd step `usb-bootdev` runs `blockdev --setro` on the medium and all its partitions, so the kernel refuses writes to it, even from root. network: the root image is a read-only loop device over a tmpfs file |
 
 Writable storage exists only on disks mounted at runtime, such as the Docker data disk.
+
+Partitions of the `usb` image (what `burn.sh` writes):
 
 | # | Partition | Content |
 |---|---|---|
 | 1 | ESP, 512 MiB, FAT | signed systemd-boot `\EFI\BOOT\BOOTX64.EFI`, signed UKI `\EFI\Linux\*.efi` |
 | 2 | root, erofs (zstd) | `/usr`, `/etc`, factory `/var`, shipped Docker images |
 | 3 | root-verity | dm-verity hash tree for partition 2 |
+
+The `network` image has partitions 2 and 3 only; they are published as separate files
+(`root.img`, `root.verity`) and the UKI is served on its own. See
+[NETBOOT.md](NETBOOT.md).
 
 ## How the integrity protection works
 
@@ -68,8 +102,10 @@ signature:
    uses `db.key`).
 2. The command line is part of the signed file. Under Secure Boot, systemd-stub ignores any
    command line passed from outside.
-3. The initrd (also signed) reads `roothash=`, finds the root and hash partitions by the UUIDs
-   derived from it, and sets up `/dev/mapper/root`.
+3. The initrd (also signed) reads `roothash=`. usb: it finds the root and hash partitions by
+   the UUIDs derived from it. network: it downloads `root.img` and `root.verity` from the URL
+   on the signed command line and opens them with that hash. Either way the result is
+   `/dev/mapper/root`, and a wrong or manipulated root is rejected before it is mounted.
 4. The kernel checks every block read from root against the tree. A mismatch stops the system
    (`panic-on-corruption`).
 
@@ -83,7 +119,9 @@ Those paths are closed on the signed command line:
 | extension images (`*.sysext.raw`, `*.confext.raw`) | `systemd.sysext=0`, `systemd.confext=0` and `rd.` variants; the units are also masked in the initrd and on the system |
 
 `diagnose.sh` checks all of this on a burned stick, including that the ESP holds nothing but
-systemd-boot and the UKI.
+systemd-boot and the UKI. For the network variant, `netboot-export.sh` does the equivalent
+check before publishing (root hash in the UKI vs. the published images, `veritysetup verify`
+over the whole root image, and which key signed the UKI).
 
 **Preconditions:** Secure Boot on and a firmware password on every machine. Without Secure Boot,
 any command line (and with it any `roothash=`) can be passed in. The `db` key decides
@@ -98,7 +136,7 @@ only boots binaries signed with them (the "seal").
 
 ```sh
 sudo ./secureboot-export.sh      # reads /var/lib/sbctl, writes public files only
-sudo mkosi -f build
+sudo ./build.sh usb -f           # (or network -f, or both)
 ```
 
 `secureboot-export.sh` puts into `mkosi.extra/usr/share/safespace/secureboot/` the PK, KEK
@@ -125,6 +163,11 @@ our keys. Use it only on machines without such devices, e.g. integrated graphics
 
 Try it in a VM: `./test-vm.sh --setup-mode --ssh 2222`, log in, `sudo safespace-seal`, power
 off, then `./test-vm.sh --sealed`.
+
+A netbooted machine can seal itself the same way: boot it in Setup Mode (no keys, so the
+unverified UKI loads), run `sudo safespace-seal`, reboot — from then on the firmware
+verifies the downloaded UKI against your `db`. See
+[NETBOOT.md](NETBOOT.md#secure-boot-on-the-clients).
 
 ## Docker
 
@@ -169,16 +212,23 @@ Everything below is on top of what `mkosi build` with `Distribution=arch` and st
 packages would give you. Stock Arch defaults (e.g. the nftables ruleset in
 `/etc/nftables.conf`: input policy drop, ssh allowed) are not listed.
 
-### Build configuration (`mkosi.conf`, `mkosi.conf.d/`)
+### Build configuration (`mkosi.conf`, `mkosi.conf.d/`, `mkosi.profiles/`)
+
+`mkosi.conf` holds everything both variants share; the differences are in
+`mkosi.profiles/usb/` and `mkosi.profiles/network/`, which mkosi merges in when that
+profile is active (`./build.sh <variant>` = `mkosi --profile=<variant>`). `mkosi.postinst`
+stops the build if no variant is selected.
 
 | Setting | Why |
 |---|---|
+| `Profiles=` (`--profile`) | `usb` or `network`; also inherited by the initrd, so `mkosi.initrd.conf/mkosi.profiles/<variant>/` ends up in the initrd |
+| `ImageId=safespace-arch-usb` / `-network` | per variant, so both can live in `mkosi.output/` and `burn.sh`/`test-vm.sh` never pick the wrong one |
 | `Format=disk`, `Bootable=yes` | bootable GPT image |
 | `Bootloader=systemd-boot` | mkosi's default for this setup would be a bare UKI as `\EFI\BOOT\BOOTX64.EFI`. Some firmware resets when its boot manager starts a 90 MiB UKI directly, but loads it fine for systemd-boot (see "Troubleshooting") |
 | `ElTorito=no` | mkosi 27 adds an ISO9660/El Torito header for CD boot by default; a stick boots via GPT |
 | `SecureBoot=yes`, `SecureBootKey`/`Certificate` from `/var/lib/sbctl`, `SecureBootSignTool=systemd-sbsign`, `SecureBootAutoEnroll=no` | systemd-boot and the UKI are signed with the sbctl `db` key; no systemd-boot auto-enrollment files on the ESP (`safespace-seal` does enrollment) |
 | `Verity=hash` | dm-verity root; the root hash is on the signed kernel command line, no signature partition needed |
-| `SplitArtifacts=uki,roothash`, `ManifestFormat=json` | UKI, root hash and package list next to the image |
+| `SplitArtifacts=uki,roothash` (+`partitions` for network), `ManifestFormat=json` | UKI, root hash and package list next to the image; the network variant also writes the root and verity partitions as separate files to publish |
 | `CompressOutput=zstd`, `CompressLevel=10` | image as `.raw.zst`, only as large as its content |
 | `OutputDirectory=mkosi.output` | outputs out of the project root |
 | `Snapshot=` in `mkosi.conf.d/20-snapshot.conf` | pinned Arch Linux Archive day: rebuilds install the same packages; `update-snapshot.sh` moves it |
@@ -186,14 +236,15 @@ packages would give you. Stock Arch defaults (e.g. the nftables ruleset in
 | `Environment=SYSTEMD_REPART_MKFS_OPTIONS_VFAT=-S512` | FAT with 512-byte sectors (many firmwares don't read 4K-sector FAT on USB), while erofs and verity keep 4K blocks |
 | `Ssh=never` | no sshd-over-vsock units for `mkosi vm` |
 | `Hostname=`, `Locale=`, `Keymap=`, `Timezone=` | safespace, en_US.UTF-8, us, UTC |
-| `mkosi.version` | `ImageVersion` is the build timestamp, so every build gets its own files |
+| `mkosi.version` | `ImageVersion` is the build timestamp, so every build gets its own files. `build.sh` runs it once and passes `--image-version`, so the same value can go into the netboot URL |
+| `KernelCommandLine=` of the network variant | `root=/dev/mapper/root`, `rootfstype=erofs`, `ro`, `systemd.verity=no` (the initrd opens the verity device itself) and `safespace.netroot=<url>/<version>/` (where to fetch root from, signed in) |
 | `mkosi.local.conf.example` | per-host settings, e.g. more erofs compression threads |
 
-### Disk layout (`mkosi.repart/`)
+### Disk layout (`mkosi.repart/`, `mkosi.profiles/usb/mkosi.repart/`)
 
 | File | Partition |
 |---|---|
-| `00-esp.conf` | 512 MiB FAT32 with systemd-boot and the UKI only. Excluded: `intel-ucode.img` (the UKI has its microcode), `loader/` (no loader.conf, no type 1 entries, no random seed), `\EFI\systemd\` (only needed for NVRAM boot entries), `BOOTIA32.EFI` |
+| `mkosi.profiles/usb/mkosi.repart/00-esp.conf` | usb variant only: 512 MiB FAT32 with systemd-boot and the UKI only. Excluded: `intel-ucode.img` (the UKI has its microcode), `loader/` (no loader.conf, no type 1 entries, no random seed), `\EFI\systemd\` (only needed for NVRAM boot entries), `BOOTIA32.EFI` |
 | `10-root.conf` | erofs, zstd level 12, `Minimize=best`; without `/var`, `/efi`, `/boot` |
 | `11-root-verity.conf` | dm-verity hash tree for root |
 
@@ -205,16 +256,26 @@ packages would give you. Stock Arch defaults (e.g. the nftables ruleset in
 | `usbcore.authorized_default=0` | the kernel authorizes no USB device by itself |
 | `systemd.credentials_boot_policy=strict` | no null-key credentials from the ESP |
 | `systemd.sysext=0`, `systemd.confext=0`, `rd.systemd.sysext=0`, `rd.systemd.confext=0` | no extension images over `/usr` and `/etc` |
-| `systemd.verity_root_options=panic-on-corruption` | a modified root block stops the system |
+| `systemd.verity_root_options=panic-on-corruption` (usb) | a modified root block stops the system; the network variant passes `--panic-on-corruption` to `veritysetup` instead |
 | `systemd.firstboot=off` | no first-boot questions |
+| `root=/dev/mapper/root`, `rootfstype=erofs`, `ro`, `systemd.verity=no` (network) | the initrd opens the downloaded verity device under that name, so systemd must not look for partitions |
+| `safespace.netroot=<url>/<version>/` (network) | where `netroot` fetches `root.img` and `root.verity`; signed, so it cannot be redirected |
 
 ### Initrd (`mkosi.initrd.conf/`, `InitrdPackages=`, `KernelInitrdModules=`)
 
-- Extra drivers for USB storage, MMC and card readers; `coreutils`, `sed`, `kmod` for the
-  script below.
-- `usb-bootdev.service` and `/usr/local/lib/safespace/usb-bootdev`: see "USB lockdown".
-- sysext/confext units masked in the initrd as well.
-- `CompressLevel=19`, and unused sqlite tools and `magic.mgc` removed, to keep the UKI small.
+- `coreutils`, `sed`, `kmod` for the scripts below; sysext/confext units masked in the
+  initrd as well; `CompressLevel=19`, and unused sqlite tools and `magic.mgc` removed, to
+  keep the UKI small.
+- usb (`mkosi.initrd.conf/mkosi.profiles/usb/`): drivers for USB storage, MMC and card
+  readers; `usb-bootdev.service` and `/usr/local/lib/safespace/usb-bootdev`, see
+  "USB lockdown".
+- network (`mkosi.initrd.conf/mkosi.profiles/network/`): ethernet drivers (and their
+  firmware), `curl`, `cryptsetup`, `iproute2`; `20-netboot.network` (DHCP on physical
+  ethernet) and `netroot.service` + `/usr/local/lib/safespace/netroot`, which waits for
+  DHCP, downloads `root.verity` and `root.img` into a tmpfs under `/run/netroot` (checking
+  `MemAvailable` first), and opens them with the signed root hash as `/dev/mapper/root`.
+  The tmpfs stays after switch-root: that file *is* the root filesystem. Several
+  `safespace.netroot=` URLs are tried in order.
 
 ### Build scripts
 
@@ -222,7 +283,7 @@ packages would give you. Stock Arch defaults (e.g. the nftables ruleset in
 |---|---|
 | `mkosi.postinst` | users from `users.conf` without password (`*`) and with groups from `safespace.env`; their ssh keys into the read-only `/etc/ssh/authorized_keys/<user>`; root locked; `/home` → `/var/home`, `/root` → `/var/roothome`; sudoers check; usbguard daemon settings (block new devices, keep present ones, IPC for `wheel`); VNC password (random per build, saved next to the image); mount points `/efi`, `/var`, `/opt/docker` |
 | `mkosi.finalize` | `resolv.conf` → systemd-resolved stub; moves the built `/var` to `/usr/share/factory/var` (caches and logs dropped) |
-| `mkosi.postoutput` | fails the build if the UKI is larger than 100 MiB, or signed by another key than the exported `db.pem` |
+| `mkosi.postoutput` | fails the build if the UKI is larger than 100 MiB (network: 128 MiB, it carries the ethernet drivers), if it is signed by another key than the exported `db.pem`, or if a network build has no `safespace.netroot=` URL |
 
 ### Files in the system (`mkosi.extra/`)
 
@@ -230,7 +291,7 @@ packages would give you. Stock Arch defaults (e.g. the nftables ruleset in
 |---|---|
 | Read-only system | `etc/fstab` (ESP never mounted, Docker data disk); `safespace-var-factory.service` fills `/var` from the factory copy on every boot; masked: `boot.mount`, `boot.automount`, `efi.mount`, `efi.automount`, `systemd-repart`, `systemd-boot-random-seed`, `systemd-boot-update`, all sysext/confext units |
 | ssh | `sshd_config.d/10-safespace.conf` (keys only, no root, group `wheel`, keys from `/etc/ssh/authorized_keys/%u`, host keys in `/var`); `sshd-hostkeys.service` + `sshd.service.d/10-hostkeys.conf` replace the masked `sshdgenkeys.service` |
-| Network | `20-wired.network`: DHCP on physical ethernet only (`Kind=!*` skips Docker's veth pairs) |
+| Network | `20-wired.network`: DHCP on physical ethernet only (`Kind=!*` skips Docker's veth pairs). The network variant configures the same thing once more in the initrd |
 | sudo | `sudoers.d/10-wheel`: `wheel` without password |
 | USB | `usbguard.service.d/10-early.conf`: usbguard starts before `sysinit.target` |
 | Desktop | `tigervnc/vncserver-config-defaults` (XFCE, 1920x1080), `vncserver-config-mandatory` (`localhost` only) |
@@ -241,8 +302,9 @@ packages would give you. Stock Arch defaults (e.g. the nftables ruleset in
 
 ### Tools around the build (not in the image)
 
-`secureboot-export.sh`, `burn.sh`, `diagnose.sh`, `test-vm.sh`, `hwtest-image.sh`,
-`update-snapshot.sh`, `fetch-images.sh`: see "What's where".
+`build.sh`, `secureboot-export.sh`, `burn.sh`, `diagnose.sh`, `netboot-export.sh`,
+`test-vm.sh`, `hwtest-image.sh`, `update-snapshot.sh`, `fetch-images.sh`: see
+"What's where".
 
 ## Living with a read-only, volatile system
 
@@ -254,28 +316,34 @@ packages would give you. Stock Arch defaults (e.g. the nftables ruleset in
 | **ssh host keys** | **new on every boot** (`/var` is RAM), so clients warn "host key changed" after each reboot. See "Open decisions" |
 | Logs | journal in RAM only, gone after reboot |
 | machine-id | new on every boot |
-| Packages | no `pacman` on the stick; add to `Packages=` and rebuild |
+| Packages | no `pacman` on the running system; add to `Packages=` and rebuild |
 | usbguard | only temporary `allow-device`; permanent rules go into the image |
 | System extensions | `systemd-sysext`/`confext` stay disabled |
-| RAM | `/var` (homes, logs, factory content) uses RAM; the factory part is small (users' homes, package database) |
+| RAM | `/var` (homes, logs, factory content) uses RAM; the factory part is small (users' homes, package database). The network variant also keeps the whole root image (~2 GiB) in RAM |
 
 ## What's where
 
 | File | Purpose |
 |---|---|
-| `mkosi.conf` | packages, kernel command line, UKI, Secure Boot key, verity, compression, caches |
+| `build.sh` | the build entry point: picks the variant (`usb` / `network`), fixes the version, puts the netboot URL on the signed command line, then runs mkosi |
+| `mkosi.conf` | what both variants share: packages, kernel command line, UKI, Secure Boot key, verity, compression, caches |
 | `mkosi.conf.d/20-snapshot.conf` | pinned Arch Linux Archive snapshot; `update-snapshot.sh` moves it |
-| `mkosi.repart/` | ESP, erofs root (verity data), root-verity |
+| `mkosi.profiles/usb/` | usb variant: `ImageId`, split artifacts, USB lockdown on the command line, USB/SD drivers, and `mkosi.repart/00-esp.conf` (the ESP) |
+| `mkosi.profiles/network/` | network variant: `ImageId`, `SplitArtifacts=…,partitions`, `root=`/`systemd.verity=no`, ethernet drivers, initrd packages |
+| `mkosi.repart/` | erofs root (verity data) and root-verity, for both variants |
 | `mkosi.extra/` | files in the system: sshd, sudo, networkd, usbguard drop-in, TigerVNC, fstab, Docker and containerd config, service presets, unit masks, volatile `/var`, image loader |
-| `mkosi.initrd.conf/` | the `usb-bootdev` service and script for mkosi's default initrd |
+| `mkosi.initrd.conf/` | initrd configuration: unit masks for both, `mkosi.profiles/usb/` with `usb-bootdev`, `mkosi.profiles/network/` with `netroot` and the initrd network config |
 | `mkosi.postinst` | `/home` and `/root` into `/var`, users and ssh keys, usbguard, VNC, sudoers check, mount points |
 | `mkosi.finalize` | resolv.conf, moves the built `/var` to `/usr/share/factory/var` |
-| `mkosi.postoutput` | fails the build if the UKI is larger than 100 MiB or not signed by the exported `db.pem` |
+| `mkosi.postoutput` | UKI size and signature checks, netroot URL check (see above) |
 | `docker-images.txt`, `fetch-images.sh` | images to ship and their downloader |
 | `users.conf.example`, `safespace.env` | users and ssh keys (copy to `users.conf`); groups and VNC settings |
+| `netboot.conf.example` | the netboot base URL for the network variant; copy to `netboot.conf` |
 | `mkosi.local.conf.example` | per-host settings (erofs threads, key paths); copy to `mkosi.local.conf` |
-| `burn.sh`, `diagnose.sh` | write an image to a stick; read-only check incl. `veritysetup verify` and which build is on the stick |
-| `test-vm.sh` | boot an image in QEMU as a USB stick, optionally with enforced Secure Boot, in Setup Mode or sealed |
+| `burn.sh`, `diagnose.sh` | write a usb image to a medium; read-only check incl. `veritysetup verify` and which build is on it |
+| `netboot-export.sh` | the publish step for a network build (needed for real machines, not a test tool): verify UKI, root hash and root image against each other, write them as `boot.efi`/`root.img`/`root.verity` in `<tree>/<version>/`, move `current`, optionally rsync to the server, prune old versions |
+| `NETBOOT.md` | the network variant end to end: trust model, a netboot server from scratch (dnsmasq + nginx), Secure Boot enrollment, rebuilding and rollout, QEMU test, troubleshooting |
+| `test-vm.sh` | optional rehearsal in QEMU: boot an image as a USB stick, or `--netboot` a published network build (DHCP + HTTP boot, no disk), optionally with enforced Secure Boot, in Setup Mode or sealed |
 | `hwtest-image.sh` | diagnostic stick for machines that reset/hang on the real stick: systemd-boot menu that starts the UKI layer by layer (see the script header) |
 | `secureboot-export.sh` | public Secure Boot keys and signed enrollment updates for `safespace-seal` |
 | `update-snapshot.sh` | moves the pinned package snapshot to the newest day |
@@ -284,15 +352,16 @@ packages would give you. Stock Arch defaults (e.g. the nftables ruleset in
 
 | Task | Command |
 |---|---|
-| Build | `sudo mkosi build` (`-f` to rebuild unchanged) |
-| Update packages | `./update-snapshot.sh && sudo mkosi -f build` |
-| Update shipped images | edit `docker-images.txt`, `./fetch-images.sh`, `sudo mkosi -f build` |
-| Force reinstalling all packages | `sudo mkosi -ff build` |
-| Show the resolved configuration | `mkosi summary` |
-| Look inside the image | `sudo mkosi shell` |
-| Test in a VM (no root) | `./test-vm.sh` or `./test-vm.sh --secure-boot` (needs `qemu-desktop edk2-ovmf`, for Secure Boot `virt-firmware`) |
+| Build | `sudo ./build.sh usb` or `sudo ./build.sh network` (`-f` to rebuild unchanged) |
+| Update packages | `./update-snapshot.sh && sudo ./build.sh <variant> -f` |
+| Update shipped images | edit `docker-images.txt`, `./fetch-images.sh`, `sudo ./build.sh <variant> -f` |
+| Force reinstalling all packages | `sudo ./build.sh <variant> -ff` |
+| Show the resolved configuration | `./build.sh <variant> summary` |
+| Look inside the image | `sudo mkosi --profile=<variant> shell` |
+| Test in a VM (no root) | `./test-vm.sh` / `./test-vm.sh --secure-boot`, or `./test-vm.sh --netboot` (DHCP + HTTP boot, no disk; needs `qemu-desktop edk2-ovmf`, for Secure Boot `virt-firmware`) |
 | Machine does not boot the stick | `./hwtest-image.sh`, write `mkosi.test/hwtest.img` with `dd`, try the menu entries in order |
-| Burn / check | `sudo ./burn.sh /dev/sdX`, `sudo ./diagnose.sh /dev/sdX` |
+| Burn / check (usb) | `sudo ./burn.sh /dev/sdX`, `sudo ./diagnose.sh /dev/sdX` |
+| Publish / roll out (network) | `./netboot-export.sh --rsync root@SERVER:/srv/netboot/safespace`, then boot the machine from the network ([NETBOOT.md](NETBOOT.md)) |
 | Delete outputs / also caches | `sudo mkosi clean` / `sudo mkosi -ff clean` |
 
 **Build host with many cores:** `cp mkosi.local.conf.example mkosi.local.conf` and set
@@ -353,11 +422,16 @@ on that machine.
 
 ## USB lockdown
 
-- `usbcore.authorized_default=0`: the kernel authorizes no USB device.
-- In the initrd, `usb-bootdev` authorizes hubs and mass-storage interfaces, waits up to 30 s for
-  the root partition (UUID derived from `roothash=`), revokes every USB device not on the path
-  to it, and marks the stick read-only. A second stick posing as root is rejected by dm-verity.
-- After boot, usbguard blocks every new device. Log: `journalctl -b -g usb-bootdev`.
+- `usbcore.authorized_default=0`: the kernel authorizes no USB device. Both variants.
+- usb variant: in the initrd, `usb-bootdev` authorizes hubs and mass-storage interfaces, waits
+  up to 30 s for the root partition (UUID derived from `roothash=`), revokes every USB device
+  not on the path to it, and marks the medium read-only. A second stick posing as root is
+  rejected by dm-verity.
+- network variant: nothing authorizes anything, because nothing is needed from USB — every USB
+  device stays unauthorized until usbguard is told otherwise (`sudo usbguard allow-device …`),
+  and a USB NIC cannot be used for booting.
+- After boot, usbguard blocks every new device. Log: `journalctl -b -g usb-bootdev` (usb) or
+  `journalctl -b -g netroot` (network).
 
 ## Open decisions
 
@@ -374,9 +448,15 @@ on that machine.
 
 ## Known open points
 
-- **Tested on one real machine only.** Firmware differs (FAT handling, UKI loading, option
-  ROMs when sealing with `--replace`); `hwtest-image.sh` helps to find out why a machine
-  doesn't boot.
+- **Tested on one real machine only** (usb variant). Firmware differs (FAT handling, UKI
+  loading, option ROMs when sealing with `--replace`); `hwtest-image.sh` helps to find out why
+  a machine doesn't boot.
+- **The network variant has not run on real hardware yet.** Open points specific to it:
+  UEFI HTTP boot has to be available (PXE/TFTP is a slow fallback); the ~110 MiB UKI may hit
+  firmware limits; the root image (~2 GiB) is downloaded into RAM on every boot, so the
+  machines need the RAM and the server the bandwidth; the server address is part of the signed
+  command line, so moving it means rebuilding; and a machine cannot boot at all while the
+  server is down. See [NETBOOT.md](NETBOOT.md), "Known limits".
 - `fetch-images.sh` is untested.
 - Without a data disk, the console shows "Dependency failed" for docker.socket,
   docker.service, containerd and the image loader. That's expected: they hard-require the
@@ -385,7 +465,8 @@ on that machine.
   - the UKI is signed with the build host's sbctl `db` key (a separate key for the sticks would
     be cleaner);
   - the build runs as root from a folder a normal user can write to;
-  - old signed images stay bootable;
+  - old signed images stay bootable (network: for as long as their directory is on the
+    server, which is also what makes a rollback work);
   - no kernel lockdown parameters.
 - The data disk is unverified. Shipped images are reloaded when their ID doesn't match, but
   Docker doesn't re-check layer contents that are already on the disk.

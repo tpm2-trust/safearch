@@ -2,15 +2,39 @@
 # Runs after the outputs exist in $OUTPUTDIR, before they move to mkosi.output/.
 set -euo pipefail
 
-# Firmware loads the whole UKI into memory over its own (slow) USB driver; a
-# few hundred MiB fails or stalls on many machines.
-limit_mib=100
+# Firmware loads the whole UKI into memory, over its own (slow) USB driver or
+# over the network; a few hundred MiB fails or stalls on many machines.
+# The netboot UKI carries the ethernet drivers and their firmware (~16 MiB) and
+# is not read from a USB stick, so it gets a higher limit. Keep it as small as
+# possible anyway: with a PXE/TFTP fallback every MiB is noticeable, and some
+# firmware fails on large network boot programs.
+case " ${PROFILES:-} " in
+	*" network "*) limit_mib=128 ;;
+	*) limit_mib=100 ;;
+esac
 for uki in "$OUTPUTDIR"/*.efi; do
 	[[ -e $uki ]] || continue
 	bytes=$(stat -c %s "$uki")
 	echo "safespace: UKI $(basename "$uki"): $((bytes / 1048576)) MiB"
 	((bytes <= limit_mib * 1048576)) || { echo "safespace: ERROR: UKI larger than $limit_mib MiB" >&2; exit 1; }
 done
+
+# The netboot UKI is useless without the URL it should load its root from.
+case " ${PROFILES:-} " in
+	*" network "*)
+		for uki in "$OUTPUTDIR"/*.efi; do
+			[[ -e $uki ]] || continue
+			if command -v objcopy >/dev/null; then
+				cmdline=$(objcopy -O binary --only-section=.cmdline "$uki" /dev/stdout 2>/dev/null | tr -d '\0')
+			else
+				cmdline=$(grep -ao 'safespace\.netroot=[^ ]*' "$uki" | tr '\n' ' ')
+			fi
+			[[ $cmdline == *safespace.netroot=* ]] ||
+				{ echo "safespace: ERROR: no safespace.netroot= in the UKI command line (build with ./build.sh network)" >&2; exit 1; }
+			echo "safespace: netroot URL(s): $(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace.netroot=//p' | tr '\n' ' ')"
+		done
+		;;
+esac
 
 # The keys shipped for safespace-seal must be the ones the UKI is signed with,
 # or a machine sealed from this stick refuses to boot it.

@@ -26,8 +26,10 @@ HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 
-UKI=${1:-$(ls -t "$HERE"/mkosi.output/*.efi 2>/dev/null | head -1 || true)}
-[[ -n $UKI && -f $UKI ]] || die "no UKI found (mkosi.output/*.efi)"
+# Default: the newest usb UKI (a network UKI would load its root over HTTP,
+# which says nothing about why this machine will not boot from a medium).
+UKI=${1:-$(ls -t "$HERE"/mkosi.output/*.efi 2>/dev/null | grep -v -- '-network_' | head -1 || true)}
+[[ -n $UKI && -f $UKI ]] || die "no UKI found (mkosi.output/*.efi; run: sudo ./build.sh usb)"
 STUB=/usr/lib/systemd/boot/efi/linuxx64.efi.stub
 BOOT=/usr/lib/systemd/boot/efi/systemd-bootx64.efi
 for f in "$STUB" "$BOOT"; do [[ -f $f ]] || die "$f missing (systemd, systemd-ukify)"; done
