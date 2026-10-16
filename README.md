@@ -46,10 +46,9 @@ sudo ./build.sh usb           # -> mkosi.output/safespace-arch-usb_<date-time>.r
 sudo ./burn.sh /dev/sdX       # writes the newest usb image to the medium
 sudo ./diagnose.sh /dev/sdX   # optional: verifies root on the medium block by block
 
-# variant network: UEFI HTTP/PXE boot (details and the server: NETBOOT.md)
-cp netboot.conf.example netboot.conf   # NETROOT_URL=http://SERVER/safespace/
-sudo ./build.sh network       # -> mkosi.output/safespace-arch-network_<date-time>.*
-./netboot-export.sh --rsync root@SERVER:/srv/netboot/safespace
+# variant network: UEFI HTTP/PXE boot
+sudo ./build.sh network       # URL from netboot.conf, see the next section
+./netboot-export.sh --rsync root@arch.boot.internal:/srv/netboot/safespace
 
 # on the machine, once per data disk (any disk except the boot medium):
 sudo mkfs.ext4 -L safespace-docker /dev/<datadisk>
@@ -65,6 +64,93 @@ Not tracked by git, created per user or host: `users.conf`, `netboot.conf`,
 (`mkosi.extra/usr/share/safespace/secureboot/`), shipped images
 (`mkosi.extra/usr/share/safespace/docker-images/`), caches, outputs and the staged
 netboot tree (`mkosi.netboot/`).
+
+## Network boot: build and provide
+
+Everything needed to build the `network` variant and put it in front of the machines, in
+order. This installation uses the name **`arch.boot.internal`** for the netboot server and
+`/srv/netboot/safespace` as the tree; the server itself (nginx, dnsmasq, DHCP options,
+Secure Boot enrollment, troubleshooting) is described in **[NETBOOT.md](NETBOOT.md)**.
+
+| | Value |
+|---|---|
+| netboot server (DNS A record) | `arch.boot.internal` |
+| tree on the server | `/srv/netboot/safespace/<version>/` plus `current -> <version>` |
+| boot file for the DHCP answer | `http://arch.boot.internal/safespace/current/boot.efi` |
+| root image URL signed into the UKI | `http://arch.boot.internal/safespace/<version>/` (from `netboot.conf`) |
+
+### Once, on the build host
+
+```sh
+sudo pacman -S --needed mkosi systemd-ukify sbctl efitools dosfstools mtools erofs-utils zstd skopeo
+sudo sbctl create-keys                  # if there are no Secure Boot keys yet
+cp users.conf.example users.conf        # your users and ssh keys
+sudo ./secureboot-export.sh             # public keys, so safespace-seal can enroll them
+cp netboot.conf.example netboot.conf    # NETROOT_URL=http://arch.boot.internal/safespace/
+```
+
+`netboot.conf` is where the name lives; `build.sh` appends the build version to it and signs
+the result into the UKI, which is why **changing the server address means rebuilding** — a
+name keeps that from happening when the server moves. Several URLs can be listed, tried in
+order (name first, address as fallback).
+
+### Once, on the network
+
+1. **DNS:** an A record `arch.boot.internal` pointing at whatever serves the files — the
+   netboot server, or the build host itself for a first test. The machines resolve it with
+   the DNS server they get from DHCP (in the initrd through systemd-networkd), so that
+   resolver has to know the name.
+2. **HTTP:** nginx with `root /srv/netboot;` and the tree in `/srv/netboot/safespace`
+   ([NETBOOT.md §2](NETBOOT.md#2-http-nginx)). For a first test, serving the staged tree from
+   the build host is enough:
+   ```sh
+   mkdir -p mkosi.test/docroot
+   ln -sfnT "$PWD/mkosi.netboot" mkosi.test/docroot/safespace   # same path as on the server
+   sudo python3 -m http.server 80 --directory mkosi.test/docroot
+   ```
+3. **DHCP:** two options, only for clients that ask for them
+   ([NETBOOT.md §3](NETBOOT.md#3-dhcp-and-the-boot-file)):
+   option **60** = `HTTPClient`, option **67** = `http://arch.boot.internal/safespace/current/boot.efi`.
+   Using the server's IP address instead of the name in option 67 avoids relying on the
+   firmware's own resolver, and can be changed any time without a rebuild.
+4. **Secure Boot:** enroll the `db` certificate on the machines, or boot them once in Setup
+   Mode and run `sudo safespace-seal`
+   ([NETBOOT.md](NETBOOT.md#secure-boot-on-the-clients)).
+
+### Every build
+
+```sh
+sudo ./build.sh network                 # -f to rebuild unchanged packages
+./netboot-export.sh --rsync root@arch.boot.internal:/srv/netboot/safespace
+```
+
+`build.sh` writes `mkosi.output/safespace-arch-network_<version>.{efi,root.raw.zst,root-verity.raw.zst,roothash}`.
+`netboot-export.sh` turns those into the three files the machines ask for — `boot.efi`,
+`root.img`, `root.verity` — in `<tree>/<version>/`, checks that they belong together (root
+hash from the signed UKI, `veritysetup verify` over the whole image, which key signed it),
+moves `current` to the new version and copies everything to the server. Machines take the new
+version on their next boot; a running machine is unaffected, it has everything in RAM.
+
+Rollback is moving the symlink back, on the server:
+
+```sh
+cd /srv/netboot/safespace && ln -sfn <older-version> .current.new && mv -T .current.new current
+```
+
+Old versions stay bootable while they are there (~2 GiB each); `./netboot-export.sh --prune 3`
+keeps the last three locally.
+
+### Check it
+
+```sh
+curl -I http://arch.boot.internal/safespace/current/boot.efi    # 200 + Content-Length
+./test-vm.sh --netboot                                          # optional rehearsal in QEMU
+```
+
+The QEMU rehearsal needs an image built for the VM's view of the host
+(`sudo ./build.sh network --url http://10.0.2.2:8000/`), so it is a separate build — see
+[NETBOOT.md](NETBOOT.md#optional-rehearse-it-in-qemu-first). On a booted machine:
+`journalctl -b -g netroot`, `findmnt /`, `veritysetup status root`, `df -h /run/netroot`.
 
 ## The boot medium is never written to
 
@@ -361,7 +447,7 @@ stops the build if no variant is selected.
 | Test in a VM (no root) | `./test-vm.sh` / `./test-vm.sh --secure-boot`, or `./test-vm.sh --netboot` (DHCP + HTTP boot, no disk; needs `qemu-desktop edk2-ovmf`, for Secure Boot `virt-firmware`) |
 | Machine does not boot the stick | `./hwtest-image.sh`, write `mkosi.test/hwtest.img` with `dd`, try the menu entries in order |
 | Burn / check (usb) | `sudo ./burn.sh /dev/sdX`, `sudo ./diagnose.sh /dev/sdX` |
-| Publish / roll out (network) | `./netboot-export.sh --rsync root@SERVER:/srv/netboot/safespace`, then boot the machine from the network ([NETBOOT.md](NETBOOT.md)) |
+| Publish / roll out (network) | `./netboot-export.sh --rsync root@arch.boot.internal:/srv/netboot/safespace`, then boot the machine from the network (["Network boot: build and provide"](#network-boot-build-and-provide)) |
 | Delete outputs / also caches | `sudo mkosi clean` / `sudo mkosi -ff clean` |
 
 **Build host with many cores:** `cp mkosi.local.conf.example mkosi.local.conf` and set

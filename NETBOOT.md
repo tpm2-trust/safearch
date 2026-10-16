@@ -16,6 +16,11 @@ The client writes nothing, anywhere — it has no boot medium at all.
 
 Nothing else is needed; `./test-vm.sh --netboot` is only an optional rehearsal in QEMU.
 
+This file is the reference and uses a generic server at `10.0.0.1`. The concrete values of
+this installation — the name `arch.boot.internal`, the tree `/srv/netboot/safespace` and the
+commands in order — are in README.md,
+["Network boot: build and provide"](README.md#network-boot-build-and-provide).
+
 ```
   machine (UEFI, Secure Boot on)                 server
   ──────────────────────────────                 ──────
