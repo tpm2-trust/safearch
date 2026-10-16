@@ -174,7 +174,7 @@ packages would give you. Stock Arch defaults (e.g. the nftables ruleset in
 | Setting | Why |
 |---|---|
 | `Format=disk`, `Bootable=yes` | bootable GPT image |
-| `Bootloader=systemd-boot` | mkosi's default for this setup would be a bare UKI as `\EFI\BOOT\BOOTX64.EFI`. Some firmware resets when its boot manager starts a 90 MiB UKI directly, but loads it fine for systemd-boot (found with `hwtest-image.sh`) |
+| `Bootloader=systemd-boot` | mkosi's default for this setup would be a bare UKI as `\EFI\BOOT\BOOTX64.EFI`. Some firmware resets when its boot manager starts a 90 MiB UKI directly, but loads it fine for systemd-boot (see "Troubleshooting") |
 | `ElTorito=no` | mkosi 27 adds an ISO9660/El Torito header for CD boot by default; a stick boots via GPT |
 | `SecureBoot=yes`, `SecureBootKey`/`Certificate` from `/var/lib/sbctl`, `SecureBootSignTool=systemd-sbsign`, `SecureBootAutoEnroll=no` | systemd-boot and the UKI are signed with the sbctl `db` key; no systemd-boot auto-enrollment files on the ESP (`safespace-seal` does enrollment) |
 | `Verity=hash` | dm-verity root; the root hash is on the signed kernel command line, no signature partition needed |
@@ -305,6 +305,51 @@ Quick start, plus the sbctl `db` key and certificate at the paths in `mkosi.conf
 Caches: `mkosi.pkgcache/` (packages) and `mkosi.cache/` (installed system,
 `Incremental=yes`). The cache skips package installation, not the erofs compression, which
 runs on every build. After editing `Packages=`, build with `-ff` to be safe.
+
+## Troubleshooting: the machine resets instead of booting
+
+**Case found so far** (one real machine, Secure Boot in Setup Mode): right after selecting the
+stick, the machine reset without any output. The same image booted in QEMU, and an Arch ISO
+booted from the same port.
+
+How it was narrowed down:
+
+1. **Is the right image on the stick?** `diagnose.sh` shows the build on the stick (root hash vs.
+   `mkosi.output/*.roothash`). The first attempt had an older build burned, with 4K FAT
+   sectors and a CD boot header; both are fixed in the build now (`-S512`, `ElTorito=no`).
+2. **Diagnostic stick.** `./hwtest-image.sh` builds a stick with a systemd-boot menu that starts
+   the same UKI layer by layer: the full UKI, the UKI without microcode, systemd-stub with the
+   kernel only, the kernel without stub, the kernel with initrd, with and without microcode.
+   **All entries booted**, including the unmodified UKI.
+3. **Compare the sticks.** Both FAT filesystems were identical apart from the label
+   (FAT32, 512-byte sectors, same geometry). The only difference left: on the real stick, the
+   firmware's boot manager started the 90 MiB UKI directly as `\EFI\BOOT\BOOTX64.EFI`; on
+   the diagnostic stick, systemd-boot (130 KiB) was `BOOTX64.EFI` and loaded the UKI.
+
+**Finding:** this firmware resets when its boot manager starts a 90 MiB UKI as
+`BOOTX64.EFI`, but loads the same file fine when systemd-boot asks for it. Hence
+`Bootloader=systemd-boot`: a small signed systemd-boot as `BOOTX64.EFI`, the UKI in
+`\EFI\Linux\`, no `loader.conf` (boots the only UKI immediately). With that, the stick boots
+on that machine.
+
+**If another machine doesn't boot:**
+
+1. `sudo ./diagnose.sh /dev/sdX`: right build, 512-byte FAT, no ISO9660 header,
+   systemd-boot as `BOOTX64.EFI`.
+2. Note when it fails (immediately without output, after kernel messages, after 30-90 s),
+   the Secure Boot state, and whether other live sticks boot.
+3. `./hwtest-image.sh`, then write the image (the script prints the `dd` command), try entries
+   1-6 and note which ones fail. Entries 3-6 print kernel messages from the start, so a crash
+   shows how far it got. The test files are unsigned: Secure Boot must be off or in Setup Mode.
+
+| Result | Points to |
+|---|---|
+| no menu at all | firmware can't start anything from this layout (partition table, FAT) |
+| 4 fails | kernel |
+| 4 boots, 3 fails | systemd-stub |
+| 5 boots, 6 fails / 2 boots, 1 fails | microcode |
+| 3 and 4 boot, 1/2/5/6 fail | initrd size or content |
+| all boot, real stick doesn't | how the firmware starts the real ESP's `BOOTX64.EFI` (the case above) |
 
 ## USB lockdown
 
