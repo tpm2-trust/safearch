@@ -48,7 +48,7 @@ sudo ./diagnose.sh /dev/sdX   # optional: verifies root on the medium block by b
 
 # variant network: UEFI HTTP/PXE boot
 sudo ./build.sh network       # URL from netboot.conf, see the next section
-./netboot-export.sh --rsync root@arch.boot.internal:/srv/netboot/safespace
+./netboot-export.sh --rsync arch.boot.internal:/srv/netboot/safespace
 
 # on the machine, once per data disk (any disk except the boot medium):
 sudo mkfs.ext4 -L safespace-docker /dev/<datadisk>
@@ -94,34 +94,150 @@ the result into the UKI, which is why **changing the server address means rebuil
 name keeps that from happening when the server moves. Several URLs can be listed, tried in
 order (name first, address as fallback).
 
-### Once, on the network
+### Once: ramp up the server
 
-1. **DNS:** an A record `arch.boot.internal` pointing at whatever serves the files — the
-   netboot server, or the build host itself for a first test. The machines resolve it with
-   the DNS server they get from DHCP (in the initrd through systemd-networkd), so that
-   resolver has to know the name.
-2. **HTTP:** nginx with `root /srv/netboot;` and the tree in `/srv/netboot/safespace`
-   ([NETBOOT.md §2](NETBOOT.md#2-http-nginx)). For a first test, serving the staged tree from
-   the build host is enough:
-   ```sh
-   mkdir -p mkosi.test/docroot
-   ln -sfnT "$PWD/mkosi.netboot" mkosi.test/docroot/safespace   # same path as on the server
-   sudo python3 -m http.server 80 --directory mkosi.test/docroot
-   ```
-3. **DHCP:** two options, only for clients that ask for them
-   ([NETBOOT.md §3](NETBOOT.md#3-dhcp-and-the-boot-file)):
-   option **60** = `HTTPClient`, option **67** = `http://arch.boot.internal/safespace/current/boot.efi`.
-   Using the server's IP address instead of the name in option 67 avoids relying on the
-   firmware's own resolver, and can be changed any time without a rebuild.
-4. **Secure Boot:** enroll the `db` certificate on the machines, or boot them once in Setup
-   Mode and run `sudo safespace-seal`
-   ([NETBOOT.md](NETBOOT.md#secure-boot-on-the-clients)).
+On the machine that `arch.boot.internal` will point at — a dedicated netboot server, or this
+build host (`172.17.2.155`) for a first test. All it does is serve the three files each
+machine downloads, over plain HTTP: the integrity comes from the Secure Boot signature and
+dm-verity, not from the transport. Replace `172.17.2.155` below with that machine's address.
+
+```sh
+# 1. web server (Arch; Debian/Ubuntu: apt install nginx-light)
+sudo pacman -S --needed nginx
+
+# 2. the tree the images are published into
+sudo install -d -m 0755 /srv/netboot/safespace
+# so netboot-export.sh --rsync can write without root ssh; use the account you
+# ssh in as from the build host
+sudo chown -R "$USER" /srv/netboot/safespace
+
+# 3. site configuration
+sudo tee /etc/nginx/conf.d/netboot.conf >/dev/null <<'NGINX'
+server {
+    listen        80 default_server;
+    listen        [::]:80 default_server;
+    server_name   arch.boot.internal;
+    root          /srv/netboot;
+
+    autoindex     off;
+    sendfile      on;
+    tcp_nopush    on;
+    server_tokens off;
+
+    location / { limit_except GET HEAD { deny all; } }
+}
+NGINX
+# the main config has to pull conf.d in (Debian uses sites-enabled instead)
+grep -qE '^[[:space:]]*include[[:space:]]+(/etc/nginx/)?conf\.d/\*\.conf;' /etc/nginx/nginx.conf ||
+    sudo sed -i '/^http {/a \    include conf.d/*.conf;' /etc/nginx/nginx.conf
+
+# 4. start it
+sudo nginx -t && sudo systemctl enable --now nginx
+
+# 5. firewall, only if one is active on this host
+sudo nft add rule inet filter input tcp dport 80 accept   # nftables
+# sudo firewall-cmd --permanent --add-service=http && sudo firewall-cmd --reload
+```
+
+Check it, after the first `./netboot-export.sh` has published a build:
+
+```sh
+curl -I http://arch.boot.internal/safespace/current/boot.efi    # 200 + Content-Length
+```
+
+`Content-Length` matters: the initrd uses it to size its tmpfs and to check there is enough
+RAM before downloading. nginx sends it for static files.
+
+Without nginx, for a throwaway test from the build host, this serves the staged tree under
+the same path (needs root for port 80, and it stays in the foreground):
+
+```sh
+mkdir -p mkosi.test/docroot
+ln -sfnT "$PWD/mkosi.netboot" mkosi.test/docroot/safespace
+sudo python3 -m http.server 80 --directory mkosi.test/docroot
+```
+
+### Once: configure DNS (you have to do this)
+
+The name is not optional: it is signed into the UKI, and the machines have no other way to
+find the root image. Create an **A record** `arch.boot.internal` → the IP of the server you
+just set up (`172.17.2.155` if that is this build host), in the DNS server that your DHCP
+hands out to the clients. Examples:
+
+| DNS server | What to add |
+|---|---|
+| dnsmasq | `host-record=arch.boot.internal,172.17.2.155` (or `address=/arch.boot.internal/172.17.2.155`) |
+| BIND, zone `boot.internal` | `arch    IN  A   172.17.2.155`, then `rndc reload` |
+| Unbound (OPNsense/pfSense: *Overrides*) | `local-data: "arch.boot.internal. A 172.17.2.155"` |
+| Pi-hole | *Local DNS → DNS Records*: `arch.boot.internal` → `172.17.2.155` |
+| Windows DNS | `dnscmd . /recordadd boot.internal arch A 172.17.2.155` |
+
+Verify from a machine on the same network as the clients (not from the server itself):
+
+```sh
+getent hosts arch.boot.internal          # or: nslookup arch.boot.internal
+curl -I http://arch.boot.internal/safespace/current/boot.efi
+```
+
+If the name cannot be resolved, `netroot` says `Could not resolve host` on the client's
+console. You can ride that out by listing a second URL with a plain IP address in
+`netboot.conf` (tried in order) and rebuilding.
+
+### Once: configure the DHCP server (you have to do this)
+
+The machines are told what to boot by **DHCP**; that is the only thing that has to change in
+your network. Two options, sent **only to clients that ask for them**:
+
+| Option | Value |
+|---|---|
+| 60, vendor class identifier | `HTTPClient` |
+| 67, boot file name | `http://172.17.2.155/safespace/current/boot.efi` (the server's IP) |
+
+Use the server's IP here rather than the name: option 67 is read by the firmware, whose own
+resolver is one more thing that can fail, and this value can be changed any time without
+rebuilding the image. (The name matters for the URL *inside* the UKI, which is the one that
+would otherwise force a rebuild.)
+
+If dnsmasq is your DHCP server, this is the whole change
+([NETBOOT.md §3](NETBOOT.md#3-dhcp-and-the-boot-file) has ISC dhcpd, Kea,
+OPNsense/pfSense and Windows Server, and the PXE/TFTP fallback):
+
+```ini
+# /etc/dnsmasq.d/netboot.conf
+dhcp-vendorclass=set:httpclient,HTTPClient:Arch:00016
+dhcp-match=set:httpclient,option:client-arch,16
+dhcp-option-force=tag:httpclient,60,HTTPClient
+dhcp-boot=tag:httpclient,http://172.17.2.155/safespace/current/boot.efi
+log-dhcp
+```
+
+```sh
+sudo systemctl restart dnsmasq
+journalctl -u dnsmasq -f        # watch a machine ask and get the URL
+```
+
+If the DHCP server on this network cannot set options 60/67 (most consumer routers), run the
+boot answer from the build host instead, without touching the router:
+[NETBOOT.md, "Quick one-off test on an existing LAN"](NETBOOT.md#quick-one-off-test-on-an-existing-lan).
+
+### Once: Secure Boot on the machines
+
+Enroll your `db` certificate, or boot a machine once in Setup Mode and run
+`sudo safespace-seal` on it — see
+[NETBOOT.md](NETBOOT.md#secure-boot-on-the-clients). Until then, boot with Secure Boot off;
+the dm-verity protection of the root image works either way, but the command line (and with
+it the root hash) is only trustworthy with Secure Boot on.
 
 ### Every build
 
 ```sh
 sudo ./build.sh network                 # -f to rebuild unchanged packages
-./netboot-export.sh --rsync root@arch.boot.internal:/srv/netboot/safespace
+
+# the server is another machine: publish locally and copy it over in one step
+./netboot-export.sh --rsync arch.boot.internal:/srv/netboot/safespace
+
+# or, if this build host serves the files itself: publish straight into the tree
+./netboot-export.sh --tree /srv/netboot/safespace
 ```
 
 `build.sh` writes `mkosi.output/safespace-arch-network_<version>.{efi,root.raw.zst,root-verity.raw.zst,roothash}`.
@@ -447,7 +563,7 @@ stops the build if no variant is selected.
 | Test in a VM (no root) | `./test-vm.sh` / `./test-vm.sh --secure-boot`, or `./test-vm.sh --netboot` (DHCP + HTTP boot, no disk; needs `qemu-desktop edk2-ovmf`, for Secure Boot `virt-firmware`) |
 | Machine does not boot the stick | `./hwtest-image.sh`, write `mkosi.test/hwtest.img` with `dd`, try the menu entries in order |
 | Burn / check (usb) | `sudo ./burn.sh /dev/sdX`, `sudo ./diagnose.sh /dev/sdX` |
-| Publish / roll out (network) | `./netboot-export.sh --rsync root@arch.boot.internal:/srv/netboot/safespace`, then boot the machine from the network (["Network boot: build and provide"](#network-boot-build-and-provide)) |
+| Publish / roll out (network) | `./netboot-export.sh --rsync arch.boot.internal:/srv/netboot/safespace`, then boot the machine from the network (["Network boot: build and provide"](#network-boot-build-and-provide)) |
 | Delete outputs / also caches | `sudo mkosi clean` / `sudo mkosi -ff clean` |
 
 **Build host with many cores:** `cp mkosi.local.conf.example mkosi.local.conf` and set

@@ -466,7 +466,7 @@ In this mode the ~100 MiB UKI comes over TFTP, which takes a few minutes; the ~2
 image still comes over HTTP at full speed. Proxy DHCP cannot reliably drive UEFI **HTTP**
 boot (the firmware wants the URL and the `HTTPClient` vendor class from the DHCP server that
 owns the network), so for the fast path configure the real DHCP server, or give the test
-machines their own VLAN with dnsmasq as in [Case A](#3-dhcp-and-the-boot-file-dnsmasq).
+machines their own VLAN with dnsmasq as in [Case A](#3-dhcp-and-the-boot-file).
 
 ## Secure Boot on the clients
 
