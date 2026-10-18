@@ -44,7 +44,7 @@ from the DHCP answer, downloads it into memory and starts it. All that is needed
 machine is a NIC the firmware supports and "network boot" enabled; everything else is the
 server's answer. A machine whose firmware cannot do that at all is the only case where a small
 local boot medium is needed — see
-[Machines without HTTP boot or PXE](#machines-without-http-boot-or-pxe).
+[the netstick](#machines-that-cannot-network-boot-the-uki-the-netstick).
 
 **Everything the client trusts is inside the signed UKI**, nothing comes from the
 server unverified:
@@ -75,6 +75,7 @@ only UEFI x86-64 clients.
 | `./netboot-export.sh` | the **publish step**: turns mkosi's output into the three files the firmware and the initrd ask for (`boot.efi`, `root.img`, `root.verity`), decompresses them, checks that they belong together, puts them in `<tree>/<version>/` and moves `current`. Optionally rsyncs to the server | **yes** (or do it by hand, see below) |
 | dnsmasq + nginx on the server | the DHCP answer and the files over HTTP | **yes** |
 | `./test-vm.sh --netboot` | a rehearsal of exactly that in QEMU, on your build host, before you touch hardware | no, optional |
+| `./netstick.sh` | a loader-only USB stick for machines whose firmware cannot network-boot the UKI ([netstick](#machines-that-cannot-network-boot-the-uki-the-netstick)) | only for such machines |
 
 Nothing is installed on the machine itself, and the machine needs no local file. See
 [Boot a real machine](#boot-a-real-machine).
@@ -87,6 +88,12 @@ Nothing is installed on the machine itself, and the machine needs no local file.
   Prefer the HTTP entry; a PXE entry that is tried first and gets an HTTP URL as its boot
   file fails with `PXE-E23` and the firmware moves on to the next entry. The dnsmasq
   configuration below avoids that by answering each client according to what it asks for.
+  **UEFI HTTP boot is the intended path**: the firmware downloads the signed UKI itself
+  and checks it against `db`, no extra loader in between. PXE/TFTP is only the
+  alternative for older machines whose firmware has no HTTP boot (e.g. the ThinkPad
+  T450s, [Case found](#case-found-thinkpad-t450s-bios-jbet73ww)); it starts the same
+  signed UKI directly. iPXE is not part of either path (it was only used to diagnose
+  the T450s).
 - **A PCI/PCIe NIC.** USB NICs do not work: the kernel authorizes no USB device
   (`usbcore.authorized_default=0`), and unlike the usb variant there is no initrd step
   that authorizes anything.
@@ -101,14 +108,14 @@ Nothing is installed on the machine itself, and the machine needs no local file.
 
 ## Build and publish
 
-Once per build host, as for the usb variant: `users.conf`, `safespace.env`, and
-`sudo ./secureboot-export.sh` (needed so that `safespace-seal` can enroll the keys).
+Once per build host, as for the usb variant: `users.conf` and `safespace.env`. The public
+Secure Boot keys for `safespace-seal` are exported by `build.sh` on every build.
 Then set the URL of your netboot tree:
 
 ```sh
 cp netboot.conf.example netboot.conf     # NETROOT_URL=http://10.0.0.1/safespace/
 sudo ./build.sh network                  # -> mkosi.output/safespace-arch-network_<version>.*
-./netboot-export.sh                      # -> mkosi.netboot/<version>/ and current -> <version>
+./netboot-export.sh                      # stages mkosi.netboot/<version>/ + current; not yet on the server
 ```
 
 `build.sh` appends the build version to `NETROOT_URL` and signs it into the UKI, so
@@ -188,7 +195,11 @@ older ones.
 ### 2. HTTP (nginx)
 
 `/etc/nginx/conf.d/netboot.conf` (Arch) or `/etc/nginx/sites-available/netboot`
-(Debian; symlink it into `sites-enabled/` and remove the default site):
+(Debian; symlink it into `sites-enabled/` and remove the default site). Arch ships
+neither `conf.d/` nor an include for it: `install -d /etc/nginx/conf.d` and add
+`include conf.d/*.conf;` inside `http { }` in `nginx.conf` (the README's server
+ramp-up does both). The stock `server_name localhost` block in Arch's `nginx.conf`
+can stay; the block below is the `default_server`.
 
 ```nginx
 server {
@@ -272,6 +283,8 @@ dhcp-boot=tag:efi64,safespace/current/boot.efi,,10.0.0.1
 dhcp-boot=tag:efi64-bc,safespace/current/boot.efi,,10.0.0.1
 enable-tftp
 tftp-root=/srv/netboot
+# all of TFTP on port 69, so a firewall only needs UDP 69 (and 67/4011 for DHCP)
+tftp-single-port
 
 log-dhcp
 ```
@@ -292,8 +305,11 @@ port=0
 dhcp-range=10.0.0.0,proxy
 pxe-service=tag:efi64,x86-64_EFI,"safespace netboot",safespace/current/boot.efi
 dhcp-match=set:efi64,option:client-arch,7
+dhcp-match=set:efi64,option:client-arch,9
 enable-tftp
 tftp-root=/srv/netboot
+# all of TFTP on port 69, so a firewall only needs UDP 69 (and 67/4011 for DHCP)
+tftp-single-port
 log-dhcp
 ```
 
@@ -438,6 +454,9 @@ To try a real machine before setting up a server: the only thing the LAN's own D
 will not tell the machine is where to boot from, and dnsmasq can add just that answer
 without handing out addresses ("proxy DHCP"), so the existing DHCP server is untouched.
 Everything runs on the build host; `dnsmasq` is the only extra package (`pacman -S dnsmasq`).
+This works for **PXE only**: dnsmasq in proxy mode answers only clients that announce
+`PXEClient`, so UEFI HTTP boot (options 60/67) always needs the DHCP server that hands out
+the address. `./pxe-proxy.sh BOOTFILE` runs step 3 below with the values of this host.
 
 ```sh
 # 1. build for the build host's own address (a port above 1024 needs no root
@@ -449,18 +468,25 @@ sudo ./build.sh network --url http://192.168.1.10:8000/
 (cd mkosi.netboot && python3 -m http.server 8000) &
 
 # 3. answer only the boot question on the LAN, and hand out the UKI over TFTP
-sudo dnsmasq -d -q --port=0 --dhcp-range=192.168.1.0,proxy \
+sudo dnsmasq -d --port=0 --dhcp-range=192.168.1.0,proxy --log-dhcp \
      --dhcp-match=set:efi64,option:client-arch,7 \
      --dhcp-match=set:efi64,option:client-arch,9 \
-     --pxe-service=tag:efi64,x86-64_EFI,"safespace netboot",current/boot.efi \
-     --enable-tftp --tftp-root="$PWD/mkosi.netboot"
+     '--pxe-service=tag:efi64,x86-64_EFI,safespace netboot,current/boot.efi' \
+     --enable-tftp --tftp-root="$PWD/mkosi.netboot" --tftp-single-port
 
 # 4. on the test machine: one-time boot menu -> "UEFI PXEv4 ..."
 ```
 
+`./pxe-proxy.sh BOOTFILE` runs step 3 for you against `/srv/netboot` (`--root` for another
+tree), with interface and subnet taken from the default route, and logs to
+`mkosi.test/dnsmasq.log`, e.g. `sudo ./pxe-proxy.sh safespace/current/boot.efi`.
+
 Use your own addresses: `192.168.1.10` is the build host, `192.168.1.0` the LAN that the
 machine gets its address from. dnsmasq stays in the foreground and logs every DHCP and TFTP
-request, which is exactly what you want to watch.
+request, which is exactly what you want to watch. A firewall between the machine and the build host has
+to let through UDP 67 and 4011 (proxy DHCP) and UDP 69 (TFTP, all of it with
+`--tftp-single-port`). Proxy DHCP only works on the machine's own L2 segment: a build host
+in a VM behind NAT never sees the broadcasts.
 
 In this mode the ~100 MiB UKI comes over TFTP, which takes a few minutes; the ~2 GiB root
 image still comes over HTTP at full speed. Proxy DHCP cannot reliably drive UEFI **HTTP**
@@ -473,7 +499,7 @@ machines their own VLAN with dnsmasq as in [Case A](#3-dhcp-and-the-boot-file).
 The firmware checks a downloaded boot file exactly like one from an ESP: the UKI's
 signature must match a certificate in `db`. So nothing special is needed for netboot —
 but the `db` certificate has to be on the machine. Three ways, all using the keys that
-`secureboot-export.sh` put into the image:
+`build.sh` exports into every image (`secureboot-export.sh`):
 
 1. **Seal from the netboot itself** (no stick needed). Firmware setup: *Reset to Setup
    Mode* / *Clear Secure Boot keys*. With no keys enrolled, Secure Boot cannot be
@@ -502,7 +528,7 @@ Notes:
   Secure Boot off, or boot a different URL.
 - `netboot-export.sh` prints the certificate the UKI is signed with, and warns if it is
   not the `db.pem` shipped in the image (a sealed machine would refuse that UKI).
-- Rotating keys means: `sudo ./secureboot-export.sh`, rebuild, publish, and re-seal the
+- Rotating keys means: new keys in sbctl, rebuild (the build exports them), publish, and re-seal the
   machines (the enrollment files carry a newer timestamp, so they replace the old ones).
 
 ## A host name instead of an IP address
@@ -543,7 +569,7 @@ every file name and of the URL inside the UKI, so builds never overwrite each ot
 
 ```sh
 # 1. change what you want, e.g.
-./update-snapshot.sh                 # newest Arch Linux Archive day
+./update-snapshot.sh                 # newest Arch Linux Archive day (repos.conf)
 vim users.conf mkosi.conf            # users, packages, …
 ./fetch-images.sh                    # shipped Docker images
 
@@ -587,6 +613,17 @@ This is only a rehearsal on the build host — it is not needed for, and says no
 a particular piece of hardware. It is useful to check the artifacts, the initrd and the
 Secure Boot signature before carrying anything into a server room.
 
+A published build, from the real server, by pure UEFI HTTP boot (no local server, no
+special build; the VM reaches the server through QEMU's NAT and resolves names through the
+host):
+
+```sh
+./test-vm.sh --netboot --url http://10.0.0.1/safespace/current/boot.efi --ssh 2222
+./test-vm.sh --netboot --url http://10.0.0.1/safespace/current/boot.efi --setup-mode --ssh 2222   # then safespace-seal inside, then --sealed
+```
+
+Or a self-contained lab on the build host:
+
 ```sh
 # built for the VM: QEMU's user network is the host at 10.0.2.2, and the
 # console= part puts the kernel and netroot messages into mkosi.test/serial.log
@@ -627,26 +664,150 @@ which files the VM asked the HTTP server for. With `--ssh 2222` you can log in a
 around: `journalctl -b -g netroot`, `findmnt /`, `df -h /run/netroot`,
 `veritysetup status root`.
 
-## Machines without HTTP boot or PXE
+## Machines that cannot network-boot the UKI: the netstick
 
-Still UEFI, but with no usable network boot in the firmware: make a small stick that only
-holds the netboot UKI. The machine boots that locally and still loads its root over the
-network. ~120 MiB are enough, and the UKI is signed, so Secure Boot stays intact.
+Still UEFI, but the firmware has no usable network boot — no HTTP boot or PXE at all, or,
+as on the ThinkPad T450s with Intel AMT enabled (below), a network boot that cannot start
+any image it loaded.
+Such a machine boots a **netstick**: a small USB stick that holds only the loader —
+signed systemd-boot and the signed network UKI, the same layout as the usb variant's ESP.
+Everything else still comes from the netboot server: the initrd gets its address from the
+normal DHCP server (no boot options, no proxy DHCP, no TFTP needed) and loads
+`root.img`/`root.verity` over HTTP, checked against the root hash in the signed UKI.
 
 ```sh
-dev=/dev/sdX                                   # CAREFUL: destroys the medium
-uki=mkosi.netboot/current/boot.efi
-sudo sfdisk --label gpt "$dev" <<<'start=1MiB, size=256MiB, type=uefi'
-sudo mkfs.vfat -F32 -S512 -n SAFEBOOT "${dev}1"
-sudo mount "${dev}1" /mnt
-sudo install -D /usr/lib/systemd/boot/efi/systemd-bootx64.efi /mnt/EFI/BOOT/BOOTX64.EFI
-sudo sbctl sign /mnt/EFI/BOOT/BOOTX64.EFI      # with the same db key
-sudo install -D "$uki" "/mnt/EFI/Linux/safespace.efi"
-sudo umount /mnt
+sudo ./build.sh network                       # add --debug for ethtool, dmidecode, kexec-tools, ...
+./netboot-export.sh --tree /srv/netboot/safespace   # or --rsync; the stick needs a published version
+sudo ./netstick.sh --tree /srv/netboot/safespace    # -> mkosi.output/safespace-arch-netstick_<version>.raw
+sudo dd if=mkosi.output/safespace-arch-netstick_<version>.raw of=/dev/sdX bs=4M conv=fsync oflag=direct status=progress
+sudo ./diagnose.sh /dev/sdX                   # ESP, signatures, and whether the server serves its root
 ```
 
-(systemd-boot with no `loader.conf` starts the single UKI immediately. The UKI is
-already signed by the build; `sbctl sign` is only for systemd-boot itself.)
+(`sudo ./burn.sh --netstick /dev/sdX` does the `dd` with the usual safety checks.)
+
+- `netstick.sh` takes the UKI from the **published** tree (default `mkosi.netboot/current`,
+  `--version` for another one), i.e. after `netboot-export.sh` has verified it against its
+  root image, and refuses a UKI whose netroot URL does not end in that version.
+- It signs systemd-boot with the key and sign tool mkosi uses (`mkosi --json summary`,
+  so `mkosi.local.conf` overrides count) and checks that systemd-boot and the UKI have the
+  same signer. Secure Boot stays intact: nothing unsigned is on the stick.
+- Image: GPT with one ESP (FAT32, 512-byte sectors), `\EFI\BOOT\BOOTX64.EFI` and
+  `\EFI\Linux\safespace-arch-network_<version>.efi`, no `loader.conf`: systemd-boot starts
+  the UKI immediately and writes nothing to the stick.
+- **The stick is tied to its version**: the UKI loads `<base>/<version>/`, so it boots as
+  long as the server keeps that version, and a new release needs a new stick.
+- The stick is only read while the firmware loads the UKI; afterwards the kernel ignores
+  it (`usbcore.authorized_default=0`), it can even be pulled.
+
+### Case found: ThinkPad T450s (BIOS JBET73WW)
+
+**Result:** with **Intel AMT disabled** in the BIOS (*Config → Intel AMT → Intel AMT
+Support: Disabled*) the T450s network-boots over PXE/TFTP, as long as the UKI stays
+below the firmware's size limit for network boot programs: images of 17, 48, 80 and
+82 MiB start, 112 MiB does not (the limit is somewhere in between). That is why the
+network UKI is trimmed (see [Size of the network UKI](#size-of-the-network-uki)).
+**Verified end to end** with the trimmed 82 MiB UKI (`20261018-1559-debug`): firmware
+PXE → TFTP download → UKI starts → DHCP in the initrd → `root.verity` and `root.img`
+over HTTP → verified root mounted → login over ssh. No iPXE, no stick.
+
+This is the path for old machines without UEFI HTTP boot; machines with HTTP boot use
+that (the intended path, also without iPXE). The netstick stays the fallback for a
+machine where AMT has to stay on.
+
+What follows is how it was found. The firmware offers only PXE (no HTTP boot entry; "UEFI Network Stack" on, the LAN boot
+entry prints `Start PXE over IPv4` / `Station IP address …`). With proxy DHCP and TFTP
+(see [Quick one-off test](#quick-one-off-test-on-an-existing-lan)) every file arrives
+completely, but **nothing except iPXE ever runs**:
+
+| Loaded by | Image | Result |
+|---|---|---|
+| firmware PXE | the UKI (112 MiB) | downloaded once completely, then nothing; another time the firmware stopped after the size probe (`tsize`) and went back to the boot menu |
+| firmware PXE | systemd-boot (160 KiB), systemd-stub + kernel (17 MiB) | reboot |
+| firmware PXE | EFI shell | nothing |
+| firmware PXE | iPXE `snponly.efi` | **runs**, network works |
+| iPXE | the UKI, a rebuilt UKI with `efi=debug earlyprintk=efi`, systemd-stub + kernel, the bare kernel (with and without initrd), systemd-boot, the EFI shell (also starting the UKI as a file from iPXE's virtual filesystem), a second iPXE | hang, not a single kernel or EFI-stub message |
+| USB stick | systemd-boot → UKI | **boots** |
+
+So it is not the images (same PE flags, alignment and sizes boot from the stick) but the
+state the firmware's network boot leaves behind. With **AMT enabled**, the I218-LM is
+shared with the Intel ME, and the firmware's AMT drivers (MEBx, IDE-R, Serial-over-LAN)
+run their own callbacks on that NIC. Traced inside iPXE (debug builds with
+markers around `LoadImage`/`StartImage`):
+
+1. iPXE's default `ipxe.efi` and `snponly.efi` hang right after `autoexec.ipxe… not found`,
+   when iPXE takes the NIC over. Visible with `DEBUG=efi_driver`: the last line is
+   `EFIDRV … using driver "NIIONLY"` (iPXE prefers the NII/UNDI interface). With NII
+   disabled it uses `SNPONLY`; then it hangs when it publishes its own SNP device and HII
+   form back to the firmware. With those disabled too, iPXE's network works: DHCP, ping,
+   the 112 MiB UKI over HTTP in about a second.
+2. `LoadImage()` of any downloaded image returns fine. `StartImage()` is never reached:
+   iPXE hangs in `efi_snp_release()`, which lowers the TPL back to `TPL_APPLICATION`.
+   Lowering the TPL lets the firmware's pending event callbacks run, and one of them does
+   not return. **Every** TPL drop hangs at that point (also `DisconnectController()`,
+   which iPXE calls at the external TPL).
+3. Starting the image without lowering the TPL reaches `StartImage()`, but the image does
+   not run (the UEFI spec requires `StartImage()` below `TPL_CALLBACK`).
+4. Leaving the firmware's network stack bound (MNP instead of SNP, or SNP opened shared
+   instead of `BY_DRIVER|EXCLUSIVE`) leaves iPXE without a working network.
+
+With AMT enabled, the firmware's own network stack, once the PXE boot has used it and the
+NIC has been taken over, cannot survive a TPL drop, and loading the next image needs one.
+The iPXE patches tried (NII, HII and the SNP provider off, markers in `efi_image.c`) are
+not kept in this repository: they did not lead to a working boot, disabling AMT did.
+
+Then, read from the running system (netstick, `--debug` build, Lenovo WMI settings via
+`think-lmi`): BIOS 1.37 is the last release, the NIC is an Intel I218-LM (vPro/AMT) with
+the ME active, `AMTControl=Enable`. With AMT disabled, the firmware's own PXE starts
+systemd-boot and Linux images of 17, 48 and 80 MiB; the 112 MiB UKI is downloaded
+completely but not started (or the firmware gives up after the size probe), and a
+UKI-sized test image (padding instead of an initrd) behaves the same: a size limit, not
+the UKI's content.
+
+How to recognise the case on another machine: the files are delivered completely
+(dnsmasq logs `sent …`, nginx `200` with the full size), yet the machine reboots, returns
+to the boot menu or hangs without a single kernel message, also for small images.
+
+## Size of the network UKI
+
+Firmware loads the UKI as a network boot program, and some firmware cannot start a
+large one (T450s: 82 MiB fine, 112 MiB not). **The current size, 82 MiB, is fine**; the
+80 MiB warning only marks the largest size tested before the trimmed build, not a
+limit. `mkosi.postoutput` prints the size of each
+part of the network UKI, **warns above 80 MiB** and stops the build above 128 MiB
+(per host: `Environment=SAFESPACE_UKI_WARN_MIB=… SAFESPACE_UKI_LIMIT_MIB=…` in
+`mkosi.local.conf`).
+
+| Part | Size | |
+|---|---|---|
+| kernel | ~16 MiB | fixed |
+| microcode | ~16 MiB | all Intel CPUs; kept, it carries CPU security fixes |
+| initrd | ~48 MiB (78 MiB untrimmed) | trimmed for the netroot path |
+| **UKI** | **~82 MiB** (112 MiB untrimmed) | boots over PXE on the T450s |
+
+The network initrd only has to bring up the NIC, fetch and verify the root image and
+mount it, so the initrd (of both variants, to keep them aligned) trims what mkosi's default
+initrd brings along:
+
+- **Drivers** (`KernelInitrdModules=`): an explicit list instead of mkosi's default set —
+  dm-verity, loop, erofs, crypto, virtio_net for QEMU (`mkosi.conf`, both variants), and
+  for the network variant the client NIC families (`mkosi.profiles/network/mkosi.conf`) (Intel e1000/e1000e/igb/igc/ixgbe, Realtek, Broadcom
+  tg3/b44, Marvell sky2, Atheros, Aquantia, AMD pcnet32) with PHY/MDIO helpers. No
+  server NICs (Mellanox, QLogic, Chelsio, Solarflare, Intel i40e/ice, Broadcom bnx2x …)
+  and their firmware, no storage or filesystem drivers. To netboot a machine with
+  another NIC, add its driver there.
+- **Programs** (`mkosi.initrd.conf/mkosi.conf`, `RemoveFiles=`, both variants):
+  filesystem tools (btrfs, xfs, ext4, vfat), systemd tools without a job in the initrd,
+  glibc's charset converters, the gcc sanitizer runtimes, certificate CLIs, and
+  terminal/timezone/keymap data beyond the console defaults.
+
+The usb variant uses the same trimmed initrd with its own boot-path drivers (USB host
+controllers, USB storage, MMC, card readers) instead of the NICs; it would not need the
+size, but both variants stay aligned.
+
+Cosmetic: mkosi copies the kernel's full module index into the initrd (all ~6500 modules,
+of which ~200 are shipped), so udev in the initrd logs `error=No such file or directory`
+for drivers of hardware it finds but has no module for (kvm, mei, wmi, sound, ...). The
+real system loads them from the root image.
 
 ## Troubleshooting
 
@@ -656,11 +817,19 @@ already signed by the build; `sbctl sign` is only for systemd-boot itself.)
 | "unsupported image", "invalid boot file" or the firmware restarts the boot menu | the machine booted in legacy BIOS/CSM mode: the boot file is a UEFI binary. Set the firmware to UEFI only and use the "UEFI …" network entry |
 | DHCP but no download | `journalctl -u dnsmasq -f`: does the client get option 60/67? HTTP boot needs both. `curl -I` the URL from another machine |
 | firmware downloads, then "Access Denied" / nothing | Secure Boot is enforced but `db` does not have your certificate: seal the machine (see above). `netboot-export.sh` prints the signer |
-| firmware resets or hangs on the download | the UKI may be too large for this firmware: shrink it (`KernelInitrdModules=` in `mkosi.profiles/network/mkosi.conf`, e.g. only `/drivers/net/ethernet/intel/`) and rebuild; or use the boot-stick fallback |
+| firmware resets or hangs on the download | the UKI may be too large for this firmware: shrink it (`KernelInitrdModules=` in `mkosi.profiles/network/mkosi.conf`, e.g. only `/drivers/net/ethernet/intel/`) and rebuild; or use a [netstick](#machines-that-cannot-network-boot-the-uki-the-netstick) |
 | `netroot: no link reported as online` | NIC driver missing in the initrd (add it to `KernelInitrdModules=`), no DHCP on that port, or the NIC is on USB (not supported) |
 | `netroot: not enough RAM` | the machine cannot hold the root image; more RAM, or a smaller image (fewer packages) |
 | `netroot: download … failed` | nginx not running, wrong path, or firewall; the message contains curl's own error |
 | `netroot: dm-verity refused the image` | `root.img`/`root.verity` in that directory are not the ones the UKI was signed for: republish with `netboot-export.sh` (it checks this before publishing) |
+| the screen says `Start PXE over IPv4`, `Station IP address …`, but nginx sees nothing | that is the firmware's **PXE** client, not HTTP boot: it wants a TFTP file name and a TFTP server, an HTTP URL in option 67 fails. Enable HTTP boot and pick the "HTTPv4" entry, or serve the UKI over TFTP (dnsmasq `pxe-service` / proxy DHCP, [Quick one-off test](#quick-one-off-test-on-an-existing-lan)) |
+| proxy DHCP (dnsmasq) logs nothing when the client boots | the broadcasts do not reach dnsmasq: another L2 segment (e.g. the build host is a VM behind NAT), or a firewall in between. Proxy DHCP needs UDP 67 and 4011, TFTP UDP 69 (with `--tftp-single-port` nothing else) |
+| dnsmasq: `error 8 User aborted the transfer` | harmless if a `sent …` follows: UEFI PXE asks for the file size first (`tsize`) and aborts on purpose. Without a second request the firmware refused the file (too large for it) |
+| the client fetches the old boot file after a change | dnsmasq still runs with the previous command line (shell history); restart it with the new one |
+| iPXE runs a different script than expected | iPXE (EFI) loads `autoexec.ipxe` from the TFTP server **before** its embedded script; remove a stale one. Arch's `ipxe` package also ships `ipxe-arch.efi`, which boots Arch Linux's own netboot: use `ipxe.efi`/`snponly.efi` |
+| a UKI over PXE: downloaded completely, then back to PXE or stuck after `NBP file …` | too large for this firmware's network boot (T450s: 82 MiB works, 112 MiB fails): check the size `mkosi.postoutput` prints, keep the network UKI below the limit ([Size of the network UKI](#size-of-the-network-uki)) |
+| on a machine with Intel AMT (vPro, e.g. Intel I218-LM/I219-LM): only iPXE runs over PXE, everything else reboots or hangs | disable Intel AMT in the BIOS ([Case found](#case-found-thinkpad-t450s-bios-jbet73ww)) |
+| files arrive completely, then reboot / hang / back to the boot menu, even for small images | the firmware cannot start a network-loaded image (ThinkPad T450s): use a [netstick](#machines-that-cannot-network-boot-the-uki-the-netstick) |
 | boot stops in the initrd emergency shell | `journalctl -b -g netroot`, then `ip a`, `curl -I <url>/root.img` from the shell |
 | host key warnings on every ssh login | expected: `/var` is RAM, so ssh host keys are new on every boot (README, "Open decisions") |
 
@@ -681,7 +850,9 @@ already signed by the build; `sbctl sign` is only for systemd-boot itself.)
 - An old version stays bootable as long as it is on the server (as with old signed
   sticks: whoever can reach the server can boot an old build, which is why only the
   ones you still want should be there).
-- Not tested on real hardware yet. In QEMU (OVMF) the whole chain was tested end to end:
+- Real hardware: a ThinkPad T450s (no HTTP boot) network-boots over PXE/TFTP only with
+  Intel AMT disabled and a UKI that is not much larger than the current 82 MiB (see [Case found](#case-found-thinkpad-t450s-bios-jbet73ww)); with
+  AMT on it needs a netstick. In QEMU (OVMF) the whole chain was tested end to end:
   DHCP → UEFI HTTP boot of the signed UKI → DHCP in the initrd → `root.verity` and
   `root.img` over HTTP → `veritysetup open` against the signed root hash → the real
   safespace root mounted → login prompt, with no disk attached to the VM. Real firmware

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Build one of the two safespace-arch variants with mkosi.
 #
-#   sudo ./build.sh usb     [MKOSI OPTIONS...]
-#   sudo ./build.sh network [--url BASE_URL]... [MKOSI OPTIONS...]
+#   sudo ./build.sh usb     [--workers N] [--debug] [MKOSI OPTIONS...]
+#   sudo ./build.sh network [--url BASE_URL]... [--workers N] [--debug] [MKOSI OPTIONS...]
 #
 #   usb      a bootable USB stick / SD card: ESP with signed systemd-boot and
 #            UKI, erofs root and its dm-verity hash tree on the medium.
@@ -18,13 +18,31 @@
 # than once for failover (tried in order), or put it in netboot.conf
 # (NETROOT_URL=, see netboot.conf.example) and leave the option out.
 #
-# Everything after the variant (and --url) is passed to mkosi unchanged, e.g.
+# Package source: SNAPSHOT= and MIRROR= in repos.conf, overridden per host by
+# repos.local.conf (see repos.local.conf.example). A pinned date, or latest,
+# each with mkosi's default mirror or your own. Not settable on the command
+# line, so every build of a checkout uses the same source; build.sh checks
+# that the mirror serves core.db before the build starts.
+#
+# --workers N  threads for the erofs compression of the root (mkfs.erofs,
+#              default 4; 0 would mean single-threaded, so N >= 1). Overrides
+#              mkosi.local.conf for this run; set it there to keep it.
+#
+# --debug      add the "debug" profile (mkosi.profiles/debug/: ethtool,
+#              dmidecode, pciutils, kexec-tools, tcpdump, ...) and append
+#              "-debug" to the image version.
+#
+# Everything else after the variant is passed to mkosi unchanged, e.g.
 #   sudo ./build.sh usb -f          force a rebuild of unchanged packages
 #   sudo ./build.sh network summary show the resolved configuration
 #
 # Building needs root, because the UKI is signed with the sbctl db key in
 # /var/lib/sbctl, which is readable by root only. Read-only verbs (summary,
 # cat-config) run as a normal user.
+#
+# Every build exports the public Secure Boot keys it signs with into the image
+# (secureboot-export.sh), so safespace-seal works in both variants, and
+# creates the expected-PCR signing key on the first build (lib/keys.sh).
 set -Eeuo pipefail
 
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
@@ -42,17 +60,30 @@ esac
 
 URLS=()
 NETROOT=()
+WORKERS=""
+DEBUG=0
 MKOSI_ARGS=()
 while (($#)); do
 	case $1 in
 		--url) URLS+=("${2:?--url needs a base URL}"); shift 2 ;;
 		--url=*) URLS+=("${1#--url=}"); shift ;;
+		--workers) WORKERS=${2:?--workers needs a thread count}; shift 2 ;;
+		--workers=*) WORKERS=${1#--workers=}; shift ;;
+		--debug) DEBUG=1; shift ;;
+		-m* | --mirror | --mirror=* | --snapshot | --snapshot=*)
+			die "$1: the package source is set in repos.conf / repos.local.conf (SNAPSHOT=, MIRROR=)" ;;
 		-h | --help) usage; exit 0 ;;
 		*) MKOSI_ARGS+=("$1"); shift ;;
 	esac
 done
+[[ -z $WORKERS || $WORKERS =~ ^[1-9][0-9]*$ ]] || die "--workers needs a thread count >= 1, got '$WORKERS'"
 
 command -v mkosi >/dev/null || die "mkosi not found (pacman -S mkosi)"
+
+# shellcheck source=lib/repos.sh
+source "$HERE/lib/repos.sh"
+repos_load "$HERE"
+mapfile -t REPO_ARGS < <(repos_mkosi_args)
 
 # No verb in the arguments: build. Only the verbs that touch the image need root.
 VERB=build
@@ -70,12 +101,28 @@ case $VERB in
 		[[ -f $HERE/users.conf ]] || die "users.conf missing: cp users.conf.example users.conf and add your ssh keys"
 		;;
 esac
+if [[ $VERB == build ]]; then
+	# Host tools that mkosi (without a tools tree) runs from the host.
+	missing=()
+	for tool in cpio curl ukify sbctl mkfs.erofs mkfs.vfat mcopy zstd systemd-repart openssl cert-to-efi-sig-list sign-efi-sig-list; do
+		command -v "$tool" >/dev/null || missing+=("$tool")
+	done
+	[[ -x /usr/lib/systemd/systemd-measure ]] || command -v systemd-measure >/dev/null || missing+=(systemd-measure)
+	((${#missing[@]} == 0)) ||
+		die "missing host tools: ${missing[*]} (see README.md, Quick start: pacman -S --needed ...)"
+fi
 
 # The same version goes into the output names and, for the network variant,
 # into the netroot URL, so it must be fixed here instead of letting mkosi run
 # ./mkosi.version twice.
 VERSION=$("$HERE/mkosi.version")
-EXTRA=(--profile="$VARIANT" --image-version="$VERSION")
+PROFILES=(--profile="$VARIANT")
+if ((DEBUG)); then
+	PROFILES+=(--profile=debug)
+	VERSION+=-debug
+fi
+EXTRA=("${PROFILES[@]}" --image-version="$VERSION" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"})
+[[ -z $WORKERS ]] || EXTRA+=(--environment="SYSTEMD_REPART_MKFS_OPTIONS_EROFS=--workers=$WORKERS")
 
 if [[ $VARIANT == network ]]; then
 	if ((${#URLS[@]} == 0)); then
@@ -94,8 +141,22 @@ if [[ $VARIANT == network ]]; then
 	done
 fi
 
-log "Running variant $VARIANT, version $VERSION"
+log "Running variant $VARIANT$( ((DEBUG)) && echo ' + debug'), version $VERSION"
+log "packages: $(repos_describe)"
 ((${#NETROOT[@]})) && log "netroot: ${NETROOT[*]}"
+[[ -n $WORKERS ]] && log "erofs compression: $WORKERS threads"
+if [[ $VERB == build ]]; then
+	repos_check
+	# shellcheck source=lib/keys.sh
+	source "$HERE/lib/keys.sh"
+	summary=$(mktemp)
+	mkosi "${EXTRA[@]}" --json summary >"$summary" || { rm -f "$summary"; die "mkosi summary failed"; }
+	keys_load "$summary"
+	rm -f "$summary"
+	keys_export_secureboot "$HERE"
+	keys_ensure_pcr
+	[[ $SNAPSHOT == latest ]] && log "note: SNAPSHOT=latest reuses the cached image as long as the configuration is unchanged; -f installs the current packages"
+fi
 set -x
 mkosi "${EXTRA[@]}" ${MKOSI_ARGS[@]+"${MKOSI_ARGS[@]}"} ${APPEND_VERB:+build}
 { set +x; } 2>/dev/null

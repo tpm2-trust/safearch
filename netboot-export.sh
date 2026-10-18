@@ -34,6 +34,8 @@ log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 warn() { printf '\e[1;33m==> WARNING:\e[0m %s\n' "$*" >&2; }
 die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,${/^#/!q;s/^# \?//;p}' "$0"; }
+# shellcheck source=lib/uefi.sh
+source "$HERE/lib/uefi.sh"
 
 TREE=$HERE/mkosi.netboot
 VERSION="" RSYNC="" CURRENT=1 PRUNE=0 CONFIRM=1
@@ -111,17 +113,8 @@ done
 
 # --- signature ------------------------------------------------------------------
 
-SIGNER=$(python3 -I - "$UKI" <<-'EOF' | openssl pkcs7 -inform DER -print_certs 2>/dev/null
-	import struct, sys
-	d = open(sys.argv[1], 'rb').read()
-	opt = struct.unpack_from('<I', d, 0x3c)[0] + 24
-	dd = opt + (112 if struct.unpack_from('<H', d, opt)[0] == 0x20b else 96)
-	off, size = struct.unpack_from('<II', d, dd + 32)
-	if not size: sys.exit('UKI is not signed')
-	length = struct.unpack_from('<I', d, off)[0]
-	sys.stdout.buffer.write(d[off + 8:off + length])
-	EOF
-) || die "the UKI is not signed: the firmware will refuse it with Secure Boot on"
+SIGNER=$(uefi_signer "$UKI" 2>/dev/null) && [[ -n $SIGNER ]] ||
+	die "the UKI is not signed: the firmware will refuse it with Secure Boot on"
 log "signed by: $(openssl x509 -noout -subject -nameopt oneline <<<"$SIGNER" | sed 's/^subject=//')"
 log "           $(openssl x509 -noout -fingerprint -sha256 <<<"$SIGNER")"
 db=$HERE/mkosi.extra/usr/share/safespace/secureboot/db.pem

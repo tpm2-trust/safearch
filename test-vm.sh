@@ -4,6 +4,7 @@
 #
 #   ./test-vm.sh [IMAGE] [--secure-boot | --setup-mode | --sealed] [--ssh PORT]
 #   ./test-vm.sh --netboot [--tree DIR] [--tftp] [--secure-boot | ...] [--ssh PORT]
+#   ./test-vm.sh --netboot --url BOOT_URL [--secure-boot | ...] [--ssh PORT]
 #
 # --netboot: a local netboot lab, no disk at all -- a rehearsal of the real
 #   thing on this host. A real machine needs none of this: it is told to boot
@@ -26,6 +27,11 @@
 #   firmware without UEFI HTTP boot. The root image still comes over HTTP.
 # --tree DIR: netboot tree to serve (a tree with current/, or a version
 #   directory).
+# --url BOOT_URL: no local server; UEFI HTTP boot of a published UKI from a
+#   real netboot server, e.g. http://10.0.0.1/safespace/current/boot.efi.
+#   The VM reaches it through QEMU's NAT and resolves names with the host's
+#   DNS, so a normal build (netboot.conf URL) is tested as published, exactly
+#   as a machine on the LAN would boot it.
 #
 # --secure-boot: enforced Secure Boot with only the UKI's own signing
 #   certificate in db (taken from the signature, so no root needed). Needs
@@ -44,12 +50,13 @@ HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 
-IMAGE="" SB=0 SETUP=0 SEALED=0 SSH_PORT="" NETBOOT=0 TREE="" NBMODE=http
+IMAGE="" SB=0 SETUP=0 SEALED=0 SSH_PORT="" NETBOOT=0 TREE="" NBMODE=http BOOT_URL=""
 while (($#)); do
 	case $1 in
 		--netboot) NETBOOT=1; shift ;;
 		--tftp) NBMODE=tftp; shift ;;
 		--tree) TREE=${2:?--tree needs a directory}; shift 2 ;;
+		--url) BOOT_URL=${2:?--url needs the URL of boot.efi}; shift 2 ;;
 		--secure-boot) SB=1; shift ;;
 		--setup-mode) SETUP=1; shift ;;
 		--sealed) SEALED=1; shift ;;
@@ -67,7 +74,22 @@ mkdir -p "$WORK"
 # RAM for the VM; MEM= in the environment overrides.
 MEM=${MEM:-}
 RAW=""
-if ((NETBOOT)); then
+[[ -z $BOOT_URL ]] || ((NETBOOT)) || die "--url needs --netboot"
+if ((NETBOOT)) && [[ -n $BOOT_URL ]]; then
+	[[ -z $IMAGE && -z $TREE && $NBMODE == http ]] || die "--url takes no image, --tree or --tftp"
+	[[ $BOOT_URL =~ ^https?://[^/]+/.+ ]] || die "--url needs a full http(s) URL of boot.efi: $BOOT_URL"
+	# A local copy only to read the signed command line (and the signer for
+	# --secure-boot); the VM downloads its own.
+	uki=$WORK/remote-boot.efi
+	curl -fsS -o "$uki" "$BOOT_URL" || die "cannot download $BOOT_URL"
+	cmdline=$(objcopy -O binary --only-section=.cmdline "$uki" /dev/stdout 2>/dev/null | tr -d '\0')
+	NETROOT_URL=$(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace.netroot=//p' | head -1)
+	[[ -n $NETROOT_URL ]] || die "$BOOT_URL has no safespace.netroot= on its command line (not a network build)"
+	root_bytes=$(curl -fsSI "${NETROOT_URL%/}/root.img" | tr -d '\r' | awk 'tolower($1) == "content-length:" { print $2 }')
+	[[ $root_bytes =~ ^[0-9]+$ ]] || die "the server does not serve ${NETROOT_URL%/}/root.img"
+	MEM=${MEM:-$((root_bytes / 1048576 + 2048))}
+	log "UKI from $BOOT_URL, root from $NETROOT_URL"
+elif ((NETBOOT)); then
 	[[ -z $IMAGE ]] || die "--netboot takes no image (it boots the UKI from the netboot tree)"
 	TREE=${TREE:-$HERE/mkosi.netboot}
 	BOOTDIR=$TREE/current
@@ -176,7 +198,9 @@ boot=()
 if ((NETBOOT)); then
 	# DHCP (QEMU's user network) tells the firmware what to boot; -boot order=n
 	# makes the firmware's network boot option the first one.
-	if [[ $NBMODE == http ]]; then
+	if [[ -n $BOOT_URL ]]; then
+		nic+=",bootfile=$BOOT_URL"
+	elif [[ $NBMODE == http ]]; then
 		# UEFI HTTP boot: the boot file is a URL, the firmware downloads it
 		# itself. This is what a machine on a real network does.
 		nic+=",bootfile=http://10.0.2.2:$port/$urlpath/boot.efi"

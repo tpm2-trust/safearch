@@ -4,7 +4,11 @@
 Description=Populate volatile /var from /usr/share/factory/var
 DefaultDependencies=no
 RequiresMountsFor=/var
+# Everything that writes to /var early starts right after var.mount; without
+# the explicit order these race the copy (cp: "File exists").
 Before=local-fs.target systemd-tmpfiles-setup.service systemd-journal-flush.service
+Before=systemd-random-seed.service systemd-tpm2-setup.service systemd-timesyncd.service
+Before=systemd-pcrproduct.service systemd-pcrmachine.service systemd-update-utmp.service
 Conflicts=shutdown.target
 ConditionDirectoryNotEmpty=/usr/share/factory/var
 

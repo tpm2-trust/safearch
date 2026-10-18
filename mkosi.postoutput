@@ -4,19 +4,32 @@ set -euo pipefail
 
 # Firmware loads the whole UKI into memory, over its own (slow) USB driver or
 # over the network; a few hundred MiB fails or stalls on many machines.
-# The netboot UKI carries the ethernet drivers and their firmware (~16 MiB) and
-# is not read from a USB stick, so it gets a higher limit. Keep it as small as
-# possible anyway: with a PXE/TFTP fallback every MiB is noticeable, and some
-# firmware fails on large network boot programs.
+# The netboot UKI is the stricter case: firmware loads it as a network boot
+# program, and some cannot start a large one (ThinkPad T450s: 80 MiB fine,
+# 112 MiB not, the limit is in between; see NETBOOT.md). Its initrd is trimmed
+# for that (mkosi.profiles/network/, mkosi.initrd.conf/mkosi.profiles/network/).
+# Above the warning size the build continues but says so; above the limit it
+# fails. Both per host, e.g. in mkosi.local.conf:
+#   [Build]
+#   Environment=SAFESPACE_UKI_WARN_MIB=90 SAFESPACE_UKI_LIMIT_MIB=100
 case " ${PROFILES:-} " in
-	*" network "*) limit_mib=128 ;;
-	*) limit_mib=100 ;;
+	*" network "*) warn_mib=${SAFESPACE_UKI_WARN_MIB:-80} limit_mib=${SAFESPACE_UKI_LIMIT_MIB:-128} ;;
+	*) warn_mib=${SAFESPACE_UKI_WARN_MIB:-100} limit_mib=${SAFESPACE_UKI_LIMIT_MIB:-100} ;;
 esac
+for v in warn_mib limit_mib; do
+	[[ ${!v} =~ ^[1-9][0-9]*$ ]] || { echo "safespace: ERROR: SAFESPACE_UKI_${v^^}=${!v} is not a number" >&2; exit 1; }
+done
 for uki in "$OUTPUTDIR"/*.efi; do
 	[[ -e $uki ]] || continue
 	bytes=$(stat -c %s "$uki")
-	echo "safespace: UKI $(basename "$uki"): $((bytes / 1048576)) MiB"
+	echo "safespace: UKI $(basename "$uki"): $((bytes / 1048576)) MiB (warning above $warn_mib MiB, limit $limit_mib MiB)"
+	# Where the size comes from, so growth is visible at build time.
+	if command -v objdump >/dev/null; then
+		objdump -h "$uki" | awk '$2 ~ /^\.(linux|initrd|ucode)$/ { printf "safespace:   %-8s %4d MiB\n", $2, strtonum("0x" $3) / 1048576 }' || true
+	fi
 	((bytes <= limit_mib * 1048576)) || { echo "safespace: ERROR: UKI larger than $limit_mib MiB" >&2; exit 1; }
+	((bytes <= warn_mib * 1048576)) ||
+		echo "safespace: WARNING: UKI larger than $warn_mib MiB: some firmware cannot start a network boot program this large (NETBOOT.md, \"Size of the network UKI\")" >&2
 done
 
 # The netboot UKI is useless without the URL it should load its root from.
@@ -38,10 +51,24 @@ esac
 
 # The keys shipped for safespace-seal must be the ones the UKI is signed with,
 # or a machine sealed from this stick refuses to boot it.
+# build.sh exports them before every build; a missing export means mkosi was
+# run directly.
 keys=$SRCDIR/mkosi.extra/usr/share/safespace/secureboot
-if [[ ! -f $keys/db.pem ]]; then
-	echo "safespace: no Secure Boot keys in the image (safespace-seal disabled; run secureboot-export.sh)"
-	exit 0
+if [[ ! -f $keys/db.pem || ! -f $keys/PK.auth ]]; then
+	echo "safespace: ERROR: no Secure Boot keys in the image, safespace-seal would not work (build with ./build.sh)" >&2
+	exit 1
+fi
+# Only public material: certificates, signed updates, the GUID.
+for f in "$keys"/* "$keys"/.[!.]*; do
+	[[ -e $f ]] || continue
+	case ${f##*/} in
+		PK.pem | KEK.pem | db.pem | PK.auth | KEK.auth | db.auth | KEK-append.auth | db-append.auth | GUID) ;;
+		*) echo "safespace: ERROR: unexpected file in the shipped Secure Boot keys: $f" >&2; exit 1 ;;
+	esac
+done
+if grep -alq -- 'PRIVATE KEY' "$keys"/*; then
+	echo "safespace: ERROR: private key material in $keys" >&2
+	exit 1
 fi
 for uki in "$OUTPUTDIR"/*.efi; do
 	[[ -e $uki ]] || continue

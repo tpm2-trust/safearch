@@ -26,6 +26,7 @@ mkosi.crt
 mkosi.local.conf
 users.conf
 netboot.conf
+repos.local.conf
 
 # Generated into the image tree by fetch-images.sh and secureboot-export.sh.
 mkosi.extra/usr/share/safespace/docker-images/

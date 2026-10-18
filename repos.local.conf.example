@@ -1,0 +1,10 @@
+# Per-host package source. Copy to repos.local.conf (ignored by git); keys set
+# here override repos.conf. See repos.conf for the meaning and URL layout.
+#
+# Newest packages from a nearby normal mirror:
+#SNAPSHOT=latest
+#MIRROR=https://ftp.fau.de/archlinux
+#
+# The pinned snapshot, but from an Arch Linux Archive mirror instead of
+# archive.archlinux.org (must serve <MIRROR>/repos/<date>/):
+#MIRROR=https://archive.example.org
