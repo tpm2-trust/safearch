@@ -294,7 +294,20 @@ storage, network RemoveFiles trimming.
 - [x] 5. tmpfiles `00-safespace-links.conf` (`L /home`, `L /root`). The initrd
       module-load errors: mkosi ships the full module index (6518 entries, 214
       modules); cosmetic, documented.
-- [ ] 6. Test: rebuild network, netboot the T450s: `systemctl --failed` (docker
+- [x] 6. Test (20261018-2009-debug): T450s over PXE, sealed with
+      safespace-seal, Secure Boot enabled (user); var-factory, tmpfiles and the
+      shipped keys fine; only the NvPCR units fail (old Intel PTT, "Device not a
+      stream", ignored). QEMU (nested KVM): pure UEFI HTTP boot from nginx via
+      `test-vm.sh --netboot --url`, system "running", no failed system units.
+      Open: usb build in QEMU; fluidsynth user unit fails (no SoundFont).
+- [x] 8. VMs: README "A netbooting VM": plain QEMU (headless) and a persistent
+      libvirt machine (own NAT network with bootp URL, virt-install, Setup Mode,
+      PXE off via fw_cfg `opt/org.tianocore/IPv4PXESupport=n`/`IPv6PXESupport=n`,
+      `--reset-nvram`); DNS through the VM host's resolver (IP or IP fallback in
+      NETROOT_URL). Confirmed by the user on their libvirt host. `test-vm.sh`:
+      `--url` for a published build, PXE off in HTTP mode. pxe-proxy.sh keeps
+      mkosi.test/ owned by the project user.
+      Was: rebuild network, netboot the T450s: `systemctl --failed` (docker
       aside), `safespace-seal` finds the keys, `.pcrsig`/`.pcrpkey` in the UKI.
       Old TPMs (T450s: Intel PTT fw 10.0, 2013) are ignored: the NvPCR units
       may fail there. usb build: same checks in QEMU; network: pure UEFI HTTP

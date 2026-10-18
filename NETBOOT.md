@@ -622,6 +622,10 @@ host):
 ./test-vm.sh --netboot --url http://10.0.0.1/safespace/current/boot.efi --setup-mode --ssh 2222   # then safespace-seal inside, then --sealed
 ```
 
+A netbooting VM of its own (plain QEMU, or a persistent libvirt machine for virt-manager,
+with PXE switched off in OVMF so it goes straight to HTTP boot):
+[README, "A netbooting VM"](README.md#a-netbooting-vm-qemu-libvirt--virt-manager).
+
 Or a self-contained lab on the build host:
 
 ```sh
@@ -830,6 +834,8 @@ real system loads them from the root image.
 | a UKI over PXE: downloaded completely, then back to PXE or stuck after `NBP file …` | too large for this firmware's network boot (T450s: 82 MiB works, 112 MiB fails): check the size `mkosi.postoutput` prints, keep the network UKI below the limit ([Size of the network UKI](#size-of-the-network-uki)) |
 | on a machine with Intel AMT (vPro, e.g. Intel I218-LM/I219-LM): only iPXE runs over PXE, everything else reboots or hangs | disable Intel AMT in the BIOS ([Case found](#case-found-thinkpad-t450s-bios-jbet73ww)) |
 | files arrive completely, then reboot / hang / back to the boot menu, even for small images | the firmware cannot start a network-loaded image (ThinkPad T450s): use a [netstick](#machines-that-cannot-network-boot-the-uki-the-netstick) |
+| a VM (OVMF) shows `Start PXE over IPv4` before HTTP boot | OVMF tries its PXE entries first; switch them off with fw_cfg `opt/org.tianocore/IPv4PXESupport=n` / `IPv6PXESupport=n` ([README, "A netbooting VM"](README.md#a-netbooting-vm-qemu-libvirt--virt-manager)) |
+| a VM: `netroot: download … failed`, `Could not resolve host` | the VM's virtual network resolves through the VM host's resolver, which does not know the name in `NETROOT_URL`: put the IP (or the IP as a second URL) into `netboot.conf` and rebuild |
 | boot stops in the initrd emergency shell | `journalctl -b -g netroot`, then `ip a`, `curl -I <url>/root.img` from the shell |
 | host key warnings on every ssh login | expected: `/var` is RAM, so ssh host keys are new on every boot (README, "Open decisions") |
 

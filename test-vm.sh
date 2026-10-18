@@ -198,6 +198,12 @@ boot=()
 if ((NETBOOT)); then
 	# DHCP (QEMU's user network) tells the firmware what to boot; -boot order=n
 	# makes the firmware's network boot option the first one.
+	# HTTP boot: no PXE boot entries in OVMF, which would otherwise be tried
+	# first and fail on the URL.
+	[[ $NBMODE == http ]] && extra+=(
+		-fw_cfg name=opt/org.tianocore/IPv4PXESupport,string=n
+		-fw_cfg name=opt/org.tianocore/IPv6PXESupport,string=n
+	)
 	if [[ -n $BOOT_URL ]]; then
 		nic+=",bootfile=$BOOT_URL"
 	elif [[ $NBMODE == http ]]; then

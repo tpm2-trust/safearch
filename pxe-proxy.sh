@@ -57,6 +57,9 @@ fi
 
 LOG=$HERE/mkosi.test/dnsmasq.log
 mkdir -p "$(dirname "$LOG")"
+touch "$LOG"
+# Keep the project owned by its user, not by root (test-vm.sh writes there too).
+chown --reference="$HERE" "$(dirname "$LOG")" "$LOG"
 log "Proxy DHCP on $IFACE ($SUBNET), TFTP root $ROOT"
 log "Boot file: $BOOTFILE ($(($(stat -c %s "$ROOT/$BOOTFILE") / 1024)) KiB)"
 log "Log: $LOG"

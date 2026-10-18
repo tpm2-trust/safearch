@@ -323,10 +323,127 @@ curl -I http://arch.boot.internal/safespace/current/boot.efi    # 200 + Content-
 
 `test-vm.sh --netboot --url` boots the published build in QEMU by pure UEFI HTTP boot from
 the real server (through QEMU's NAT, names resolved by the host), as a machine on the LAN
-would. Without `--url` the rehearsal serves a local tree and needs an image built for the
-VM's view of the host (`sudo ./build.sh network --url http://10.0.2.2:8000/`) — see
+would.
+
+Without `--url` the rehearsal serves a local tree and needs an image built for the VM's view
+of the host (`sudo ./build.sh network --url http://10.0.2.2:8000/`) — see
 [NETBOOT.md](NETBOOT.md#optional-rehearse-it-in-qemu-first). On a booted machine:
 `journalctl -b -g netroot`, `findmnt /`, `veritysetup status root`, `df -h /run/netroot`.
+
+### A netbooting VM (QEMU, libvirt / virt-manager)
+
+A VM that boots the published build exactly like a machine on the LAN: pure UEFI HTTP boot of
+the signed UKI from the server, no disk, no iPXE. Two forms, both tested: a plain
+`qemu-system-x86_64` command, or a persistent libvirt machine that shows up in virt-manager.
+
+Common to both:
+
+- **Firmware:** OVMF with Secure Boot and **no** enrolled keys, so the VM starts in Setup
+  Mode; `sudo safespace-seal` inside seals it, and from the next start on it boots the UKI only
+  with enforced Secure Boot. Its NVRAM (a file of its own) keeps that state. With enrolled
+  keys, libvirt's Secure Boot firmware would trust only Microsoft's and refuse the UKI.
+- **PXE off in the firmware:** OVMF creates PXEv4, PXEv6, HTTPv4 and HTTPv6 boot entries for
+  the NIC, PXE first. The PXE entry gets the URL, cannot use it and fails, and only then does
+  HTTPv4 load the UKI. Two fw_cfg settings of OVMF remove the PXE entries, so the firmware
+  goes straight to `Start HTTP Boot over IPv4`: `opt/org.tianocore/IPv4PXESupport=n` and
+  `opt/org.tianocore/IPv6PXESupport=n`. They apply to the boot entries the firmware creates;
+  an NVRAM that already has PXE entries is reset once (below).
+- **DHCP and DNS** come from the virtual network (QEMU's user network or a libvirt NAT
+  network), which uses the **resolver of the VM host**. A host name in the root URL (the
+  `NETROOT_URL` signed into the UKI) only resolves if that host's DNS knows it. If not, use
+  the server's IP in `netboot.conf`, or the name plus the IP as fallback
+  (`NETROOT_URL="http://arch.boot.internal/safespace/ http://10.0.0.1/safespace/"`, tried in
+  order), and rebuild. Check on the VM host: `getent hosts arch.boot.internal`.
+- **RAM:** at least root.img + 2 GiB (4 GiB).
+
+#### Plain QEMU, headless
+
+On any host with QEMU and OVMF, no checkout needed. Arch paths; Debian/Ubuntu:
+`/usr/share/OVMF/OVMF_CODE_4M.secboot.fd` and `OVMF_VARS_4M.fd`. Runs in the foreground,
+also as root over ssh without a desktop; Ctrl-C stops it.
+
+```sh
+cp /usr/share/edk2/x64/OVMF_VARS.4m.fd safespace-vm-vars.fd      # once: the VM's NVRAM
+qemu-system-x86_64 -machine q35,smm=on,accel=kvm -cpu host -smp 2 -m 4096 -global driver=cfi.pflash01,property=secure,value=on -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd -drive if=pflash,format=raw,file=safespace-vm-vars.fd -fw_cfg name=opt/org.tianocore/IPv4PXESupport,string=n -fw_cfg name=opt/org.tianocore/IPv6PXESupport,string=n -nic user,model=virtio-net-pci,bootfile=http://10.0.0.1/safespace/current/boot.efi,hostfwd=tcp:127.0.0.1:2222-:22 -boot order=n -display none -serial file:safespace-vm-serial.log
+ssh -p 2222 <user>@127.0.0.1                                      # after ~1 min; a user from users.conf
+```
+
+| Part | Why |
+|---|---|
+| `OVMF_CODE.secboot.4m.fd` (read-only pflash) | the UEFI firmware, shared by all VMs; the build with Secure Boot |
+| `safespace-vm-vars.fd` (writable pflash) | this VM's NVRAM: boot entries and the Secure Boot keys `safespace-seal` writes. A fresh copy = Setup Mode again |
+| `smm=on`, `cfi.pflash01,property=secure` | only the firmware (in SMM) may write the keys, not the guest |
+| `-fw_cfg name=opt/org.tianocore/IPv4PXESupport,string=n` (and IPv6) | no PXE boot entries: HTTP boot right away |
+| `-nic user,…,bootfile=` | QEMU's user network is the DHCP server, `bootfile=` is its option 67 (the server's IP, so the firmware needs no DNS) |
+| `hostfwd=tcp:127.0.0.1:2222-:22` | ssh into the VM from this host only (`tcp::2222-:22` opens it to the network) |
+| `-display none`, `-serial file:…` | no window; `safespace-vm-serial.log` shows the firmware's netboot (`Start HTTP Boot over IPv4`, `Downloading...100%`). The kernel console is not on the serial port (no `console=ttyS0` in the UKI), so the system is reached over ssh |
+
+Without Secure Boot in the VM: `OVMF_CODE.4m.fd`, and drop `smm=on` and the `-global` option.
+
+#### Persistent machine in libvirt (virt-manager)
+
+libvirt's user network has no `bootfile=`, so the boot URL comes from the DHCP server of a
+small libvirt NAT network of its own; other networks and VMs stay untouched. As root on the
+VM host (change `192.168.150.0/24` if it is in use there).
+
+1. The network; its DHCP sends the boot URL (option 67):
+
+   ```sh
+   virsh net-define /dev/stdin <<'EOF'
+   <network>
+     <name>safespace-netboot</name>
+     <forward mode='nat'/>
+     <bridge name='virbr-ssnb'/>
+     <ip address='192.168.150.1' netmask='255.255.255.0'>
+       <dhcp>
+         <range start='192.168.150.100' end='192.168.150.199'/>
+         <bootp file='http://10.0.0.1/safespace/current/boot.efi'/>
+       </dhcp>
+     </ip>
+   </network>
+   EOF
+   virsh net-autostart safespace-netboot && virsh net-start safespace-netboot
+   ```
+
+2. The machine: UEFI with Secure Boot and no keys (Setup Mode), no disk, the NIC as the only
+   boot device:
+
+   ```sh
+   virt-install --name safespace-netboot --memory 4096 --vcpus 2 --cpu host-passthrough --machine q35 --boot uefi,network,firmware.feature0.name=secure-boot,firmware.feature0.enabled=yes,firmware.feature1.name=enrolled-keys,firmware.feature1.enabled=no --network network=safespace-netboot,model=virtio --disk none --pxe --osinfo linux2022 --graphics vnc --noautoconsole
+   ```
+
+3. PXE off: `virsh edit safespace-netboot` and add, directly inside `<domain>`
+   (libvirt ≥ 6.5):
+
+   ```xml
+   <sysinfo type='fwcfg'>
+     <entry name='opt/org.tianocore/IPv4PXESupport'>n</entry>
+     <entry name='opt/org.tianocore/IPv6PXESupport'>n</entry>
+   </sysinfo>
+   ```
+
+   Then start it once with a fresh NVRAM, so the PXE entries of the first start go away. This
+   also clears its Secure Boot keys: seal the VM after this start, not before.
+
+   ```sh
+   virsh destroy safespace-netboot; virsh start safespace-netboot --reset-nvram
+   ```
+
+The VM appears in virt-manager as `safespace-netboot`, with its console there. Its address,
+for ssh from the VM host:
+
+```sh
+virsh net-dhcp-leases safespace-netboot
+ssh <user>@192.168.150.1xx
+```
+
+It boots what `current` points to; to pin a version, put it into `<bootp file=…>`
+(`virsh net-edit safespace-netboot`, then `virsh net-destroy` and `virsh net-start`). Remove
+it all again:
+
+```sh
+virsh destroy safespace-netboot; virsh undefine --nvram safespace-netboot; virsh net-destroy safespace-netboot; virsh net-undefine safespace-netboot
+```
 
 ## The boot medium is never written to
 
