@@ -4,8 +4,7 @@
 Description=Watch the safespace share for new releases
 
 [Path]
-PathChanged=@SHARE@/network/release
-PathChanged=@SHARE@/usb/release
+PathChanged=@SHARE@/release
 
 [Install]
 WantedBy=multi-user.target

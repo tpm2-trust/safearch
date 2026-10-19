@@ -1,10 +1,10 @@
 #!/bin/sh
-# Runs in mkosi's default initrd (bash as sh, coreutils, sed, kmod), started
-# by usb-bootdev.service, only with usbcore.authorized_default=0. The partition
-# to wait for is taken from, in this order: rd.usbroot=<PARTUUID>,
-# root=PARTUUID=..., roothash= (dm-verity: the root data partition's UUID is
-# the first 128 bits of the root hash), or the EFI variable LoaderDevicePartUUID
-# (the ESP the UKI was started from, set by systemd-stub).
+# The boot path from a stick / SD card. Runs in mkosi's default initrd (bash as
+# sh, coreutils, sed, kmod, veritysetup), started by usb-bootdev.service when
+# systemd-boot started the UKI from a partition (LoaderDevicePartUUID). The
+# partitions to wait for are named by the signed root hash: the root data
+# partition's UUID is its first 128 bits, the hash partition's its last 128
+# bits (as systemd-repart sets them).
 #
 # 1. Interfaces start unauthorized on every controller, so authorizing a device
 #    only configures it; no driver binds until we authorize an interface.
@@ -19,6 +19,10 @@
 #    write to the stick, not even root.
 # 4. Restore interface_authorized_default=1 so devices that usbguard later
 #    allows work normally; new devices are still denied at device level.
+# 5. Open the root through dm-verity with the signed root hash as
+#    /dev/mapper/root (root= on the command line), --panic-on-corruption: a
+#    modified or damaged block stops the machine. (systemd's own verity
+#    generator is switched off, systemd.verity=no, as for the network path.)
 #
 # Progress goes to the kernel log, so it shows on the console and in
 # `journalctl -b -g usb-bootdev` after boot.
@@ -31,24 +35,13 @@ msg() { echo "usb-bootdev: $*" >/dev/kmsg; }
 cmdline=$(cat /proc/cmdline)
 arg() { printf '%s\n' "$cmdline" | tr ' ' '\n' | sed -n "s/^$1=//p" | tail -n 1; }
 
-partuuid=$(arg rd.usbroot)
-[ -n "$partuuid" ] || partuuid=$(arg root | sed -n 's/^PARTUUID=//p')
-if [ -z "$partuuid" ]; then
-	roothash=$(arg roothash)
-	if [ ${#roothash} -ge 32 ]; then
-		h=$(printf '%s' "$roothash" | cut -c1-32)
-		partuuid=$(printf '%s' "$h" | sed 's/^\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)$/\1-\2-\3-\4-\5/')
-	fi
-fi
-if [ -z "$partuuid" ]; then
-	# efivarfs: 4 bytes attributes, then the UUID as UTF-16LE.
-	var=/sys/firmware/efi/efivars/LoaderDevicePartUUID-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
-	[ -r "$var" ] && partuuid=$(tail -c +5 "$var" | tr -d '\000')
-fi
-# by-partuuid links are lowercase.
-partuuid=$(printf '%s' "$partuuid" | tr 'A-F' 'a-f')
-[ -n "$partuuid" ] || { msg "cannot tell which partition to wait for, nothing to do"; exit 0; }
+roothash=$(arg roothash)
+printf '%s' "$roothash" | grep -qx '[0-9a-f]\{64\}' || { msg "ERROR: no roothash= on the kernel command line"; exit 1; }
+uuid() { printf '%s' "$1" | sed 's/^\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)$/\1-\2-\3-\4-\5/'; }
+partuuid=$(uuid "$(printf '%s' "$roothash" | cut -c1-32)")
+hashuuid=$(uuid "$(printf '%s' "$roothash" | cut -c33-64)")
 part=/dev/disk/by-partuuid/$partuuid
+hashpart=/dev/disk/by-partuuid/$hashuuid
 
 # udev loads these on the interface uevent anyway; loading them up front means
 # the explicit probe below finds the driver already registered.
@@ -132,4 +125,16 @@ done
 for hc in "$U"/usb*; do
 	[ -e "$hc/interface_authorized_default" ] && echo 1 >"$hc/interface_authorized_default"
 done
+
+[ -e "$part" ] || { msg "ERROR: no root partition, cannot boot"; exit 1; }
+udevadm settle -t 5
+[ -e "$hashpart" ] || { msg "ERROR: no hash partition $hashuuid next to the root partition"; exit 1; }
+# The root hash comes from the signed command line: this is the step that
+# decides whether the partition is the one that was signed.
+if ! out=$(veritysetup open "$part" root "$hashpart" "$roothash" --panic-on-corruption 2>&1); then
+	msg "ERROR: dm-verity refused the root partition: $out"
+	exit 1
+fi
+msg "root opened as /dev/mapper/root, verified against roothash=$(printf %.12s "$roothash")..."
+udevadm settle -t 15
 exit 0

@@ -51,40 +51,40 @@ import json, sys
 print(json.dumps({"packages": [{"name": p.split("=")[0], "version": p.split("=")[1]} for p in sys.argv[1:]]}))' "$@" >"$f"
 }
 
-# fx_info CHECKOUT VARIANT GROUPS VERSION: build.json as build.sh writes it.
+# fx_info CHECKOUT GROUPS VERSION: build.json as build.sh writes it.
 fx_info() {
-	local co=$1 variant=$2 groups=$3 version=$4 d id
+	local co=$1 groups=$2 version=$3 d id
 	id="${groups//,/-}_$version"
-	d=$co/mkosi.output/$variant/$id
+	d=$co/mkosi.output/$id
 	(
 		die() { echo "$*" >&2; exit 1; }
 		HERE=$co; source "$co/lib/builds.sh"
-		builds_write_info "$d" build="$id" variant="$variant" version="$version" groups="$groups" debug=no \
+		builds_write_info "$d" build="$id" version="$version" groups="$groups" debug=no \
 			started="${version:0:4}-${version:4:2}-${version:6:2}T00:00:00+00:00" \
 			finished="${version:0:4}-${version:4:2}-${version:6:2}T${version:9:2}:${version:11:2}:00+00:00" \
 			snapshot=2099/01/01 mirror=default commit=abc1234 uncommitted_changes=no signer=test netroot= builder=test
 	)
 }
 
-# fx_finish CHECKOUT VARIANT GROUPS VERSION PACKAGES...: a bare build directory
+# fx_finish CHECKOUT GROUPS VERSION PACKAGES...: a bare build directory
 # (manifest + build.json only), for tests that only look at the bookkeeping.
 fx_finish() {
-	local d=$1/mkosi.output/$2/${3//,/-}_$4
+	local d=$1/mkosi.output/${2//,/-}_$3
 	mkdir -p "$d"
-	fx_manifest "$d/manifest.json" "${@:5}"
-	fx_info "$1" "$2" "$3" "$4"
+	fx_manifest "$d/manifest.json" "${@:4}"
+	fx_info "$1" "$2" "$3"
 }
 
 # uuid HEX32: 8-4-4-4-12, as systemd-repart derives partition UUIDs from the root hash.
 fx_uuid() { sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12}).*/\1-\2-\3-\4-\5/' <<<"$1"; }
 
-# fx_build CHECKOUT VARIANT VERSION KEYDIR GROUPS URL PACKAGES...: what mkosi
-# leaves in a build directory (for usb with the whole disk image, partition
+# fx_build CHECKOUT VERSION KEYDIR GROUPS URL PACKAGES...: what mkosi leaves
+# in a build directory (the split parts and the whole disk image, partition
 # UUIDs from the root hash as repart sets them), then builds_finalize.
 fx_build() {
-	local co=$1 variant=$2 v=$3 kd=$4 groups=$5 url=$6 d b tmp hash cmdline rs vs total; shift 6
-	d=$co/mkosi.output/$variant/${groups//,/-}_$v
-	b=$d/safespace-arch-${variant}_$v
+	local co=$1 v=$2 kd=$3 groups=$4 url=$5 d b tmp hash cmdline rs vs total; shift 5
+	d=$co/mkosi.output/${groups//,/-}_$v
+	b=$d/safespace-arch_$v
 	mkdir -p "$d"
 	tmp=$(mktemp -d)
 	hash=$(fx_root "$tmp")
@@ -95,14 +95,14 @@ fx_build() {
 	cp "$tmp/root.verity" "$b.root-verity.raw"
 	echo "$hash" >"$b.roothash"
 	fx_manifest "$b.manifest" "${@:-linux=1}"
-	if [[ $variant == usb ]]; then
+	{
 		sbsign --key "$kd/db/db.key" --cert "$kd/db/db.pem" --output "$tmp/boot.efi" \
 			/usr/lib/systemd/boot/efi/systemd-bootx64.efi >/dev/null 2>&1
 		truncate -s 8M "$tmp/esp.img"
 		mkfs.vfat -S 512 "$tmp/esp.img" >/dev/null
 		mmd -i "$tmp/esp.img" ::/EFI ::/EFI/BOOT ::/EFI/Linux
 		mcopy -i "$tmp/esp.img" "$tmp/boot.efi" ::/EFI/BOOT/BOOTX64.EFI
-		mcopy -i "$tmp/esp.img" "$b.efi" "::/EFI/Linux/safespace-arch-usb_$v.efi"
+		mcopy -i "$tmp/esp.img" "$b.efi" "::/EFI/Linux/safespace-arch_$v.efi"
 		rs=$(($(stat -c %s "$tmp/root.img") / 512)) vs=$((($(stat -c %s "$tmp/root.verity") + 511) / 512))
 		total=$((2048 + 16384 + rs + vs + 2048))
 		truncate -s $((total * 512)) "$b.raw"
@@ -113,16 +113,16 @@ fx_build() {
 		dd if="$tmp/root.img" of="$b.raw" bs=1M seek=$((18432 * 512)) oflag=seek_bytes conv=notrunc status=none
 		dd if="$tmp/root.verity" of="$b.raw" bs=1M seek=$(((18432 + rs) * 512)) oflag=seek_bytes conv=notrunc status=none
 		ln -sf "$(basename "$b.raw")" "$b"
-	fi
+	}
 	echo initrd >"$d/initrd.cpio.zst"
 	ln -sf initrd.cpio.zst "$d/initrd"
 	rm -rf "$tmp"
 	(
 		die() { echo "$*" >&2; exit 1; }
 		HERE=$co; source "$co/lib/builds.sh"
-		builds_finalize "$d" "$variant" "$v"
+		builds_finalize "$d" "$v"
 	) || return 1
-	fx_info "$co" "$variant" "$groups" "$v"
+	fx_info "$co" "$groups" "$v"
 }
 
 # fx_resum DIR: recompute SHA256SUMS, as someone tampering with a release would.

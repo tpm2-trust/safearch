@@ -501,3 +501,65 @@ Results: `tests/run.sh` 103 pass (finalize keeps exactly the parts; usb checks i
 foreign systemd-boot and wrong/too small partitions; sticks from a build, a share and a URL
 equal the build: table, ESP content, signed files, FAT sector size, root block by block; a
 manipulated streamed root is refused and nothing stays behind); upload by hand 8 pass.
+
+---
+
+# PLAN: one build for both boot paths
+
+## Goal
+
+One build yields everything: the same UKI boots from a stick/SD card and over the network,
+the same root serves both. No `usb`/`network` variant any more; `./build.sh --groups …` once.
+
+## Design
+
+- **One UKI, one command line.** Common: `root=/dev/mapper/root rootfstype=erofs ro`,
+  `systemd.verity=no` (+`rd.`), `usbcore.authorized_default=0`, `safespace.netroot=<URL>`
+  (optional: without it the build is for sticks only), plus the existing hardening.
+- **The initrd picks the path at boot:** `LoaderDevicePartUUID` (set by systemd-boot/stub
+  when started from a disk partition; absent when the firmware loaded the UKI over the
+  network):
+  - set → `usb-bootdev`: authorize the USB path, wait for the root/verity partitions by the
+    UUIDs from the root hash, set the stick read-only, then **open the verity root itself**
+    (`veritysetup open … --panic-on-corruption`, as netroot does; systemd's generator is
+    switched off)
+  - absent → `netroot` as today
+  - Spoofing the variable only switches to the other path, which then finds no root
+    (denial of service); what boots stays verified.
+- **initrd:** the union of both: USB/SD drivers + ethernet drivers, curl, cryptsetup,
+  iproute2; both scripts and units, each conditioned on the variable. Measured: about
+  +1 MiB for the network boot.
+- **One image:** `ImageId=safespace-arch`, the ESP in `mkosi.repart/` (systemd-boot and the
+  partition table come out of it), `mkosi.profiles/{usb,network}` merged into `mkosi.conf`
+  and `mkosi.initrd.conf/`.
+- **Builds:** `mkosi.output/<groups>_<version>/`, all parts: boot.efi, root.img,
+  root.verity, roothash, systemd-boot.efi, layout.sfdisk, manifest.json, build.json.
+- **One release per server, flat:** `share/` holds the parts directly; URLs
+  `http://<server>/safespace/boot.efi`, `NETROOT_URL=http://<server>/safespace/`;
+  `burn.sh http://<server>/safespace/ /dev/sdX`.
+- Commands: `sudo ./build.sh [--groups …]`, `./release.sh [--build|--groups] [--push …]`,
+  `burn.sh [SOURCE] DEVICE`, `test-vm.sh [SOURCE]` / `--netboot`.
+
+## Breaking
+
+Every existing build and release, the server layout (rerun `server/setup.sh`, remove
+`share/network` and `share/usb`), `NETROOT_URL`, the DHCP/libvirt boot URL. Rebuild.
+
+## Steps
+
+- [x] 1. mkosi config: merge the variants, one command line, ESP in the base repart,
+      initrd union, units conditioned on `LoaderDevicePartUUID`, `usb-bootdev` opens the
+      verity root.
+- [x] 2. `mkosi.postinst`, `mkosi.postoutput` without variants.
+- [x] 3. `build.sh`, `lib/builds.sh`: no variant, one build directory per build.
+- [x] 4. `release.sh`, `lib/verify.sh`, `server/` on the flat share.
+- [x] 5. `burn.sh`, `test-vm.sh`, `diagnose.sh`, `hwtest-image.sh`.
+- [x] 6. Tests; the initrd path selection with shims (usb-bootdev and netroot conditions).
+- [x] 7. README, NETBOOT.md, AGENTS.md.
+- [ ] 8. Yours (root): one build, QEMU as stick and over HTTP boot, T450s over PXE, a real stick.
+
+Results: `tests/run.sh` 105 pass (one build has all parts; release/verify on the flat share,
+incl. foreign systemd-boot, wrong partition tables; sticks from a build, a share and a URL;
+netroot on the flat URLs; the initrd units carry the LoaderDevicePartUUID conditions);
+upload by hand 8 pass. Not testable here: the boot itself on either path (step 8), in
+particular usb-bootdev opening the verity root and the path selection by the variable.

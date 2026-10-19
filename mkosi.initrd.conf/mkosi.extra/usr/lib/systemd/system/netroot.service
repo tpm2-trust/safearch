@@ -1,9 +1,13 @@
 # Enabled by the initrd.target.wants symlink next to this file, not by an
 # [Install] section: the default initrd applies presets with "disable *".
+# The boot path over the network: the firmware loaded the UKI itself, so there
+# is no LoaderDevicePartUUID (from a stick systemd-boot sets it, and
+# usb-bootdev.service runs instead).
 [Unit]
 Description=Fetch and verify the root image over the network
 DefaultDependencies=no
 ConditionKernelCommandLine=safespace.netroot
+ConditionPathExists=!/sys/firmware/efi/efivars/LoaderDevicePartUUID-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
 # systemd-networkd does the DHCP (20-netboot.network), udev loads the NIC
 # drivers from the kernel modules initrd.
 Requires=systemd-networkd.service

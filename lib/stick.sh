@@ -66,7 +66,7 @@ stick_write() { # TARGET SRC [ROOT]
 	local m=$target@@$(($1 * 512))
 	mmd -i "$m" ::/EFI ::/EFI/BOOT ::/EFI/Linux &&
 		mcopy -i "$m" "$src/systemd-boot.efi" ::/EFI/BOOT/BOOTX64.EFI &&
-		mcopy -i "$m" "$src/boot.efi" ::/EFI/Linux/safespace-arch-usb.efi || die "copying onto the ESP failed"
+		mcopy -i "$m" "$src/boot.efi" ::/EFI/Linux/safespace-arch.efi || die "copying onto the ESP failed"
 	# 3. hash tree, then the root partition
 	set -- $verity
 	"${dd[@]}" if="$src/root.verity" of="$target" seek=$(($1 * 512)) || die "writing root.verity failed"

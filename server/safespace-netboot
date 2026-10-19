@@ -4,22 +4,21 @@
 # it is the tool for checking by hand. It never changes the share: replacing a
 # release is the build host's job (release.sh).
 #
-#   safespace-netboot status             the served releases and their last check
-#   safespace-netboot verify [--changed] [network|usb]
-#                                        check the served release(s): Secure Boot
-#                                        signature against the pinned db.pem, root
-#                                        image against the signed root hash;
-#                                        --changed: only what changed since the
-#                                        last check (the verify unit). Exit 1 if
-#                                        one is broken.
+#   safespace-netboot status             the served release and its last check
+#   safespace-netboot verify [--changed] check the served release: Secure Boot
+#                                        signatures against the pinned db.pem,
+#                                        root image against the signed root hash,
+#                                        the stick's partition table; --changed:
+#                                        only if it changed since the last check
+#                                        (the verify unit). Exit 1 if broken.
 #   safespace-netboot dnsmasq-config     write the dnsmasq configuration for
 #                                        DHCP_MODE (safespace-dhcp, as root)
 #
 # Settings: /etc/safespace/server.conf (SAFESPACE_SERVER_CONF= overrides).
-# The share (served by nginx under /safespace/), one release per variant:
-#   network/  boot.efi root.img root.verity roothash cmdline release ...
-#   usb/      the same + systemd-boot.efi layout.sfdisk
-# Results of the checks: $STATE/<variant> (outside the share).
+# The share (served by nginx under /safespace/) holds one release, for both
+# boot paths: boot.efi root.img root.verity roothash systemd-boot.efi
+# layout.sfdisk manifest.json cmdline release SHA256SUMS.
+# Result of the last check: $STATE/last (outside the share).
 set -Eeuo pipefail
 
 log() { printf '%s\n' "$*"; }
@@ -58,19 +57,27 @@ if [[ $EUID -eq 0 && $CMD == verify ]] && id "$SERVICE_USER" >/dev/null 2>&1; th
 fi
 
 # A fingerprint of what is served: release + SHA256SUMS name every file's hash.
-fingerprint() { cat "$SHARE/$1/release" "$SHARE/$1/SHA256SUMS" 2>/dev/null | sha256sum | cut -d' ' -f1; }
+fingerprint() { cat "$SHARE/release" "$SHARE/SHA256SUMS" 2>/dev/null | sha256sum | cut -d' ' -f1; }
 
-verify_one() { # VARIANT -> 0 ok, 1 broken
-	local variant=$1 fp version out rc=0
-	fp=$(fingerprint "$variant")
-	version=$(release_get "$SHARE/$variant/release" VERSION 2>/dev/null || true)
-	log "checking $variant ${version:-(no release)}"
-	out=$(verify_release "$SHARE/$variant" "$variant" "$DB_CERT" 2>&1) || rc=1
+verify() {
+	local changed=0 fp out rc=0 r=$SHARE/release
+	while (($#)); do
+		case $1 in
+			--changed) changed=1; shift ;;
+			*) die "verify: unknown argument $1" ;;
+		esac
+	done
+	mkdir -p "$STATE"
+	exec 9>"$STATE/.lock"
+	flock 9
+	[[ -f $r ]] || { ((changed)) || log "nothing served yet"; return 0; }
+	fp=$(fingerprint)
+	((changed)) && [[ -f $STATE/last && $(release_get "$STATE/last" FINGERPRINT) == "$fp" ]] && return 0
+	log "checking $(release_get "$r" BUILD)"
+	out=$(verify_release "$SHARE" "$DB_CERT" 2>&1) || rc=1
 	printf '%s\n' "$out" | sed 's/^/  /'
 	{
-		echo "VERSION=${version:-}"
-		echo "BUILD=$(release_get "$SHARE/$variant/release" BUILD 2>/dev/null || true)"
-		echo "GROUPS=$(release_get "$SHARE/$variant/release" GROUPS 2>/dev/null || true)"
+		echo "BUILD=$(release_get "$r" BUILD)"
 		echo "CHECKED=$(date -Is)"
 		echo "FINGERPRINT=$fp"
 		if ((rc == 0)); then
@@ -79,60 +86,32 @@ verify_one() { # VARIANT -> 0 ok, 1 broken
 			echo "RESULT=BROKEN"
 			echo "REASON=$(printf '%s\n' "$out" | grep -v '^    ' | tail -1)"
 		fi
-	} >"$STATE/$variant.new"
-	mv "$STATE/$variant.new" "$STATE/$variant"
+	} >"$STATE/last.new"
+	mv "$STATE/last.new" "$STATE/last"
 	if ((rc == 0)); then
-		log "$variant $version: ok"
+		log "$(release_get "$r" BUILD): ok"
 	else
-		log "$variant ${version:-}: BROKEN — machines will refuse it; release it again from the build host"
+		log "$(release_get "$r" BUILD): BROKEN — machines will refuse it; release it again from the build host"
 	fi
 	return $rc
 }
 
-verify() {
-	local changed=0 variants=() v rc=0
-	while (($#)); do
-		case $1 in
-			--changed) changed=1; shift ;;
-			network | usb) variants+=("$1"); shift ;;
-			*) die "verify: unknown argument $1" ;;
-		esac
-	done
-	((${#variants[@]})) || variants=(network usb)
-	mkdir -p "$STATE"
-	exec 9>"$STATE/.lock"
-	flock 9
-	for v in "${variants[@]}"; do
-		[[ -f $SHARE/$v/release ]] || { ((changed)) || log "$v: nothing served"; continue; }
-		if ((changed)) && [[ -f $STATE/$v ]] &&
-			[[ $(release_get "$STATE/$v" FINGERPRINT) == "$(fingerprint "$v")" ]]; then
-			continue
-		fi
-		verify_one "$v" || rc=1
-	done
-	return $rc
-}
-
 status() {
-	local v
-	for v in network usb; do
-		if [[ ! -f $SHARE/$v/release ]]; then
-			printf '%-8s nothing served\n' "$v"
-			continue
-		fi
-		r=$SHARE/$v/release
-		printf '%-8s %s, served since %s\n' "$v" "$(release_get "$r" BUILD || true)" "$(date -r "$r" '+%F %T')"
-		printf '         groups %s, built %s, snapshot %s, commit %s, %s packages\n' "$(release_get "$r" GROUPS)" \
-			"$(release_get "$r" BUILT)" "$(release_get "$r" SNAPSHOT)" "$(release_get "$r" COMMIT)" "$(release_get "$r" PACKAGES)"
-		if [[ ! -f $STATE/$v ]]; then
-			printf '         not checked yet (safespace-netboot verify %s)\n' "$v"
-		elif [[ $(release_get "$STATE/$v" FINGERPRINT) != "$(fingerprint "$v")" ]]; then
-			printf '         changed since the last check (%s)\n' "$(release_get "$STATE/$v" CHECKED)"
-		else
-			printf '         %s, checked %s %s\n' "$(release_get "$STATE/$v" RESULT)" "$(release_get "$STATE/$v" CHECKED)" \
-				"$(release_get "$STATE/$v" REASON)"
-		fi
-	done
+	local r=$SHARE/release
+	if [[ ! -f $r ]]; then
+		echo "nothing served yet"
+		return 0
+	fi
+	printf '%s, served since %s\n' "$(release_get "$r" BUILD)" "$(date -r "$r" '+%F %T')"
+	printf '  groups %s, built %s, snapshot %s, commit %s, %s packages\n' "$(release_get "$r" GROUPS)" \
+		"$(release_get "$r" BUILT)" "$(release_get "$r" SNAPSHOT)" "$(release_get "$r" COMMIT)" "$(release_get "$r" PACKAGES)"
+	if [[ ! -f $STATE/last ]]; then
+		echo "  not checked yet (safespace-netboot verify)"
+	elif [[ $(release_get "$STATE/last" FINGERPRINT) != "$(fingerprint)" ]]; then
+		echo "  changed since the last check ($(release_get "$STATE/last" CHECKED))"
+	else
+		echo "  $(release_get "$STATE/last" RESULT), checked $(release_get "$STATE/last" CHECKED) $(release_get "$STATE/last" REASON)"
+	fi
 }
 
 # dnsmasq for DHCP_MODE: proxy (PXE boot answers next to the LAN's own DHCP
@@ -143,7 +122,7 @@ dnsmasq_config() {
 	[[ ${DHCP_MODE:-off} == proxy || ${DHCP_MODE:-off} == dhcp ]] ||
 		die "DHCP_MODE=${DHCP_MODE:-off}: nothing to configure (proxy or dhcp)"
 	[[ ${DHCP_INTERFACE:-} =~ ^[A-Za-z0-9._-]+$ ]] || die "DHCP_INTERFACE= missing or invalid"
-	url=${SERVER_URL%/}/network/boot.efi
+	url=${SERVER_URL%/}/boot.efi
 	[[ $url =~ ^https?://[^/[:space:]]+/[^[:space:]]*$ ]] || die "SERVER_URL= missing or invalid"
 	mkdir -p "$(dirname "$out")"
 	{
@@ -156,7 +135,7 @@ dnsmasq_config() {
 		if [[ $DHCP_MODE == proxy ]]; then
 			[[ ${DHCP_PROXY_SUBNET:-} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "DHCP_PROXY_SUBNET= missing or invalid"
 			echo "dhcp-range=$DHCP_PROXY_SUBNET,proxy"
-			echo "pxe-service=tag:efi64,x86-64_EFI,\"safespace netboot\",network/boot.efi"
+			echo "pxe-service=tag:efi64,x86-64_EFI,\"safespace netboot\",boot.efi"
 		else
 			[[ ${DHCP_RANGE:-} =~ ^[0-9.]+,[0-9.]+(,[0-9]+[smhd]?)?$ ]] || die "DHCP_RANGE= missing or invalid"
 			echo "dhcp-range=$DHCP_RANGE"
@@ -166,7 +145,7 @@ dnsmasq_config() {
 			echo "dhcp-match=set:httpclient,option:client-arch,16"
 			echo "dhcp-option-force=tag:httpclient,60,HTTPClient"
 			echo "dhcp-boot=tag:httpclient,$url"
-			echo "dhcp-boot=tag:efi64,network/boot.efi"
+			echo "dhcp-boot=tag:efi64,boot.efi"
 		fi
 		echo "enable-tftp"
 		echo "tftp-root=$SHARE"
@@ -174,7 +153,7 @@ dnsmasq_config() {
 		echo "log-dhcp"
 		[[ -d /etc/safespace/dnsmasq.d ]] && echo "conf-dir=/etc/safespace/dnsmasq.d/,*.conf"
 	} >"$out"
-	log "wrote $out (DHCP_MODE=$DHCP_MODE, boot file network/boot.efi)"
+	log "wrote $out (DHCP_MODE=$DHCP_MODE, boot file boot.efi)"
 }
 
 case $CMD in

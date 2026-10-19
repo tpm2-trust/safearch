@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Write a usb build onto a USB stick / SD card, assembled from its parts
+# Write a build onto a USB stick / SD card, assembled from its parts
 # (lib/stick.sh): the partition table the build recorded, an ESP with the
 # signed systemd-boot and UKI, the dm-verity hash tree and the root partition.
 # Needs no keys and no build: the parts are signed already.
@@ -7,19 +7,18 @@
 #   sudo ./burn.sh [SOURCE] DEVICE [--yes]
 #   ./burn.sh [SOURCE] --image FILE        a stick image file instead (no root)
 #
-#   SOURCE  where the parts come from (default: the newest usb build here):
+#   SOURCE  where the parts come from (default: the newest build here):
 #           - a build, as ./build.sh list shows it (base-remotedesktop_20261019-0930)
-#           - a directory with the parts: a build directory, mkosi.release/usb,
-#             or a distribution server's share (/srv/safespace/share/usb)
-#           - a distribution server's URL, e.g. http://10.0.0.1/safespace/usb/:
+#           - a directory with the parts: a build directory, mkosi.release,
+#             or a distribution server's share (/srv/safespace/share)
+#           - a distribution server's URL, e.g. http://10.0.0.1/safespace/:
 #             the root partition is streamed straight onto the stick, and
 #             every file is checked against the release's SHA256SUMS
 #   DEVICE  the whole stick, e.g. /dev/sdb or /dev/mmcblk0
 #   --yes   do not ask before overwriting DEVICE
 #
-# Images of the network variant have no ESP and are not written to a medium;
-# they are released with release.sh. Check a written stick with diagnose.sh
-# (signatures against db.pem, root block by block).
+# The same build boots over the network (release.sh). Check a written stick
+# with diagnose.sh (signatures against db.pem, root block by block).
 set -Eeuo pipefail
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
@@ -64,9 +63,9 @@ ROOT_URL="" ROOT_SUM=""
 if [[ $SOURCE =~ ^https?:// ]]; then
 	command -v curl >/dev/null || die "missing 'curl'"
 	base=${SOURCE%/}
-	log "Fetching the usb release from $base/"
+	log "Fetching the release from $base/"
 	for f in SHA256SUMS release roothash layout.sfdisk systemd-boot.efi boot.efi root.verity; do
-		curl -fsS -o "$TMP/$f" "$base/$f" || die "cannot fetch $base/$f (not a usb release?)"
+		curl -fsS -o "$TMP/$f" "$base/$f" || die "cannot fetch $base/$f (not a safespace release?)"
 	done
 	(cd "$TMP" && grep -E ' \*?(release|roothash|layout\.sfdisk|systemd-boot\.efi|boot\.efi|root\.verity)$' SHA256SUMS |
 		sha256sum --quiet --strict -c) || die "the release's files do not match its SHA256SUMS"
@@ -77,13 +76,13 @@ if [[ $SOURCE =~ ^https?:// ]]; then
 elif [[ -d $SOURCE ]]; then
 	SRC=$(readlink -f "$SOURCE")
 elif [[ -n $SOURCE ]]; then
-	SRC=$(builds_dir usb "$(builds_find "usb/${SOURCE#usb/}" | cut -d/ -f2)")
+	SRC=$(builds_dir "$(builds_find "$SOURCE")")
 else
-	b=$(builds_newest usb)
-	[[ -n $b ]] || die "no usb build here (sudo ./build.sh usb, or give a SOURCE)"
-	SRC=$(builds_dir usb "$b")
+	b=$(builds_newest)
+	[[ -n $b ]] || die "no build here (sudo ./build.sh, or give a SOURCE)"
+	SRC=$(builds_dir "$b")
 fi
-[[ -f $SRC/layout.sfdisk ]] || die "$SRC has no layout.sfdisk: not a usb build or release"
+[[ -f $SRC/layout.sfdisk ]] || die "$SRC has no layout.sfdisk: not a build or release (or one from before the single build)"
 if [[ -z $ROOT_URL && -f $SRC/SHA256SUMS ]]; then
 	log "Checking $SRC against its SHA256SUMS"
 	(cd "$SRC" && sha256sum --quiet --strict -c SHA256SUMS) || die "$SRC does not match its SHA256SUMS"

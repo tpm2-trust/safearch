@@ -3,17 +3,17 @@
 # Sourced; needs bash, sbverify, objcopy, veritysetup, sha256sum, openssl.
 # No root, no temp space: everything is checked on the files as they are.
 #
-#   verify_release DIR VARIANT DB_CERT
-#       both: boot.efi root.img root.verity roothash cmdline release SHA256SUMS
-#       usb:  + systemd-boot.efi layout.sfdisk
+#   verify_release DIR DB_CERT
+#       boot.efi root.img root.verity roothash systemd-boot.efi layout.sfdisk
+#       cmdline release SHA256SUMS
 #   release_get FILE KEY        value of KEY=... in a release file (not sourced)
 #   verify_name_version VALUE
 #
 # What is trusted: only DB_CERT, the public Secure Boot db certificate. The
-# UKI (and for usb systemd-boot) must carry a valid signature from it; the
-# root hash is taken from the UKI's signed command line, and the root image
-# must match it block by block. For usb the partition table must name the
-# partitions by that root hash, as the initrd finds them. So a release that
+# UKI and systemd-boot must carry a valid signature from it; the root hash is
+# taken from the UKI's signed command line, and the root image must match it
+# block by block. The partition table for sticks must name the partitions by
+# that root hash, as the initrd finds them. So a release that
 # passes was built and signed by the holder of the db key, whatever path it
 # took to get here. SHA256SUMS only catches broken transfers.
 # On failure: a message on stderr and return 1.
@@ -54,23 +54,15 @@ verify_cmdline_roothash() { # CMDLINE ROOTHASH
 		vfail "the UKI's signed command line does not carry roothash=$2"
 }
 
-verify_release() { # DIR VARIANT DB_CERT
-	local dir=$1 variant=$2 cert=$3 f version roothash cmdline url urls=0
-	local files=(boot.efi root.img root.verity roothash cmdline release SHA256SUMS)
+verify_release() { # DIR DB_CERT
+	local dir=$1 cert=$2 f version roothash cmdline url urls=0
 	[[ -f $cert ]] || vfail "no db certificate $cert" || return
 	[[ -d $dir ]] || vfail "no release directory $dir" || return
-	case $variant in
-		network) ;;
-		usb) files+=(systemd-boot.efi layout.sfdisk) ;;
-		*) vfail "unknown variant '$variant'"; return ;;
-	esac
-	for f in "${files[@]}"; do
+	for f in boot.efi root.img root.verity roothash systemd-boot.efi layout.sfdisk cmdline release SHA256SUMS; do
 		[[ -f $dir/$f && ! -L $dir/$f ]] || vfail "$f missing" || return
 	done
 	verify_sums "$dir" || return
 	vinfo "SHA256SUMS ok"
-	[[ $(release_get "$dir/release" VARIANT) == "$variant" ]] ||
-		vfail "release says VARIANT=$(release_get "$dir/release" VARIANT), expected $variant" || return
 	version=$(release_get "$dir/release" VERSION)
 	verify_name_version "$version" || vfail "release has an invalid VERSION='$version'" || return
 	vinfo "release $(release_get "$dir/release" BUILD) (groups $(release_get "$dir/release" GROUPS))"
@@ -78,24 +70,17 @@ verify_release() { # DIR VARIANT DB_CERT
 	[[ $roothash =~ ^[0-9a-f]{64}$ ]] || vfail "roothash is not a sha256 root hash" || return
 
 	verify_signature "$dir/boot.efi" "$cert" || return
-	if [[ $variant == usb ]]; then
-		verify_signature "$dir/systemd-boot.efi" "$cert" || return
-		vinfo "boot.efi and systemd-boot.efi signed by the db key"
-	else
-		vinfo "boot.efi signed by the db key"
-	fi
+	verify_signature "$dir/systemd-boot.efi" "$cert" || return
+	vinfo "boot.efi and systemd-boot.efi signed by the db key"
 	cmdline=$(uki_cmdline "$dir/boot.efi")
 	verify_cmdline_roothash "$cmdline" "$roothash" || return
-	if [[ $variant == network ]]; then
-		for url in $(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace\.netroot=//p'); do
-			urls=$((urls + 1))
-			vinfo "netroot URL: $url"
-		done
-		((urls)) || vfail "no safespace.netroot= in the UKI: not a network build" || return
-	else
-		verify_layout "$dir" "$roothash" || return
-	fi
 	vinfo "signed command line: roothash matches"
+	for url in $(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace\.netroot=//p'); do
+		urls=$((urls + 1))
+		vinfo "netroot URL: $url"
+	done
+	((urls)) || vinfo "no safespace.netroot= in the UKI: this release boots from sticks only"
+	verify_layout "$dir" "$roothash" || return
 	veritysetup verify "$dir/root.img" "$dir/root.verity" "$roothash" >&2 ||
 		vfail "root.img does not match the signed root hash" || return
 	vinfo "root.img matches the signed root hash"

@@ -1,14 +1,16 @@
-# Netboot: the `network` variant on a fresh server
+# Netboot: booting safespace-arch over the network
 
-The `network` variant of safespace-arch boots over the network instead of from a
-stick: the firmware downloads the signed UKI (kernel + initrd + signed command line),
-and the initrd downloads the read-only root image and its dm-verity hash tree into RAM.
-The client writes nothing, anywhere — it has no boot medium at all.
+Every build of safespace-arch boots from a stick **and** over the network. Over the
+network, the firmware downloads the signed UKI (kernel + initrd + signed command line), and
+the initrd downloads the read-only root image and its dm-verity hash tree into RAM. The
+client writes nothing, anywhere — it has no boot medium at all. (The initrd knows it was
+loaded over the network because `LoaderDevicePartUUID` is not set: no boot loader started
+it from a partition.)
 
 **The whole path, for an x86-64 UEFI machine:**
 
-1. on the build host: `sudo ./build.sh network --groups …` — [Build and release](#build-and-release)
-2. on the build host: `./release.sh network --push safespace@SERVER` — the same section;
+1. on the build host: `sudo ./build.sh --groups …` — [Build and release](#build-and-release)
+2. on the build host: `./release.sh --push safespace@SERVER` — the same section;
    it replaces the server's release, and the server checks it
 3. once on the server: `sudo server/setup.sh …` (nginx, the check, optional
    dnsmasq) — [The distribution server](#the-distribution-server)
@@ -24,15 +26,15 @@ commands in order, per role (build host, distribution server), are in README.md,
 ```
   machine (UEFI, Secure Boot on)                 server
   ──────────────────────────────                 ──────
-  1. DHCP: "where do I boot from?"  ───────────▶ DHCP: http://10.0.0.1/safespace/network/boot.efi
-  2. HTTP GET /safespace/network/boot.efi ▶ nginx
+  1. DHCP: "where do I boot from?"  ───────────▶ DHCP: http://10.0.0.1/safespace/boot.efi
+  2. HTTP GET /safespace/boot.efi ▶ nginx
      firmware verifies the signature against db
   3. UKI starts: kernel + initrd, command line fixed at build time
-     (roothash=…, safespace.netroot=http://10.0.0.1/safespace/network/)
+     (roothash=…, safespace.netroot=http://10.0.0.1/safespace/)
   4. initrd: DHCP, then
-     HTTP GET /safespace/network/roothash    ──▶ nginx   (still this UKI's release?)
-     HTTP GET /safespace/network/root.verity ──▶ nginx
-     HTTP GET /safespace/network/root.img    ──▶ nginx   (into a tmpfs)
+     HTTP GET /safespace/roothash    ──▶ nginx   (still this UKI's release?)
+     HTTP GET /safespace/root.verity ──▶ nginx
+     HTTP GET /safespace/root.img    ──▶ nginx   (into a tmpfs)
   5. veritysetup open … roothash=…  → /dev/mapper/root
   6. root mounted read-only, /var is a tmpfs, machine is independent of the
      server from here on
@@ -43,8 +45,8 @@ file on a disk: UEFI firmware has its own network stack. Put the network device 
 order (or pick it from the boot menu), and the firmware does DHCP itself, takes the boot file
 from the DHCP answer, downloads it into memory and starts it. All that is needed from the
 machine is a NIC the firmware supports and "network boot" enabled; everything else is the
-server's answer. A machine whose firmware cannot do that at all cannot use the network variant
-(the usb variant works there); see [Old firmware](#old-firmware-the-thinkpad-t450s).
+server's answer. A machine whose firmware cannot do that at all boots the same build from a
+stick instead; see [Old firmware](#old-firmware-the-thinkpad-t450s).
 
 **Everything the client trusts is inside the signed UKI**, nothing comes from the
 server unverified:
@@ -71,8 +73,8 @@ only UEFI x86-64 clients.
 
 | | Where | What it is for | Needed for a real machine? |
 |---|---|---|---|
-| `./build.sh network` | build host | builds the image | **yes** |
-| `./release.sh network` | build host | the **release step**: turns mkosi's output into the files the firmware and the initrd ask for (`boot.efi`, `root.img`, `root.verity`), checks them, pushes them to the distribution servers | **yes** |
+| `./build.sh` | build host | builds the image (for sticks and network boot alike) | **yes** |
+| `./release.sh` | build host | the **release step**: turns mkosi's output into the files the firmware and the initrd ask for (`boot.efi`, `root.img`, `root.verity`), checks them, pushes them to the distribution servers | **yes** |
 | `server/setup.sh` | distribution server | nginx, the check after every upload, optionally dnsmasq (`safespace-dhcp`) | **yes**, once per server |
 | `./test-vm.sh --netboot` | build host | a rehearsal in QEMU before you touch hardware | no, optional |
 
@@ -93,50 +95,48 @@ Nothing is installed on the machine itself, and the machine needs no local file.
   T450s, [Case found](#case-found-thinkpad-t450s-bios-jbet73ww)); it starts the same
   signed UKI directly. No iPXE in either path.
 - **A PCI/PCIe NIC.** USB NICs do not work: the kernel authorizes no USB device
-  (`usbcore.authorized_default=0`), and unlike the usb variant there is no initrd step
-  that authorizes anything.
+  (`usbcore.authorized_default=0`), and over the network there is no initrd step that
+  authorizes anything (only the stick path authorizes the way to its stick).
 - **RAM for the root image plus the system.** `root.img` lives in a tmpfs for as long
   as the machine runs (erofs, decompressed on read), so budget
   `size of root.img (~2 GiB) + 2 GiB`, i.e. 8 GiB to be comfortable. The initrd
   checks `MemAvailable` before downloading and says so if it is not enough.
 - **Your `db` certificate enrolled**, if Secure Boot is to be enforced — see
   [Secure Boot on the clients](#secure-boot-on-the-clients).
-- A data disk labelled `safespace-docker` on SATA/NVMe if Docker is used (as with the
-  usb variant; see README).
+- A data disk labelled `safespace-docker` on SATA/NVMe if Docker is used (as from a
+  stick; see README).
 
 ## Build and release
 
-Once per build host, as for the usb variant: `users.conf` and `safespace.env`. The public
-Secure Boot keys for `safespace-seal` are exported by `build.sh` on every build. Then set
-the URL of the distribution servers (`SERVER_URL` of their `server.conf` + `/network/`):
+Once per build host: `users.conf` and `safespace.env`. The public Secure Boot keys for
+`safespace-seal` are exported by `build.sh` on every build. Then set the URL of the
+distribution servers (`SERVER_URL` of their `server.conf` + `/`):
 
 ```sh
-cp netboot.conf.example netboot.conf     # NETROOT_URL=http://10.0.0.1/safespace/network/
-sudo ./build.sh network --groups base    # -> mkosi.output/network/base_<time>/
-./release.sh network --push safespace@10.0.0.1
+cp netboot.conf.example netboot.conf     # NETROOT_URL=http://10.0.0.1/safespace/
+sudo ./build.sh --groups base            # -> mkosi.output/base_<time>/
+./release.sh --push safespace@10.0.0.1
 ```
 
-`build.sh` signs `NETROOT_URL` into the UKI as it is. A server holds one release per variant,
-in the share of a distribution server (`/srv/safespace/share/`, served as
-`http://10.0.0.1/safespace/`):
+`build.sh` signs `NETROOT_URL` into the UKI as it is. A distribution server holds one
+release, in its share (`/srv/safespace/share/`, served as `http://10.0.0.1/safespace/`):
 
 ```
 /srv/safespace/share/
-├── network/
-│   ├── boot.efi       the signed UKI (what the firmware downloads)
-│   ├── root.img       erofs root partition, ~2 GiB (dm-verity data)
-│   ├── root.verity    its dm-verity hash tree, ~17 MiB
-│   ├── roothash       the release's root hash (the initrd compares it first)
-│   └── cmdline, release, manifest.json, SHA256SUMS
-└── usb/
-    └── the same parts + systemd-boot.efi, layout.sfdisk (burn.sh assembles a stick)
+├── boot.efi           the signed UKI (what the firmware downloads)
+├── root.img           erofs root partition, ~2 GiB (dm-verity data)
+├── root.verity        its dm-verity hash tree, ~17 MiB
+├── roothash           the release's root hash (the initrd compares it first)
+├── systemd-boot.efi, layout.sfdisk    for writing sticks (burn.sh)
+└── cmdline, release, manifest.json, SHA256SUMS
 ```
 
-`release.sh` refuses to release artifacts that do not belong together: it checks the UKI's
-signature against the exported `db.pem`, compares the root hash on the UKI's signed command
-line with the build's, and runs `veritysetup verify` over the whole root image — so a bad set
-is caught on the build host instead of on 50 machines. Every distribution server repeats
-exactly these checks (`lib/verify.sh`) after the upload and reports the result.
+`release.sh` refuses to release artifacts that do not belong together: it checks the
+signatures against the exported `db.pem`, compares the root hash on the UKI's signed command
+line with the build's, runs `veritysetup verify` over the whole root image and checks the
+partition table for sticks — so a bad set is caught on the build host instead of on 50
+machines. Every distribution server repeats exactly these checks (`lib/verify.sh`) after the
+upload and reports the result.
 
 **Replacing a release while machines boot:** the files are renamed into place in one go at the
 end of the upload (`rsync --delay-updates`), and a download already running finishes on the
@@ -162,7 +162,7 @@ nginx serves the share read-only: `/etc/nginx/conf.d/safespace.conf` (from
 machine:
 
 ```sh
-curl -I http://10.0.0.1/safespace/network/boot.efi    # 200 OK and a Content-Length
+curl -I http://10.0.0.1/safespace/boot.efi    # 200 OK and a Content-Length
 ```
 
 `Content-Length` matters: the initrd uses it to size the tmpfs and to check that there
@@ -175,7 +175,7 @@ Only two things have to reach the machine, whatever DHCP server you run:
 | DHCP option | HTTP boot (the fast path) | PXE/TFTP fallback |
 |---|---|---|
 | 60, vendor class identifier | `HTTPClient` | — |
-| 67, boot file name | `http://10.0.0.1/safespace/network/boot.efi` (full URL) | `network/boot.efi` (path under the TFTP root = the share) |
+| 67, boot file name | `http://10.0.0.1/safespace/boot.efi` (full URL) | `boot.efi` (path under the TFTP root = the share) |
 | 66 / `next-server` (siaddr) | — | `10.0.0.1`, the TFTP server |
 
 There is no third thing: no agent, no per-machine entry, no MAC list. The address the
@@ -213,10 +213,10 @@ dhcp-option=option:dns-server,10.0.0.1
 dhcp-vendorclass=set:httpclient,HTTPClient:Arch:00016
 dhcp-match=set:httpclient,option:client-arch,16
 dhcp-option-force=tag:httpclient,60,HTTPClient
-dhcp-boot=tag:httpclient,http://10.0.0.1/safespace/network/boot.efi
+dhcp-boot=tag:httpclient,http://10.0.0.1/safespace/boot.efi
 # Fallback for UEFI machines without HTTP boot: PXE over TFTP. client-arch 7
 # and 9 are x86-64 UEFI; legacy BIOS (0) and IA32 UEFI (6) get no answer.
-dhcp-boot=tag:efi64,network/boot.efi
+dhcp-boot=tag:efi64,boot.efi
 enable-tftp
 tftp-root=/srv/safespace/share
 # all of TFTP on port 69, so a firewall only needs UDP 69 (and 67/4011 for DHCP)
@@ -235,7 +235,7 @@ dnsmasq only answers the boot question, the existing server keeps handing out ad
 
 ```ini
 dhcp-range=10.0.0.0,proxy
-pxe-service=tag:efi64,x86-64_EFI,"safespace netboot",network/boot.efi
+pxe-service=tag:efi64,x86-64_EFI,"safespace netboot",boot.efi
 ```
 
 (plus the interface, `dhcp-match`, TFTP and log lines as above). Proxy mode reliably drives
@@ -258,13 +258,13 @@ option arch code 93 = unsigned integer 16;
 class "safespace-http" {
     match if substring(option vendor-class-identifier, 0, 10) = "HTTPClient";
     option vendor-class-identifier "HTTPClient";
-    filename "http://10.0.0.1/safespace/network/boot.efi";
+    filename "http://10.0.0.1/safespace/boot.efi";
 }
 
 # UEFI PXE (x86-64): a path under the TFTP root plus the TFTP server.
 class "safespace-pxe" {
     match if option arch = 7 or option arch = 9;
-    filename "network/boot.efi";
+    filename "boot.efi";
     next-server 10.0.0.1;
 }
 ```
@@ -280,7 +280,7 @@ Kea.)
   {
     "name": "safespace-http",
     "test": "substring(option[60].hex,0,10) == 'HTTPClient'",
-    "boot-file-name": "http://10.0.0.1/safespace/network/boot.efi",
+    "boot-file-name": "http://10.0.0.1/safespace/boot.efi",
     "option-data": [
       { "name": "vendor-class-identifier", "data": "HTTPClient" }
     ]
@@ -289,7 +289,7 @@ Kea.)
     "name": "safespace-pxe",
     "test": "option[93].hex == 0x0007 or option[93].hex == 0x0009",
     "next-server": "10.0.0.1",
-    "boot-file-name": "network/boot.efi"
+    "boot-file-name": "boot.efi"
   }
 ]
 ```
@@ -297,7 +297,7 @@ Kea.)
 #### Routers, firewalls and Windows Server
 
 - **OPNsense / pfSense:** *Services → DHCPv4 → \[interface\]*. For the PXE path use
-  "Network booting": next-server `10.0.0.1`, filename `network/boot.efi`. For
+  "Network booting": next-server `10.0.0.1`, filename `boot.efi`. For
   HTTP boot add the two options under "Additional BOOTP/DHCP Options": number 60, type
   string, value `HTTPClient`, and number 67, type string, value with the full URL.
 - **Windows Server DHCP:** option 067 (Bootfile Name) takes the URL; option 060 has to be
@@ -350,7 +350,7 @@ Both work; the second needs no stick.
 ```
 netroot: waiting up to 60s for a DHCP address
 netroot: link up: enp1s0 10.0.0.137/24
-netroot: fetching the root image from http://10.0.0.1/safespace/network
+netroot: fetching the root image from http://10.0.0.1/safespace
 netroot: root.img 2013 MiB + root.verity 16 MiB, 15822 MiB RAM free
 netroot: got root.verity: 16 MiB in 1s (16 MiB/s)
 netroot: got root.img: 2013 MiB in 19s (105 MiB/s)
@@ -395,8 +395,8 @@ sudo sed -i -e 's|^SERVER_URL=.*|SERVER_URL=http://192.168.1.10/safespace|' \
 sudo server/setup.sh                       # starts safespace-dhcp in proxy mode
 
 # 2. build for it and release to it (ssh to itself with the upload key)
-sudo ./build.sh network --url http://192.168.1.10/safespace/network/
-./release.sh network --push safespace@localhost
+sudo ./build.sh --url http://192.168.1.10/safespace/
+./release.sh --push safespace@localhost
 safespace-netboot status                    # network <version> ..., ok
 
 # 3. on the test machine: one-time boot menu -> "UEFI PXEv4 ..."
@@ -430,7 +430,7 @@ but the `db` certificate has to be on the machine. Three ways, all using the key
    ```
    Reboot, check that Secure Boot is on, set a firmware password. From now on the
    machine only boots UKIs signed with your `db` key — including the one it downloads.
-2. **Seal from a usb stick**: `sudo ./build.sh usb`, `sudo ./burn.sh /dev/sdX`, boot it
+2. **Seal from a stick**: `sudo ./burn.sh /dev/sdX` (the same build), boot it
    once per machine, `sudo safespace-seal`. Useful when netbooting in Setup Mode is not
    possible.
 3. **Enroll by hand in firmware setup**: most firmwares can load `db`/`KEK`/`PK` from a
@@ -478,7 +478,7 @@ otherwise means a rebuild. Two practical notes:
   the first choice and a fixed address the fallback:
 
   ```sh
-  NETROOT_URL="http://boot.example.internal/safespace/network/ http://10.0.0.1/safespace/network/"
+  NETROOT_URL="http://boot.example.internal/safespace/ http://10.0.0.1/safespace/"
   ```
 
   A failed lookup then costs a few seconds before the second URL is used, and nothing else.
@@ -496,10 +496,10 @@ vim users.conf mkosi.conf            # users, packages, …
 ./fetch-images.sh                    # shipped Docker images (docker group)
 
 # 2. build (-f also rebuilds unchanged packages, -ff reinstalls everything)
-sudo ./build.sh network --groups base,remotedesktop -f
+sudo ./build.sh --groups base,remotedesktop -f
 
 # 3. release: replaces the release on every server, which then checks it
-./release.sh network
+./release.sh
 ```
 
 The new files are renamed into place in one go at the end of the upload, so machines keep
@@ -507,14 +507,14 @@ booting the old release until that moment; a machine caught in between reboots o
 then loads the new one (see [Build and release](#build-and-release)).
 
 **Going back** is a release of an older build from the build host:
-`./release.sh network --build <older build>` (`./build.sh list`). The server has no rollback of its own: it
+`./release.sh --build <older build>` (`./build.sh list`). The server has no rollback of its own: it
 always serves exactly what the build host sent last.
 
 Machines take the new (or old) version on their next boot; a running machine is not
 affected, it has everything in RAM.
 
-**Disk space:** ~2 GiB per variant on every server; on the build host ~2 GiB per build in
-`mkosi.output/<variant>/` plus the staged release in `mkosi.release/`. `./build.sh prune`
+**Disk space:** ~2.2 GiB on every server; on the build host ~2.2 GiB per build in
+`mkosi.output/` (the staged release in `mkosi.release/` is hardlinks). `./build.sh prune`
 removes old builds, `sudo ./build.sh purge-cache` the caches.
 
 ## Optional: rehearse it in QEMU first
@@ -528,8 +528,8 @@ special build; the VM reaches the server through QEMU's NAT and resolves names t
 host):
 
 ```sh
-./test-vm.sh --netboot --url http://10.0.0.1/safespace/network/boot.efi --ssh 2222
-./test-vm.sh --netboot --url http://10.0.0.1/safespace/network/boot.efi --setup-mode --ssh 2222   # then safespace-seal inside, then --sealed
+./test-vm.sh --netboot --url http://10.0.0.1/safespace/boot.efi --ssh 2222
+./test-vm.sh --netboot --url http://10.0.0.1/safespace/boot.efi --setup-mode --ssh 2222   # then safespace-seal inside, then --sealed
 ```
 
 A netbooting VM of its own (plain QEMU, or a persistent libvirt machine for virt-manager,
@@ -541,14 +541,14 @@ Or a self-contained lab on the build host:
 ```sh
 # built for the VM: QEMU's user network is the host at 10.0.2.2, and the
 # console= part puts the kernel and netroot messages into mkosi.test/serial.log
-sudo ./build.sh network --url http://10.0.2.2:8000/ \
+sudo ./build.sh --url http://10.0.2.2:8000/ \
      --kernel-command-line console=ttyS0,115200
-./release.sh network                   # stage only: mkosi.release/network/
+./release.sh                           # stage only: mkosi.release/
 ./test-vm.sh --netboot                 # add --ssh 2222 to log in
 ```
 
 The VM gets no disk at all. QEMU's user network is the DHCP server, `test-vm.sh --netboot`
-serves `mkosi.release/network/` over HTTP on `127.0.0.1:8000` (a symlink farm, so the path inside
+serves `mkosi.release/` over HTTP on `127.0.0.1:8000` (a symlink farm, so the path inside
 the signed URL resolves), and the firmware boots the way a real machine does. `--tftp`
 switches the UKI download to QEMU's built-in TFTP server, for firmware without HTTP boot.
 With `--secure-boot` the VM boots with enforced Secure Boot and only the UKI's own
@@ -580,8 +580,8 @@ around: `journalctl -b -g netroot`, `findmnt /`, `df -h /run/netroot`,
 
 ## Old firmware: the ThinkPad T450s
 
-Machines whose firmware has no usable network boot cannot use the network variant; they boot
-the usb variant. The one case found so far, and how it was solved without a stick:
+Machines whose firmware has no usable network boot boot the same build from a stick. The
+one case found so far, and how it was solved without a stick:
 
 ### Case found: ThinkPad T450s (BIOS JBET73WW)
 
@@ -595,8 +595,8 @@ PXE → TFTP download → UKI starts → DHCP in the initrd → `root.verity` an
 over HTTP → verified root mounted → login over ssh. No iPXE, no stick.
 
 This is the path for old machines without UEFI HTTP boot; machines with HTTP boot use
-that (the intended path, also without iPXE). A machine where AMT has to stay on boots the
-usb variant.
+that (the intended path, also without iPXE). A machine where AMT has to stay on boots from a
+stick.
 
 **What it looked like with AMT enabled:** the firmware offers only PXE (no HTTP boot
 entry). Every file arrives completely (dnsmasq logs `sent …`), yet nothing the firmware
@@ -628,25 +628,24 @@ part of the network UKI, **warns above 80 MiB** and stops the build above 128 Mi
 | initrd | ~48 MiB (78 MiB untrimmed) | trimmed for the netroot path |
 | **UKI** | **~82 MiB** (112 MiB untrimmed) | boots over PXE on the T450s |
 
-The network initrd only has to bring up the NIC, fetch and verify the root image and
-mount it, so the initrd (of both variants, to keep them aligned) trims what mkosi's default
-initrd brings along:
+The initrd only has to bring up the NIC or find the stick, verify the root and mount it,
+so it trims what mkosi's default initrd brings along:
 
-- **Drivers** (`KernelInitrdModules=`): an explicit list instead of mkosi's default set —
-  dm-verity, loop, erofs, crypto, virtio_net for QEMU (`mkosi.conf`, both variants), and
-  for the network variant the client NIC families (`mkosi.profiles/network/mkosi.conf`) (Intel e1000/e1000e/igb/igc/ixgbe, Realtek, Broadcom
-  tg3/b44, Marvell sky2, Atheros, Aquantia, AMD pcnet32) with PHY/MDIO helpers. No
-  server NICs (Mellanox, QLogic, Chelsio, Solarflare, Intel i40e/ice, Broadcom bnx2x …)
-  and their firmware, no storage or filesystem drivers. To netboot a machine with
-  another NIC, add its driver there.
-- **Programs** (`mkosi.initrd.conf/mkosi.conf`, `RemoveFiles=`, both variants):
-  filesystem tools (btrfs, xfs, ext4, vfat), systemd tools without a job in the initrd,
-  glibc's charset converters, the gcc sanitizer runtimes, certificate CLIs, and
-  terminal/timezone/keymap data beyond the console defaults.
+- **Drivers** (`KernelInitrdModules=` in `mkosi.conf`): an explicit list instead of
+  mkosi's default set — dm-verity, loop, erofs, crypto, virtio_net for QEMU, USB host
+  controllers, USB storage, MMC and card readers (~1 MiB, for the stick path), and the
+  client NIC families (Intel e1000/e1000e/igb/igc/ixgbe, Realtek, Broadcom tg3/b44,
+  Marvell sky2, Atheros, Aquantia, AMD pcnet32) with PHY/MDIO helpers. No server NICs
+  (Mellanox, QLogic, Chelsio, Solarflare, Intel i40e/ice, Broadcom bnx2x …) and their
+  firmware, no other storage or filesystem drivers. To netboot a machine with another NIC,
+  add its driver there.
+- **Programs** (`mkosi.initrd.conf/mkosi.conf`, `RemoveFiles=`): filesystem tools (btrfs,
+  xfs, ext4, vfat), systemd tools without a job in the initrd, glibc's charset converters,
+  the gcc sanitizer runtimes, certificate CLIs, and terminal/timezone/keymap data beyond
+  the console defaults.
 
-The usb variant uses the same trimmed initrd with its own boot-path drivers (USB host
-controllers, USB storage, MMC, card readers) instead of the NICs; it would not need the
-size, but both variants stay aligned.
+The 82 MiB in the table above are from the network-only builds before; the single build
+carries the stick path's drivers too (~1 MiB more). `mkosi.postoutput` warns above 85 MiB.
 
 Cosmetic: mkosi copies the kernel's full module index into the initrd (all ~6500 modules,
 of which ~200 are shipped), so udev in the initrd logs `error=No such file or directory`
@@ -661,7 +660,7 @@ real system loads them from the root image.
 | "unsupported image", "invalid boot file" or the firmware restarts the boot menu | the machine booted in legacy BIOS/CSM mode: the boot file is a UEFI binary. Set the firmware to UEFI only and use the "UEFI …" network entry |
 | DHCP but no download | `journalctl -u safespace-dhcp -f` (or your DHCP server's log): does the client get option 60/67? HTTP boot needs both. `curl -I` the URL from another machine |
 | firmware downloads, then "Access Denied" / nothing | Secure Boot is enforced but `db` does not have your certificate: seal the machine (see above). `release.sh` and `safespace-netboot verify` say which key signed it |
-| firmware resets or hangs on the download | the UKI may be too large for this firmware: shrink it (`KernelInitrdModules=` in `mkosi.profiles/network/mkosi.conf`, e.g. only `/drivers/net/ethernet/intel/`) and rebuild; or use the usb variant |
+| firmware resets or hangs on the download | the UKI may be too large for this firmware: shrink it (`KernelInitrdModules=` in `mkosi.conf`, e.g. only `/drivers/net/ethernet/intel/`) and rebuild; or use the usb variant |
 | `netroot: no link reported as online` | NIC driver missing in the initrd (add it to `KernelInitrdModules=`), no DHCP on that port, or the NIC is on USB (not supported) |
 | `netroot: not enough RAM` | the machine cannot hold the root image; more RAM, or a smaller image (fewer packages) |
 | `netroot: download … failed` | nginx not running, wrong path, or firewall; the message contains curl's own error |
@@ -703,8 +702,8 @@ real system loads them from the root image.
   release).
 - Real hardware: a ThinkPad T450s (no HTTP boot) network-boots over PXE/TFTP only with
   Intel AMT disabled and a UKI that is not much larger than the current 82 MiB (see
-  [Case found](#case-found-thinkpad-t450s-bios-jbet73ww)); with AMT on it needs the usb
-  variant. UEFI HTTP boot is tested end to end in QEMU and libvirt (OVMF, no disk):
+  [Case found](#case-found-thinkpad-t450s-bios-jbet73ww)); with AMT on it boots from a
+  stick. UEFI HTTP boot is tested end to end in QEMU and libvirt (OVMF, no disk):
   DHCP → signed UKI over HTTP → DHCP in the initrd → `root.verity` and `root.img` over
   HTTP → dm-verity against the signed root hash → login. Real firmware differs in how it
   offers HTTP boot and how large a boot file it accepts.

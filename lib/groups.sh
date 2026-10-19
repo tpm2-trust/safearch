@@ -1,5 +1,5 @@
 # Package groups: what goes into an image on top of the base system,
-# independent of the variant (usb / network). Sourced by build.sh.
+# the same for sticks and network boot. Sourced by build.sh.
 #
 #   groups_parse LIST   "Base,RemoteDesktop" -> SAFESPACE_GROUPS=(base remotedesktop)
 #   groups_profiles     mkosi --profile= arguments for the parsed groups

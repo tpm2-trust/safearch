@@ -7,7 +7,7 @@
 #
 #   --keep   keep the temporary directory (printed at the end)
 #   TEST     run only these (default: all): syntax groups keys builds
-#            release server usb stick upload netroot dnsmasq nginx units
+#            release server stick upload netroot dnsmasq nginx units
 #
 # Needs the build host's tools (README.md, "Build host"): sbsigntools,
 # efitools, sbctl, cryptsetup, zstd, mtools, dosfstools, util-linux, binutils,
@@ -66,7 +66,8 @@ source "$REPO/tests/lib/fixtures.sh"
 log() { :; }
 die() { echo "DIE: $*" >&2; return 1; }
 
-# Shared fixtures: a key set, a checkout with one network and one usb build.
+# Shared fixtures: a key set, a checkout with two builds of different group
+# sets (the older one with the desktop); each serves sticks and network boot.
 fixtures() {
 	[[ -d $W/keys ]] && return 0
 	need sbctl sbsign sbverify veritysetup zstd objcopy mcopy mkfs.vfat sfdisk openssl || return 1
@@ -76,15 +77,13 @@ fixtures() {
 	fx_checkout "$CO" "$REPO"
 	cp "$KD/db/db.pem" "$CO/mkosi.extra/usr/share/safespace/secureboot/db.pem"
 	NETPORT=$(port)
-	# Two network builds of different group sets (the older one with the
-	# desktop), one usb build.
-	fx_build "$CO" network 20990101-0000 "$KD" base,remotedesktop "http://127.0.0.1:$NETPORT/network/" \
-		linux=6.1 vim=9.0 xfce4=4.18 || { fail "building the network fixture"; return 1; }
-	fx_build "$CO" network 20990101-0100 "$KD" base "http://127.0.0.1:$NETPORT/network/" \
-		linux=6.2 vim=9.0 openssh=9.9 || { fail "building the network fixture"; return 1; }
-	fx_build "$CO" usb 20990101-0000 "$KD" base "" linux=1 || { fail "building the usb fixture"; return 1; }
+	fx_build "$CO" 20990101-0000 "$KD" base,remotedesktop "http://127.0.0.1:$NETPORT/" \
+		linux=6.1 vim=9.0 xfce4=4.18 || { fail "building the fixture"; return 1; }
+	fx_build "$CO" 20990101-0100 "$KD" base "http://127.0.0.1:$NETPORT/" \
+		linux=6.2 vim=9.0 openssh=9.9 || { fail "building the fixture"; return 1; }
+	B=$CO/mkosi.output/base_20990101-0100
 	SHARE=$W/share STATE=$W/state
-	mkdir -p "$SHARE/network" "$SHARE/usb" "$STATE"
+	mkdir -p "$SHARE" "$STATE"
 	cat >"$W/server.conf" <<-EOF
 		SHARE=$SHARE
 		STATE=$STATE
@@ -101,11 +100,10 @@ fixtures() {
 	export SAFESPACE_SERVER_CONF=$W/server.conf
 }
 NB=$REPO/server/safespace-netboot
-# The share with both releases, for the tests that do not test releasing.
+# The share with the newest build released, for the tests that do not test releasing.
 shared() {
 	fixtures || return 1
-	[[ -f $SHARE/network/release ]] || "$CO/release.sh" network --push "$SHARE" >/dev/null 2>&1 || { fail "releasing into the share"; return 1; }
-	[[ -f $SHARE/usb/release ]] || "$CO/release.sh" usb --push "$SHARE" >/dev/null 2>&1 || { fail "releasing usb into the share"; return 1; }
+	[[ -f $SHARE/release ]] || "$CO/release.sh" --push "$SHARE" >/dev/null 2>&1 || { fail "releasing into the share"; return 1; }
 }
 
 # --- syntax --------------------------------------------------------------------------------
@@ -130,7 +128,7 @@ if wanted groups; then
 	refuse "unknown group refused" t_groups "base,foo" ""
 	refuse "shell characters refused" t_groups 'base;rm' ""
 	if need mkosi; then
-		pk() { mkosi --directory "$REPO" --profile=network "$@" --json summary 2>/dev/null |
+		pk() { mkosi --directory "$REPO" "$@" --json summary 2>/dev/null |
 			python3 -I -c 'import json, sys; print(" ".join(json.load(sys.stdin)["Images"][-1]["Packages"]))'; }
 		base=$(pk) all=$(pk --profile=remotedesktop --profile=docker)
 		check "base has no desktop and no docker" bash -c '[[ " $1 " != *" xfce4 "* && " $1 " != *" docker "* && " $1 " == *" openssh "* ]]' _ "$base"
@@ -168,128 +166,109 @@ fi
 # --- builds on the build host ----------------------------------------------------------------
 if wanted builds && fixtures; then
 	section builds
-	parts() { [[ $(LC_ALL=C ls "$1" | tr "\n" " ") == "$2" ]]; }
-	check "finalize: a network build keeps only its parts" parts "$CO/mkosi.output/network/base_20990101-0100" \
-		"boot.efi build.json manifest.json root.img root.verity roothash "
-	check "finalize: a usb build also systemd-boot and the partition table, no disk image" parts "$CO/mkosi.output/usb/base_20990101-0000" \
-		"boot.efi build.json layout.sfdisk manifest.json root.img root.verity roothash systemd-boot.efi "
+	check "finalize: a build keeps exactly its parts, no disk image, no initrd copy" bash -c '[[ $(LC_ALL=C ls "$1" | tr "\n" " ") == "boot.efi build.json layout.sfdisk manifest.json root.img root.verity roothash systemd-boot.efi " ]]' _ "$B"
 	BS=$CO/build.sh
 	"$BS" list >"$W/list.txt" 2>&1
-	check "list: every build, one group set after the other" bash -c '[[ $(grep -Eo "(network|usb) +[a-z-]+_[0-9-]+" "$1" | tr -s " " | tr "\n" "|") == "network base-remotedesktop_20990101-0000|network base_20990101-0100|usb base_20990101-0000|" ]]' _ "$W/list.txt"
+	check "list: every build, one group set after the other" bash -c '[[ $(grep -Eo "^[a-z-]+_[0-9-]+" "$1" | tr "\n" "|") == "base-remotedesktop_20990101-0000|base_20990101-0100|" ]]' _ "$W/list.txt"
 	check "list: snapshot and package count" grep -q "base_20990101-0100 .*2099/01/01 .* 3 " "$W/list.txt"
 	check "show: details and packages" bash -c '"$1" show base_20990101-0100 | grep -q "^commit *abc1234" && "$1" show base_20990101-0100 | grep -q "openssh *9.9"' _ "$BS"
-	refuse "show: an ambiguous or unknown build is refused" "$BS" show base_20990101-9999
+	refuse "show: an unknown build is refused" "$BS" show base_20990101-9999
+	refuse "build.sh refuses the old variant argument" "$BS" usb
 	"$BS" diff base-remotedesktop_20990101-0000 base_20990101-0100 >"$W/diff.txt" 2>&1
 	check "diff: added, removed, upgraded" bash -c 'grep -q "^+ openssh" "$1" && grep -q "^- xfce4" "$1" && grep -q "^~ linux .*6.1 -> 6.2" "$1" && grep -q "1 packages unchanged" "$1"' _ "$W/diff.txt"
 	if need rsync; then
-		mkdir -p "$W/pick/network" "$W/pick/usb"
-		"$CO/release.sh" network --groups Base,RemoteDesktop --push "$W/pick" >"$W/pick.log" 2>&1
-		check "release --groups picks the newest build of that set" grep -q "^BUILD=base-remotedesktop_20990101-0000$" "$W/pick/network/release"
+		mkdir -p "$W/pick"
+		"$CO/release.sh" --groups Base,RemoteDesktop --push "$W/pick" >"$W/pick.log" 2>&1
+		check "release --groups picks the newest build of that set" grep -q "^BUILD=base-remotedesktop_20990101-0000$" "$W/pick/release"
 		check "... and warns about the newer unreleased build" grep -q "a newer build is not released: base_20990101-0100" "$W/pick.log"
-		check "... and records the push in released.log" grep -q " $W/pick$" "$CO/mkosi.output/network/base-remotedesktop_20990101-0000/released.log"
-		check "the release carries build, built, snapshot, commit, packages" bash -c 'grep -q "^BUILT=2099-01-01T00:00" $1 && grep -q "^SNAPSHOT=2099/01/01" $1 && grep -q "^COMMIT=abc1234$" $1 && grep -q "^PACKAGES=3$" $1' _ "$W/pick/network/release"
-		check "release without a choice takes the newest build" bash -c '"$1" network >/dev/null 2>&1 && grep -q "^BUILD=base_20990101-0100$" "$2/release"' _ "$CO/release.sh" "$CO/mkosi.release/network"
-		check "release --build an older one (going back)" bash -c '"$1" network --build base-remotedesktop_20990101-0000 >/dev/null 2>&1 && grep -q "^BUILD=base-remotedesktop_20990101-0000$" "$2/release"' _ "$CO/release.sh" "$CO/mkosi.release/network"
-		refuse "release --groups without such a build is refused" "$CO/release.sh" network --groups base,docker
+		check "... and records the push in released.log" grep -q " $W/pick$" "$CO/mkosi.output/base-remotedesktop_20990101-0000/released.log"
+		check "the release carries build, built, snapshot, commit, packages" bash -c 'grep -q "^BUILT=2099-01-01T00:00" $1 && grep -q "^SNAPSHOT=2099/01/01" $1 && grep -q "^COMMIT=abc1234$" $1 && grep -q "^PACKAGES=3$" $1' _ "$W/pick/release"
+		check "release without a choice takes the newest build" bash -c '"$1" >/dev/null 2>&1 && grep -q "^BUILD=base_20990101-0100$" "$2/release"' _ "$CO/release.sh" "$CO/mkosi.release"
+		check "release --build an older one (going back)" bash -c '"$1" --build base-remotedesktop_20990101-0000 >/dev/null 2>&1 && grep -q "^BUILD=base-remotedesktop_20990101-0000$" "$2/release"' _ "$CO/release.sh" "$CO/mkosi.release"
+		refuse "release --groups without such a build is refused" "$CO/release.sh" --groups base,docker
+		check "staged as hardlinks of the build (nothing copied)" bash -c '[[ $(stat -c %i "$1/root.img") == $(stat -c %i "$2/root.img") ]]' _ "$CO/mkosi.release" "$CO/mkosi.output/base-remotedesktop_20990101-0000"
 	fi
 	# prune: four more base builds, the oldest of them released last to a target.
 	P=$W/prunetest
 	fx_checkout "$P" "$REPO"
-	for v in 0100 0200 0300 0400 0500; do mkdir -p "$P/mkosi.output/network/base_20990101-$v"; fx_finish "$P" network base "20990101-$v" a=1 >/dev/null; done
-	mkdir -p "$P/mkosi.output/network/base-docker_20990101-0000"; fx_finish "$P" network base,docker 20990101-0000 a=1 >/dev/null
-	echo "2099-01-01T02:00:00+00:00 dist1" >"$P/mkosi.output/network/base_20990101-0100/released.log"
-	mkdir -p "$P/mkosi.output/network/base_20990101-0600" "$P/mkosi.output/network/base_20990101-0010"
-	touch -d '-1 day' "$P/mkosi.output/network/base_20990101-0010"
+	for v in 0100 0200 0300 0400 0500; do fx_finish "$P" base "20990101-$v" a=1 >/dev/null; done
+	fx_finish "$P" base,docker 20990101-0000 a=1 >/dev/null
+	echo "2099-01-01T02:00:00+00:00 dist1" >"$P/mkosi.output/base_20990101-0100/released.log"
+	mkdir -p "$P/mkosi.output/base_20990101-0600" "$P/mkosi.output/base_20990101-0010"
+	touch -d '-1 day' "$P/mkosi.output/base_20990101-0010"
 	check "prune --keep 3 --yes" "$P/build.sh" prune --keep 3 --yes
-	check "prune: 3 newest per group set + the last released one stay" bash -c '[[ $(LC_ALL=C ls "$1" | tr "\n" " ") == "base-docker_20990101-0000 base_20990101-0100 base_20990101-0300 base_20990101-0400 base_20990101-0500 base_20990101-0600 " ]]' _ "$P/mkosi.output/network"
+	check "prune: 3 newest per group set + the last released one stay" bash -c '[[ $(LC_ALL=C ls "$1" | tr "\n" " ") == "base-docker_20990101-0000 base_20990101-0100 base_20990101-0300 base_20990101-0400 base_20990101-0500 base_20990101-0600 " ]]' _ "$P/mkosi.output"
 fi
 
 # --- release ---------------------------------------------------------------------------------
 if wanted release && fixtures && need rsync; then
 	section release
-	check "release.sh network stages and passes its own checks" "$CO/release.sh" network --groups base,remotedesktop
-	check "staged: fixed names, groups recorded" bash -c '[[ -f $1/boot.efi && -f $1/root.img && -f $1/root.verity && $(grep ^GROUPS= $1/release) == GROUPS=base,remotedesktop ]]' _ "$CO/mkosi.release/network"
-	check "release.sh network --push into a share" "$CO/release.sh" network --push "$SHARE"
-	check "release.sh usb --push into a share" "$CO/release.sh" usb --push "$SHARE"
-	check "the share serves the newest release" bash -c '[[ $(grep ^BUILD= $1/network/release) == BUILD=base_20990101-0100 ]]' _ "$SHARE"
+	check "release.sh stages and passes its own checks" "$CO/release.sh" --groups base,remotedesktop
+	check "staged: all parts, groups recorded" bash -c 'for f in boot.efi root.img root.verity roothash systemd-boot.efi layout.sfdisk manifest.json cmdline release SHA256SUMS; do [[ -f $1/$f ]] || exit 1; done; [[ $(grep ^GROUPS= $1/release) == GROUPS=base,remotedesktop ]]' _ "$CO/mkosi.release"
+	check "release.sh --push into a share" "$CO/release.sh" --push "$SHARE"
+	check "the share serves the newest release" bash -c '[[ $(grep ^BUILD= $1/release) == BUILD=base_20990101-0100 ]]' _ "$SHARE"
 	check "server status shows build, groups, snapshot" bash -c '"$1" status | grep -q "groups base, built 2099-01-01T01:00:00+00:00, snapshot 2099/01/01, commit abc1234, 3 packages"' _ "$NB"
 fi
 
 # --- server: verify ------------------------------------------------------------------------
 if wanted server && shared; then
 	section server
-	check "verify: the served network release is ok" "$NB" verify network
-	check "status says ok" bash -c '"$1" status | grep -A2 "^network" | grep -q "ok, checked"' _ "$NB"
-	check "verify --changed skips an unchanged release" bash -c '[[ -z $("$1" verify --changed network) ]]' _ "$NB"
-	cp -a "$SHARE/network" "$W/network.good"
+	check "verify: the served release is ok" "$NB" verify
+	check "status says ok" bash -c '"$1" status | grep -q "ok, checked"' _ "$NB"
+	check "verify --changed skips an unchanged release" bash -c '[[ -z $("$1" verify --changed) ]]' _ "$NB"
+	cp -a "$SHARE" "$W/share.good"
 	tamper() { # NAME COMMAND: tamper with a copy of the good release, expect BROKEN
-		rm -rf "$SHARE/network"
-		cp -a "$W/network.good" "$SHARE/network"
-		bash -c "$2" _ "$SHARE/network"
-		refuse "verify detects: $1" "$NB" verify network
+		rm -rf "$SHARE"
+		cp -a "$W/share.good" "$SHARE"
+		bash -c "$2" _ "$SHARE"
+		refuse "verify detects: $1" "$NB" verify
 	}
-	tamper "a manipulated hash tree (SHA256SUMS recomputed)" 'printf "\xff" | dd of=$1/root.verity bs=1 seek=8192 conv=notrunc status=none; source '"$REPO"'/tests/lib/fixtures.sh; fx_resum $1'
-	tamper "a manipulated root image" 'printf "\xff" | dd of=$1/root.img bs=1 seek=4096 conv=notrunc status=none; source '"$REPO"'/tests/lib/fixtures.sh; fx_resum $1'
-	tamper "a UKI signed by another key" 'sbattach --remove $1/boot.efi >/dev/null; sbsign --key '"$W"'/keys/keys/KEK/KEK.key --cert '"$W"'/keys/keys/KEK/KEK.pem --output $1/boot.efi $1/boot.efi >/dev/null 2>&1; source '"$REPO"'/tests/lib/fixtures.sh; fx_resum $1'
-	tamper "an unsigned UKI" 'sbattach --remove $1/boot.efi >/dev/null; source '"$REPO"'/tests/lib/fixtures.sh; fx_resum $1'
-	tamper "a roothash that is not the signed one" 'echo 0000000000000000000000000000000000000000000000000000000000000000 >$1/roothash; source '"$REPO"'/tests/lib/fixtures.sh; fx_resum $1'
+	resum="source $REPO/tests/lib/fixtures.sh; fx_resum \$1"
+	tamper "a manipulated hash tree (SHA256SUMS recomputed)" 'printf "\xff" | dd of=$1/root.verity bs=1 seek=8192 conv=notrunc status=none; '"$resum"
+	tamper "a manipulated root image" 'printf "\xff" | dd of=$1/root.img bs=1 seek=4096 conv=notrunc status=none; '"$resum"
+	tamper "a UKI signed by another key" 'sbattach --remove $1/boot.efi >/dev/null; sbsign --key '"$KD"'/KEK/KEK.key --cert '"$KD"'/KEK/KEK.pem --output $1/boot.efi $1/boot.efi >/dev/null 2>&1; '"$resum"
+	tamper "an unsigned UKI" 'sbattach --remove $1/boot.efi >/dev/null; '"$resum"
+	tamper "systemd-boot signed by another key" 'sbattach --remove $1/systemd-boot.efi >/dev/null; sbsign --key '"$KD"'/KEK/KEK.key --cert '"$KD"'/KEK/KEK.pem --output $1/systemd-boot.efi $1/systemd-boot.efi >/dev/null 2>&1; '"$resum"
+	tamper "a roothash that is not the signed one" 'echo 0000000000000000000000000000000000000000000000000000000000000000 >$1/roothash; '"$resum"
+	tamper "a partition table with another root partition UUID" 'sed -i "/4F68BCE3/s/uuid=[0-9A-F-]*/uuid=11111111-2222-3333-4444-555555555555/" $1/layout.sfdisk; '"$resum"
+	tamper "a partition too small for the root image" 'sed -i "/4F68BCE3/s/size= *[0-9]*/size=8/" $1/layout.sfdisk; '"$resum"
 	tamper "a file not in SHA256SUMS" 'echo x >$1/extra'
 	tamper "a broken transfer" 'truncate -s 1M $1/root.img'
-	check "status says BROKEN" bash -c '"$1" status | grep -A2 "^network" | grep -q BROKEN' _ "$NB"
-	check "verify never changes the share (the broken file is still there)" bash -c '[[ $(stat -c %s "$1/network/root.img") == 1048576 ]]' _ "$SHARE"
-	rm -rf "$SHARE/network"
-	cp -a "$W/network.good" "$SHARE/network"
-fi
-
-# --- usb release ----------------------------------------------------------------------------
-if wanted usb && shared; then
-	section usb
-	check "verify: the served usb release is ok" "$NB" verify usb
-	cp -a "$SHARE/usb" "$W/usb.good"
-	tamper_usb() { # NAME COMMAND
-		rm -rf "$SHARE/usb"
-		cp -a "$W/usb.good" "$SHARE/usb"
-		bash -c "$2; source '$REPO/tests/lib/fixtures.sh'; fx_resum \$1" _ "$SHARE/usb"
-		refuse "verify detects: $1" "$NB" verify usb
-	}
-	tamper_usb "a manipulated root image" 'printf "\xff" | dd of=$1/root.img bs=1 seek=4096 conv=notrunc status=none'
-	tamper_usb "systemd-boot signed by another key" 'sbattach --remove $1/systemd-boot.efi >/dev/null; sbsign --key '"$W"'/keys/keys/KEK/KEK.key --cert '"$W"'/keys/keys/KEK/KEK.pem --output $1/systemd-boot.efi $1/systemd-boot.efi >/dev/null 2>&1'
-	tamper_usb "a partition table with another root partition UUID" 'sed -i "/4F68BCE3/s/uuid=[0-9A-F-]*/uuid=11111111-2222-3333-4444-555555555555/" $1/layout.sfdisk'
-	tamper_usb "a partition too small for the root image" 'sed -i "/4F68BCE3/s/size= *[0-9]*/size=8/" $1/layout.sfdisk'
-	rm -rf "$SHARE/usb"
-	cp -a "$W/usb.good" "$SHARE/usb"
+	check "status says BROKEN" bash -c '"$1" status | grep -q BROKEN' _ "$NB"
+	check "verify never changes the share (the broken file is still there)" bash -c '[[ $(stat -c %s "$1/root.img") == 1048576 ]]' _ "$SHARE"
+	rm -rf "$SHARE"
+	cp -a "$W/share.good" "$SHARE"
 fi
 
 # --- writing a stick (burn.sh --image, lib/stick.sh) -----------------------------------------
 if wanted stick && shared && need mkfs.fat mmd mcopy sfdisk; then
 	section stick
-	U=$CO/mkosi.output/usb/base_20990101-0000
 	cut_part() { # IMAGE TYPE OUT: a partition of a stick image into a file
-		set -- "$1" "$(awk -F'[=,]' -v t="$2" 'toupper($0) ~ "TYPE=" t { gsub(/ /, ""); print $2, $4; exit }' "$U/layout.sfdisk")" "$3"
+		set -- "$1" "$(awk -F'[=,]' -v t="$2" 'toupper($0) ~ "TYPE=" t { gsub(/ /, ""); print $2, $4; exit }' "$B/layout.sfdisk")" "$3"
 		dd if="$1" of="$3" bs=512 skip="${2% *}" count="${2#* }" status=none
 	}
 	stick_ok() { # IMAGE: the written stick is the build
 		local img=$1
-		[[ $(sfdisk -d "$img" | sed -e '/^device:/d' -e 's|^[^ ]* : ||') == "$(cat "$U/layout.sfdisk")" ]] || { echo "partition table differs"; return 1; }
-		[[ $(mdir -b -/ -i "$img@@$((2048 * 512))" ::/ | sort | tr '\n' ' ') == "::/EFI/ ::/EFI/BOOT/ ::/EFI/BOOT/BOOTX64.EFI ::/EFI/Linux/ ::/EFI/Linux/safespace-arch-usb.efi " ]] || { echo "ESP content differs"; return 1; }
-		mcopy -n -i "$img@@$((2048 * 512))" ::/EFI/BOOT/BOOTX64.EFI "$W/st.boot" && cmp -s "$W/st.boot" "$U/systemd-boot.efi" || { echo "BOOTX64.EFI differs"; return 1; }
-		mcopy -n -i "$img@@$((2048 * 512))" ::/EFI/Linux/safespace-arch-usb.efi "$W/st.uki" && cmp -s "$W/st.uki" "$U/boot.efi" || { echo "UKI differs"; return 1; }
+		[[ $(sfdisk -d "$img" | sed -e '/^device:/d' -e 's|^[^ ]* : ||') == "$(cat "$B/layout.sfdisk")" ]] || { echo "partition table differs"; return 1; }
+		[[ $(mdir -b -/ -i "$img@@$((2048 * 512))" ::/ | sort | tr '\n' ' ') == "::/EFI/ ::/EFI/BOOT/ ::/EFI/BOOT/BOOTX64.EFI ::/EFI/Linux/ ::/EFI/Linux/safespace-arch.efi " ]] || { echo "ESP content differs"; return 1; }
+		mcopy -n -i "$img@@$((2048 * 512))" ::/EFI/BOOT/BOOTX64.EFI "$W/st.boot" && cmp -s "$W/st.boot" "$B/systemd-boot.efi" || { echo "BOOTX64.EFI differs"; return 1; }
+		mcopy -n -i "$img@@$((2048 * 512))" ::/EFI/Linux/safespace-arch.efi "$W/st.uki" && cmp -s "$W/st.uki" "$B/boot.efi" || { echo "UKI differs"; return 1; }
 		[[ $(od -An -tu2 -j$((2048 * 512 + 11)) -N2 "$img" | tr -d ' ') == 512 ]] || { echo "FAT sector size is not 512"; return 1; }
 		cut_part "$img" 4F68BCE3 "$W/st.root" && cut_part "$img" 2C7357ED "$W/st.verity" &&
-			veritysetup verify "$W/st.root" "$W/st.verity" "$(cat "$U/roothash")" || { echo "root does not verify"; return 1; }
+			veritysetup verify "$W/st.root" "$W/st.verity" "$(cat "$B/roothash")" || { echo "root does not verify"; return 1; }
 	}
-	check "burn.sh --image from a build" "$CO/burn.sh" base_20990101-0000 --image "$W/stick1.raw"
+	check "burn.sh --image from a build" "$CO/burn.sh" base_20990101-0100 --image "$W/stick1.raw"
 	check "... is the build: table, ESP, signed files, root block by block" stick_ok "$W/stick1.raw"
-	check "burn.sh --image from a share directory (SHA256SUMS checked)" "$CO/burn.sh" "$SHARE/usb" --image "$W/stick2.raw"
+	check "burn.sh --image from a share directory (SHA256SUMS checked)" "$CO/burn.sh" "$SHARE" --image "$W/stick2.raw"
 	SP=$(port)
-	serve "$W/share" "$SP"
-	check "burn.sh --image from a server URL (root streamed)" "$CO/burn.sh" "http://127.0.0.1:$SP/usb/" --image "$W/stick3.raw"
+	serve "$SHARE" "$SP"
+	check "burn.sh --image from a server URL (root streamed)" "$CO/burn.sh" "http://127.0.0.1:$SP/" --image "$W/stick3.raw"
 	check "... is the build too" stick_ok "$W/stick3.raw"
-	cp "$SHARE/usb/root.img" "$W/root.good"
-	printf '\xff' | dd of="$SHARE/usb/root.img" bs=1 seek=4096 conv=notrunc status=none
-	refuse "a root.img that does not match SHA256SUMS is refused while streaming" "$CO/burn.sh" "http://127.0.0.1:$SP/usb/" --image "$W/stick4.raw"
+	cp "$SHARE/root.img" "$W/root.good"
+	printf '\xff' | dd of="$SHARE/root.img" bs=1 seek=4096 conv=notrunc status=none
+	refuse "a root.img that does not match SHA256SUMS is refused while streaming" "$CO/burn.sh" "http://127.0.0.1:$SP/" --image "$W/stick4.raw"
 	check "... and nothing is left behind" test ! -e "$W/stick4.raw"
-	cp "$W/root.good" "$SHARE/usb/root.img"
+	cp "$W/root.good" "$SHARE/root.img"
 fi
 
 # --- upload through rrsync ------------------------------------------------------------------
@@ -307,23 +286,22 @@ if wanted upload && fixtures && [[ -z ${ONLY_SKIP:-} ]] && command -v rrsync >/d
 		SSH_ORIGINAL_COMMAND="\$*" exec $(command -v rrsync) -wo -no-del -munge "$W/rshare"
 	EOF
 	chmod +x "$W/fake-ssh"
-	mkdir -p "$W/rshare/network" "$W/rshare/usb"
-	up() { RSYNC_RSH="$W/fake-ssh" "$CO/release.sh" network --push "safespace@server"; }
+	mkdir -p "$W/rshare" "$W/empty"
+	up() { RSYNC_RSH="$W/fake-ssh" "$CO/release.sh" --push "safespace@server"; }
 	check "upload through rrsync" up
 	check "a second upload replaces the release" up
-	check "uploaded files arrived" bash -c 'cmp -s "$1/rshare/network/root.img" "$2/mkosi.release/network/root.img"' _ "$W" "$CO"
-	mkdir -p "$W/empty"
-	refuse "rrsync refuses deleting" env RSYNC_RSH="$W/fake-ssh" rsync -r --delete "$W/empty/" "safespace@server:network/"
-	check "... and the release is still there" test -f "$W/rshare/network/root.img"
-	refuse "rrsync refuses reading" env RSYNC_RSH="$W/fake-ssh" rsync -r "safespace@server:network/" "$W/readback/"
+	check "uploaded files arrived" bash -c 'cmp -s "$1/rshare/root.img" "$2/mkosi.release/root.img"' _ "$W" "$CO"
+	refuse "rrsync refuses deleting" env RSYNC_RSH="$W/fake-ssh" rsync -r --delete "$W/empty/" "safespace@server:"
+	check "... and the release is still there" test -f "$W/rshare/root.img"
+	refuse "rrsync refuses reading" env RSYNC_RSH="$W/fake-ssh" rsync -r "safespace@server:" "$W/readback/"
 	refuse "rrsync refuses paths outside the share" env RSYNC_RSH="$W/fake-ssh" rsync "$W/server.conf" "safespace@server:../escape"
 	check "nothing escaped the share" test ! -e "$W/escape"
 fi
 
-# --- netroot (initrd) -------------------------------------------------------------------------
+# --- netroot (initrd, the network path) ---------------------------------------------------------
 if wanted netroot && shared && need curl; then
 	section netroot
-	NR=$REPO/mkosi.initrd.conf/mkosi.profiles/network/mkosi.extra/usr/local/lib/safespace/netroot
+	NR=$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/netroot
 	S=$W/shims
 	mkdir -p "$S"
 	for c in modprobe udevadm umount sleep; do printf '#!/bin/sh\nexit 0\n' >"$S/$c"; done
@@ -332,9 +310,9 @@ if wanted netroot && shared && need curl; then
 	printf '#!/bin/sh\necho "$*" >>"%s/systemctl.calls"\n' "$W" >"$S/systemctl"
 	printf '#!/bin/sh\necho "$*" >>"%s/veritysetup.calls"\n[ -f "%s/veritysetup.fail" ] && exit 1\nexit 0\n' "$W" "$W" >"$S/veritysetup"
 	chmod +x "$S"/*
-	served=$(tr -d '[:space:]' <"$SHARE/network/roothash")
-	mkdir -p "$W/old/network" && echo 1111111111111111111111111111111111111111111111111111111111111111 >"$W/old/network/roothash"
-	cp "$SHARE/network/root.img" "$SHARE/network/root.verity" "$W/old/network/"
+	served=$(tr -d '[:space:]' <"$SHARE/roothash")
+	mkdir -p "$W/old" && echo 1111111111111111111111111111111111111111111111111111111111111111 >"$W/old/roothash"
+	cp "$SHARE/root.img" "$SHARE/root.verity" "$W/old/"
 	P1=$(port) P2=$(port)
 	serve "$W/old" "$P1"
 	serve "$SHARE" "$P2"
@@ -344,18 +322,18 @@ if wanted netroot && shared && need curl; then
 		NETROOT_CMDLINE="roothash=$h $(printf 'safespace.netroot=%s ' "$@")" NETROOT_DIR=$W/nr PATH="$S:$PATH" sh "$NR" >/dev/null 2>&1
 		return 0
 	}
-	nr "$served" "http://127.0.0.1:$P2/network/"
+	nr "$served" "http://127.0.0.1:$P2/"
 	check "the matching release is opened with the signed root hash" grep -q "$served" "$W/veritysetup.calls"
 	check "... and no reboot" test ! -e "$W/systemctl.calls"
 	: >"$W/http-$P1.log"
-	nr "$served" "http://127.0.0.1:$P1/network/"
+	nr "$served" "http://127.0.0.1:$P1/"
 	check "only another release served: reboot to load the new boot.efi" grep -qx reboot "$W/systemctl.calls"
-	check "... without downloading the root image" bash -c '! grep -q "GET /network/root.img" "$1"' _ "$W/http-$P1.log"
-	nr "$served" "http://127.0.0.1:$P1/network/" "http://127.0.0.1:$P2/network/"
+	check "... without downloading the root image" bash -c '! grep -q "GET /root.img" "$1"' _ "$W/http-$P1.log"
+	nr "$served" "http://127.0.0.1:$P1/" "http://127.0.0.1:$P2/"
 	check "a stale first server and a matching second one: no reboot" test ! -e "$W/systemctl.calls"
 	check "... the second one is used" grep -q "$served" "$W/veritysetup.calls"
 	touch "$W/veritysetup.fail"
-	nr "$served" "http://127.0.0.1:$P2/network/"
+	nr "$served" "http://127.0.0.1:$P2/"
 	check "the right release but a refused image: an error, no reboot loop" test ! -e "$W/systemctl.calls"
 	rm -f "$W/veritysetup.fail"
 fi
@@ -367,7 +345,8 @@ if wanted dnsmasq && shared && need dnsmasq; then
 		sed -i "s/^DHCP_MODE=.*/DHCP_MODE=$m/" "$W/server.conf"
 		check "DHCP_MODE=$m: configuration passes dnsmasq --test" bash -c 'RUNTIME_DIRECTORY=$2 "$1" dnsmasq-config && dnsmasq --test -C "$2/dnsmasq.conf"' _ "$NB" "$W/run-$m"
 	done
-	check "HTTP boot URL is \$SERVER_URL/network/boot.efi" grep -q "^dhcp-boot=tag:httpclient,http://127.0.0.1:$NETPORT/network/boot.efi$" "$W/run-dhcp/dnsmasq.conf"
+	check "HTTP boot URL is \$SERVER_URL/boot.efi" grep -q "^dhcp-boot=tag:httpclient,http://127.0.0.1:$NETPORT/boot.efi$" "$W/run-dhcp/dnsmasq.conf"
+	check "PXE boot file is boot.efi under the TFTP root (the share)" grep -q "^dhcp-boot=tag:efi64,boot.efi$" "$W/run-dhcp/dnsmasq.conf"
 	sed -i "s/^DHCP_MODE=.*/DHCP_MODE=off/" "$W/server.conf"
 	refuse "DHCP_MODE=off writes no configuration" env RUNTIME_DIRECTORY="$W/run-off" "$NB" dnsmasq-config
 fi
@@ -377,7 +356,7 @@ if wanted nginx && shared && need nginx curl; then
 	section nginx
 	N=$W/nginx P=$(port)
 	mkdir -p "$N/logs" "$N/tmp"
-	echo x >"$SHARE/network/.hidden"
+	echo x >"$SHARE/.hidden"
 	sed -e "s|@SHARE@|$SHARE|g" -e "s/listen      80 default_server;/listen 127.0.0.1:$P;/" -e '/\[::\]:80/d' "$REPO/server/nginx/safespace.conf" >"$N/site.conf"
 	cat >"$N/nginx.conf" <<-EOF
 		pid $N/nginx.pid; error_log $N/logs/error.log; events {}
@@ -387,17 +366,17 @@ if wanted nginx && shared && need nginx curl; then
 	if nginx -p "$N" -c "$N/nginx.conf" -e "$N/logs/error.log" 2>"$W/nginx.err"; then
 		sleep 0.3
 		code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
-		check "boot.efi is served with Content-Length" bash -c 'curl -sI "$1" | grep -qi "^content-length: [1-9]"' _ "http://127.0.0.1:$P/safespace/network/boot.efi"
-		check "usb parts are served" test "$(code -I "http://127.0.0.1:$P/safespace/usb/layout.sfdisk")" = 200
-		check "hidden files are refused" test "$(code "http://127.0.0.1:$P/safespace/network/.hidden")" = 403
-		check "no directory listing" test "$(code "http://127.0.0.1:$P/safespace/network/")" = 403
+		check "boot.efi is served with Content-Length" bash -c 'curl -sI "$1" | grep -qi "^content-length: [1-9]"' _ "http://127.0.0.1:$P/safespace/boot.efi"
+		check "the stick parts are served" test "$(code -I "http://127.0.0.1:$P/safespace/layout.sfdisk")" = 200
+		check "hidden files are refused" test "$(code "http://127.0.0.1:$P/safespace/.hidden")" = 403
+		check "no directory listing" test "$(code "http://127.0.0.1:$P/safespace/")" = 403
 		check "nothing outside /safespace/" test "$(code "http://127.0.0.1:$P/etc/passwd")" = 404
-		check "no writing" test "$(code -X PUT --data x "http://127.0.0.1:$P/safespace/network/x")" = 403
+		check "no writing" test "$(code -X PUT --data x "http://127.0.0.1:$P/safespace/x")" = 403
 		kill "$(cat "$N/nginx.pid")"
 	else
 		fail "nginx did not start: $(head -1 "$W/nginx.err")"
 	fi
-	rm -f "$SHARE/network/.hidden"
+	rm -f "$SHARE/.hidden"
 fi
 
 # --- units ------------------------------------------------------------------------------------
@@ -411,6 +390,11 @@ if wanted units && need systemd-analyze; then
 	done
 	check "server units pass systemd-analyze verify" bash -c '[[ -z $(systemd-analyze verify "$1"/* 2>&1) ]]' _ "$U"
 	check "verify service sandbox: exposure below 2" bash -c 'systemd-analyze security --offline=yes "$1/safespace-netboot-verify.service" 2>/dev/null | grep -Eq "Overall exposure level.*: [01]\."' _ "$U"
+	I=$REPO/mkosi.initrd.conf/mkosi.extra/usr/lib/systemd/system
+	V=/sys/firmware/efi/efivars/LoaderDevicePartUUID-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+	check "initrd: the stick path runs only when started from a partition" grep -qx "ConditionPathExists=$V" "$I/usb-bootdev.service"
+	check "initrd: the network path runs only when not" grep -qx "ConditionPathExists=!$V" "$I/netroot.service"
+	check "initrd: both paths are enabled" test -L "$I/initrd.target.wants/usb-bootdev.service" -a -L "$I/initrd.target.wants/netroot.service"
 fi
 
 printf '\n\e[1m%d passed, %d failed, %d skipped\e[0m\n' "$PASS" "$FAIL" "$SKIP"

@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# Build one of the two safespace-arch variants with mkosi, and keep track of
-# the builds on this host.
+# Build safespace-arch with mkosi, and keep track of the builds on this host.
+# One build serves both boot paths: the same signed UKI and root boot from a
+# USB stick / SD card (./burn.sh) and over the network (./release.sh to the
+# distribution servers, NETBOOT.md).
 #
-#   sudo ./build.sh usb     [--groups LIST] [--workers N] [--debug] [MKOSI OPTIONS...]
-#   sudo ./build.sh network [--groups LIST] [--url BASE_URL]... [--workers N] [--debug] [MKOSI OPTIONS...]
+#   sudo ./build.sh [--groups LIST] [--url BASE_URL]... [--workers N] [--debug] [MKOSI OPTIONS...]
 #
-#   ./build.sh list [network|usb]   the builds: groups, built at, snapshot,
+#   ./build.sh list                 the builds: groups, built at, snapshot,
 #                                   packages, size, last release
 #   ./build.sh show BUILD           details of a build and its package list
 #   ./build.sh diff BUILD BUILD     packages added, removed, changed
 #   ./build.sh prune [--keep N] [--yes]
 #                                   keep the newest N builds (default 3) per
-#                                   variant and group set; the build last
-#                                   released to each target always stays
+#                                   group set; the build last released to each
+#                                   target always stays
 #   sudo ./build.sh purge-cache [--packages]
 #                                   drop mkosi's image cache (and with
 #                                   --packages the downloaded packages); the
@@ -20,17 +21,11 @@
 #
 # Each build gets a directory of its own, named by its group set and build
 # time, so the builds of one group set sort together:
-#   mkosi.output/<variant>/<groups>_<version>/   e.g. network/base-remotedesktop_20261019-0930/
-# with build.json (what, when, from which package snapshot and commit) and
-# mkosi's output; release.sh adds released.log. BUILD in the commands above is
-# that directory name (or <variant>/<name> if both variants have it).
-#
-#   usb      a bootable USB stick / SD card: ESP with signed systemd-boot and
-#            UKI, erofs root and its dm-verity hash tree on the medium.
-#            Write it with ./burn.sh, check it with ./diagnose.sh.
-#   network  UEFI HTTP (or PXE/TFTP) netboot: the signed UKI plus the root
-#            image and its hash tree as separate files, to be published with
-#            ./release.sh. See NETBOOT.md.
+#   mkosi.output/<groups>_<version>/   e.g. mkosi.output/base-remotedesktop_20261019-0930/
+# with the parts (boot.efi, root.img, root.verity, roothash, systemd-boot.efi,
+# layout.sfdisk, manifest.json; lib/builds.sh), build.json (what, when, from
+# which package snapshot and commit); release.sh adds released.log. BUILD in
+# the commands above is that directory name.
 #
 # --groups LIST  package groups, comma-separated, case-insensitive (default:
 #              base). base: the base system only (always included);
@@ -38,12 +33,12 @@
 #              data disk. E.g. --groups base,RemoteDesktop,docker.
 #              See lib/groups.sh and mkosi.profiles/<group>/.
 #
-# The network variant needs the URL of the network release on the
-# distribution servers, e.g. --url http://10.0.0.1/safespace/network/ (the
-# initrd loads root.img and root.verity from there; a server only holds the
-# newest release). Give --url more than once for failover (tried in order), or
-# put it in netboot.conf (NETROOT_URL=, see netboot.conf.example) and leave the
-# option out.
+# --url BASE_URL  where a network-booted machine loads root.img and
+#              root.verity from: the distribution servers' share, e.g.
+#              http://10.0.0.1/safespace/ (a server only holds the newest
+#              release). More than once for failover (tried in order), or
+#              NETROOT_URL= in netboot.conf (netboot.conf.example). Without
+#              any, the build boots from sticks only.
 #
 # Package source: SNAPSHOT= and MIRROR= in repos.conf, overridden per host by
 # repos.local.conf (see repos.local.conf.example). A pinned date, or latest,
@@ -59,21 +54,20 @@
 #              dmidecode, pciutils, kexec-tools, tcpdump, ...) and append
 #              "-debug" to the image version.
 #
-# Everything else after the variant is passed to mkosi unchanged, e.g.
-#   sudo ./build.sh usb -f          force a rebuild of unchanged packages
-#   sudo ./build.sh usb --groups base,remotedesktop
-#   sudo ./build.sh network summary show the resolved configuration
+# Everything else is passed to mkosi unchanged, e.g.
+#   sudo ./build.sh -f              force a rebuild of unchanged packages
+#   sudo ./build.sh --groups base,remotedesktop
+#   ./build.sh summary              show the resolved configuration
 #
 # Building needs root, because the UKI is signed with the sbctl db key in
 # /var/lib/sbctl, which is readable by root only. Read-only verbs (summary,
 # cat-config) run as a normal user.
 #
 # Every build exports the public Secure Boot keys it signs with into the image
-# (mkosi.extra/usr/share/safespace/secureboot/), so safespace-seal works in
-# both variants, and creates the expected-PCR signing key on the first build
-# (lib/keys.sh). The keys: the host's sbctl (/var/lib/sbctl), or a dedicated
-# sbctl key set, SAFESPACE_SBCTL_CONFIG= in mkosi.local.conf (README.md,
-# "Secure Boot keys").
+# (mkosi.extra/usr/share/safespace/secureboot/), so safespace-seal works, and
+# creates the expected-PCR signing key on the first build (lib/keys.sh). The
+# keys: the host's sbctl (/var/lib/sbctl), or a dedicated sbctl key set,
+# SAFESPACE_SBCTL_CONFIG= in mkosi.local.conf (README.md, "Secure Boot keys").
 set -Eeuo pipefail
 
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
@@ -86,12 +80,10 @@ source "$HERE/lib/builds.sh"
 # --- managing the builds (no mkosi run) ----------------------------------------
 case ${1:-} in
 	list)
-		[[ -z ${2:-} || $2 == network || $2 == usb ]] || die "list: network or usb"
-		builds_list "${2:-}"
+		builds_list
 		exit 0 ;;
 	show)
-		vb=$(builds_find "${2:?show needs a build (./build.sh list)}")
-		builds_show "${vb%%/*}" "${vb#*/}"
+		builds_show "$(builds_find "${2:?show needs a build (./build.sh list)}")"
 		exit 0 ;;
 	diff)
 		a=$(builds_find "${2:?diff needs two builds}") b=$(builds_find "${3:?diff needs two builds}")
@@ -122,12 +114,9 @@ case ${1:-} in
 		exit 0 ;;
 esac
 
-VARIANT=${1:-}
-case $VARIANT in
-	usb | network) shift ;;
+case ${1:-} in
+	usb | network) die "there are no variants any more: one build serves sticks and the network (sudo $0 [--groups ...])" ;;
 	-h | --help) usage; exit 0 ;;
-	'') usage >&2; exit 1 ;;
-	*) usage >&2; die "unknown variant '$VARIANT' (expected usb or network)" ;;
 esac
 
 URLS=()
@@ -177,7 +166,7 @@ APPEND_VERB=""
 [[ " ${MKOSI_ARGS[*]-} " == *" $VERB "* ]] || APPEND_VERB=1
 case $VERB in
 	build | shell | boot | vm | qemu | clean | burn)
-		[[ $EUID -eq 0 ]] || die "'$VERB' must run as root (the sbctl db key is root-only): sudo $0 $VARIANT ${MKOSI_ARGS[*]-}"
+		[[ $EUID -eq 0 ]] || die "'$VERB' must run as root (the sbctl db key is root-only): sudo $0 ${MKOSI_ARGS[*]-}"
 		[[ -f $HERE/users.conf ]] || die "users.conf missing: cp users.conf.example users.conf and add your ssh keys"
 		;;
 esac
@@ -199,38 +188,35 @@ VERSION=$("$HERE/mkosi.version")
 GROUPS_CSV=$(IFS=,; echo "${SAFESPACE_GROUPS[*]}")
 SUFFIX=""
 ((DEBUG)) && SUFFIX=-debug
-[[ -e $(builds_dir "$VARIANT" "$(builds_id "$GROUPS_CSV" "$VERSION$SUFFIX")") ]] && VERSION=$(date +%Y%m%d-%H%M%S)
+[[ -e $(builds_dir "$(builds_id "$GROUPS_CSV" "$VERSION$SUFFIX")") ]] && VERSION=$(date +%Y%m%d-%H%M%S)
 VERSION+=$SUFFIX
-PROFILES=(--profile="$VARIANT" ${GROUP_PROFILES[@]+"${GROUP_PROFILES[@]}"})
+PROFILES=(${GROUP_PROFILES[@]+"${GROUP_PROFILES[@]}"})
 ((DEBUG)) && PROFILES+=(--profile=debug)
 BUILD=$(builds_id "$GROUPS_CSV" "$VERSION")
-OUTDIR=$(builds_dir "$VARIANT" "$BUILD")
-EXTRA=("${PROFILES[@]}" --image-version="$VERSION" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"})
+OUTDIR=$(builds_dir "$BUILD")
+EXTRA=(${PROFILES[@]+"${PROFILES[@]}"} --image-version="$VERSION" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"})
 [[ $VERB == build ]] && EXTRA+=(--output-directory="$OUTDIR")
 [[ -z $WORKERS ]] || EXTRA+=(--environment="SYSTEMD_REPART_MKFS_OPTIONS_EROFS=--workers=$WORKERS")
 
-if [[ $VARIANT == network ]]; then
-	if ((${#URLS[@]} == 0)); then
-		# shellcheck source=/dev/null
-		[[ -f $HERE/netboot.conf ]] && source "$HERE/netboot.conf"
-		read -ra URLS <<<"${NETROOT_URL:-}"
-	fi
-	((${#URLS[@]})) || die "no netboot URL: pass --url http://SERVER/safespace/ or set NETROOT_URL in netboot.conf (see netboot.conf.example)"
-	for url in "${URLS[@]}"; do
-		[[ $url == http://* || $url == https://* ]] || die "netboot URL must start with http:// or https://: $url"
-		host=${url#*//}; host=${host%%/*}; host=${host%%:*}
-		[[ $host =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || $host =~ ^\[ ]] ||
-			log "note: $host is a host name; the initrd resolves it with the DNS servers from the DHCP lease, so that answer has to carry a resolver that knows it (an IP address needs no DNS at all)"
-		NETROOT+=("${url%/}/")
-		EXTRA+=(--kernel-command-line="safespace.netroot=${url%/}/")
-	done
+if ((${#URLS[@]} == 0)); then
+	# shellcheck source=/dev/null
+	[[ -f $HERE/netboot.conf ]] && source "$HERE/netboot.conf"
+	read -ra URLS <<<"${NETROOT_URL:-}"
 fi
+for url in ${URLS[@]+"${URLS[@]}"}; do
+	[[ $url == http://* || $url == https://* ]] || die "netboot URL must start with http:// or https://: $url"
+	host=${url#*//}; host=${host%%/*}; host=${host%%:*}
+	[[ $host =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ || $host =~ ^\[ ]] ||
+		log "note: $host is a host name; the initrd resolves it with the DNS servers from the DHCP lease, so that answer has to carry a resolver that knows it (an IP address needs no DNS at all)"
+	NETROOT+=("${url%/}/")
+	EXTRA+=(--kernel-command-line="safespace.netroot=${url%/}/")
+done
 
-log "Running variant $VARIANT$( ((DEBUG)) && echo ' + debug'), version $VERSION"
+log "Running version $VERSION$( ((DEBUG)) && echo ' (debug)')"
 log "package groups: $GROUPS_CSV"
-[[ $VERB == build ]] && log "build: $VARIANT/$BUILD"
+[[ $VERB == build ]] && log "build: $BUILD"
 log "packages: $(repos_describe)"
-((${#NETROOT[@]})) && log "netroot: ${NETROOT[*]}"
+if ((${#NETROOT[@]})); then log "netroot: ${NETROOT[*]}"; else log "no NETROOT_URL (netboot.conf / --url): this build boots from sticks only"; fi
 [[ -n $WORKERS ]] && log "erofs compression: $WORKERS threads"
 if [[ $VERB == build ]]; then
 	repos_check
@@ -258,14 +244,14 @@ mkosi "${EXTRA[@]}" ${MKOSI_ARGS[@]+"${MKOSI_ARGS[@]}"} ${APPEND_VERB:+build}
 [[ $VERB == build ]] || exit 0
 
 # Keep the parts, under short names; the whole disk image goes (lib/builds.sh).
-builds_finalize "$OUTDIR" "$VARIANT" "$VERSION"
+builds_finalize "$OUTDIR" "$VERSION"
 
 # What was built, from what (build.json marks the build as complete).
 git=(git -c safe.directory="$HERE" -C "$HERE")
 commit=$("${git[@]}" rev-parse --short HEAD 2>/dev/null || echo none)
 dirty=no
 [[ -z $("${git[@]}" status --porcelain 2>/dev/null) ]] || dirty=yes
-builds_write_info "$OUTDIR" build="$BUILD" variant="$VARIANT" version="$VERSION" groups="$GROUPS_CSV" \
+builds_write_info "$OUTDIR" build="$BUILD" version="$VERSION" groups="$GROUPS_CSV" \
 	debug="$( ((DEBUG)) && echo yes || echo no)" started="$STARTED" finished="$(date -Is)" \
 	snapshot="$SNAPSHOT" mirror="${MIRROR:-default}" commit="$commit" uncommitted_changes="$dirty" \
 	signer="$(keys_fingerprint "$KEYS_SB_CERT")" netroot="$(IFS=,; echo "${NETROOT[*]-}")" \
@@ -274,12 +260,8 @@ builds_write_info "$OUTDIR" build="$BUILD" variant="$VARIANT" version="$VERSION"
 # without root. (Changing a file there gains nothing: release.sh and the
 # servers check signature and root hash.)
 if [[ -n ${SUDO_UID:-} ]]; then
-	chown "$SUDO_UID:$SUDO_GID" "$BUILDS_ROOT" "$(dirname "$OUTDIR")"
+	chown "$SUDO_UID:$SUDO_GID" "$BUILDS_ROOT"
 	chown -R "$SUDO_UID:$SUDO_GID" "$OUTDIR"
 fi
-log "Build $VARIANT/$BUILD in ${OUTDIR#"$HERE"/}"
-if [[ $VARIANT == usb ]]; then
-	log "Next: sudo ./burn.sh /dev/sdX   (then sudo ./diagnose.sh /dev/sdX), or ./release.sh usb --build $BUILD"
-else
-	log "Next: ./release.sh network --build $BUILD   (./build.sh list shows all builds)"
-fi
+log "Build $BUILD in ${OUTDIR#"$HERE"/}"
+log "Next: ./release.sh --build $BUILD (to the distribution servers), sudo ./burn.sh $BUILD /dev/sdX (a stick)"

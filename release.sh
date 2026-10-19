@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # Release a build: bundle it, check it, push it to the distribution servers.
 # Runs on the build host (the machine with the signing keys), as a normal user.
-# A server holds exactly one release per variant; pushing replaces it.
+# A server holds exactly one release; pushing replaces it. The release serves
+# both boot paths: machines boot boot.efi over the network, burn.sh writes
+# sticks from it.
 #
-#   ./release.sh network|usb [--build BUILD | --groups LIST] [--push TARGET]...
+#   ./release.sh [--build BUILD | --groups LIST] [--push TARGET]...
 #
 #   --build BUILD   the build to release, as ./build.sh list shows it
 #                   (e.g. base-remotedesktop_20261019-0930). Releasing an older
 #                   build again is how a release is rolled back.
 #   --groups LIST   the newest build with exactly this group set
-#   (neither)       the newest build of the variant, whatever its groups
+#   (neither)       the newest build, whatever its groups
 #   --push TARGET   distribution server to push to, repeatable. TARGET is the
 #                   upload account, e.g. safespace@dist1.example.org (its ssh
 #                   key only reaches the share, see server/setup.sh), or a
@@ -17,18 +19,18 @@
 #                   --push: RELEASE_TARGETS= from release.conf (gitignored,
 #                   see release.conf.example); none at all = stage only.
 #
-# The bundle, mkosi.release/<variant>/ (the newest release only), the build's
-# parts as hardlinks (nothing is copied or unpacked) plus the release files:
-#   both     boot.efi (signed UKI), root.img, root.verity, roothash,
-#            manifest.json; cmdline (the UKI's signed command line, readable),
-#            release (VARIANT, VERSION, BUILD, GROUPS, BUILT, SNAPSHOT, COMMIT,
-#            PACKAGES), SHA256SUMS
-#   usb      + systemd-boot.efi, layout.sfdisk (burn.sh assembles the stick)
+# The bundle, mkosi.release/ (the newest release only): the build's parts as
+# hardlinks (nothing is copied or unpacked) plus the release files:
+#   boot.efi (signed UKI), root.img, root.verity, roothash, systemd-boot.efi,
+#   layout.sfdisk, manifest.json; cmdline (the UKI's signed command line,
+#   readable), release (VERSION, BUILD, GROUPS, BUILT, SNAPSHOT, COMMIT,
+#   PACKAGES), SHA256SUMS
 # It is checked here exactly as a server checks it (lib/verify.sh): Secure
-# Boot signature against the exported db.pem, root image against the signed
-# root hash. test-vm.sh --netboot serves mkosi.release/network/.
+# Boot signatures against the exported db.pem, root image against the signed
+# root hash, the stick's partition table. test-vm.sh --netboot serves
+# mkosi.release/.
 #
-# Pushing: rsync over ssh into <share>/<variant>/. --delay-updates collects
+# Pushing: rsync over ssh into the share. --delay-updates collects
 # the new files in a temp directory and renames them all at the end, so the
 # switch takes milliseconds and a download already running finishes on the
 # old file. `release` goes last: it is what the server's verify unit waits for.
@@ -47,11 +49,8 @@ source "$HERE/lib/builds.sh"
 # shellcheck source=lib/groups.sh
 source "$HERE/lib/groups.sh"
 
-VARIANT=${1:-}
-case $VARIANT in
-	network | usb) shift ;;
-	-h | --help) usage; exit 0 ;;
-	*) usage >&2; die "first argument: network or usb" ;;
+case ${1:-} in
+	network | usb) die "there are no variants any more: one release serves sticks and the network ($0 [--build ...])" ;;
 esac
 BUILD="" WANT_GROUPS="" TARGETS=()
 while (($#)); do
@@ -81,42 +80,38 @@ DB=$HERE/mkosi.extra/usr/share/safespace/secureboot/db.pem
 if [[ -n $WANT_GROUPS ]]; then
 	groups_parse "$WANT_GROUPS"
 	WANT_GROUPS=$(IFS=,; echo "${SAFESPACE_GROUPS[*]}")
-	BUILD=$(builds_newest "$VARIANT" "$WANT_GROUPS")
-	[[ -n $BUILD ]] || die "no $VARIANT build with groups $WANT_GROUPS (./build.sh list)"
+	BUILD=$(builds_newest "$WANT_GROUPS")
+	[[ -n $BUILD ]] || die "no build with groups $WANT_GROUPS (./build.sh list)"
 elif [[ -n $BUILD ]]; then
-	BUILD=${BUILD#"$VARIANT"/}
-	[[ -f $(builds_dir "$VARIANT" "$BUILD")/build.json ]] || die "no $VARIANT build $BUILD (./build.sh list $VARIANT)"
+	BUILD=$(builds_find "$BUILD")
 else
-	BUILD=$(builds_newest "$VARIANT")
-	[[ -n $BUILD ]] || die "no $VARIANT build (run: sudo ./build.sh $VARIANT)"
+	BUILD=$(builds_newest)
+	[[ -n $BUILD ]] || die "no build (run: sudo ./build.sh)"
 fi
-DIR=$(builds_dir "$VARIANT" "$BUILD")
+DIR=$(builds_dir "$BUILD")
 VERSION=$(builds_info "$DIR" version)
 GROUPS_SET=$(builds_info "$DIR" groups)
 verify_name_version "$VERSION" || die "invalid version '$VERSION' in $DIR/build.json"
-log "Release $VARIANT/$BUILD"
+log "Release $BUILD"
 log "  groups $GROUPS_SET, built $(builds_info "$DIR" finished), snapshot $(builds_info "$DIR" snapshot), commit $(builds_info "$DIR" commit)$([[ $(builds_info "$DIR" uncommitted_changes) == yes ]] && echo ' + uncommitted changes'), $(builds_info "$DIR" packages) packages"
 # Newer builds of other group sets that were never released: maybe the one meant.
-while IFS=/ read -r _ b; do
-	[[ $b != "$BUILD" && $(builds_version_of "$b") > $VERSION && ! -s $(builds_dir "$VARIANT" "$b")/released.log ]] &&
+while IFS= read -r b; do
+	[[ $b != "$BUILD" && $(builds_version_of "$b") > $VERSION && ! -s $(builds_dir "$b")/released.log ]] &&
 		warn "a newer build is not released: $b (release it with --build $b)"
-done < <(builds_all "$VARIANT")
+done < <(builds_all)
 
 # --- bundle --------------------------------------------------------------------
 
-DEST=$HERE/mkosi.release/$VARIANT
+DEST=$HERE/mkosi.release
 rm -rf "$DEST"
 mkdir -p "$DEST"
-PARTS=(boot.efi root.img root.verity roothash manifest.json)
-[[ $VARIANT == usb ]] && PARTS+=(systemd-boot.efi layout.sfdisk)
-for f in "${PARTS[@]}"; do
+for f in boot.efi root.img root.verity roothash systemd-boot.efi layout.sfdisk manifest.json; do
 	[[ -f $DIR/$f ]] || die "$DIR/$f missing (a build from before the parts layout? rebuild)"
 	ln "$DIR/$f" "$DEST/$f" 2>/dev/null || cp --reflink=auto "$DIR/$f" "$DEST/$f"
 done
 uki_cmdline "$DEST/boot.efi" >"$DEST/cmdline"
 echo >>"$DEST/cmdline"
 {
-	echo "VARIANT=$VARIANT"
 	echo "VERSION=$VERSION"
 	echo "BUILD=$BUILD"
 	echo "GROUPS=$GROUPS_SET"
@@ -132,7 +127,7 @@ chmod 0755 "$DEST"
 # --- check it as a server will ---------------------------------------------------
 
 log "Checking the release (as the distribution servers do)"
-verify_release "$DEST" "$VARIANT" "$DB" || die "the release does not pass the checks; nothing pushed"
+verify_release "$DEST" "$DB" || die "the release does not pass the checks; nothing pushed"
 log "Staged: $DEST ($(du -sh "$DEST" | cut -f1))"
 
 # --- push ------------------------------------------------------------------------
@@ -142,7 +137,7 @@ for target in "${TARGETS[@]}"; do
 	# confines them); a local directory stays as it is.
 	if [[ $target == /* || $target == ./* ]]; then
 		remote=${target%/}/
-		[[ -d $remote$VARIANT ]] || die "$target is not a share (no $VARIANT/; run server/setup.sh there)"
+		[[ -d $remote && -w $remote ]] || die "$target is no writable share directory (run server/setup.sh there)"
 	elif [[ $target == *:* ]]; then
 		remote=${target%/}
 		[[ $remote == *: ]] || remote+=/
@@ -150,9 +145,9 @@ for target in "${TARGETS[@]}"; do
 		remote=$target:
 	fi
 	log "Pushing to $target"
-	rsync -rtp --chmod=D755,F644 --delay-updates --info=progress2 --exclude=release "$DEST/" "$remote$VARIANT/" ||
+	rsync -rtp --chmod=D755,F644 --delay-updates --info=progress2 --exclude=release "$DEST/" "$remote" ||
 		die "upload to $target failed"
-	rsync -rtp --chmod=F644 "$DEST/release" "$remote$VARIANT/" || die "upload of release to $target failed"
+	rsync -rtp --chmod=F644 "$DEST/release" "$remote" || die "upload of release to $target failed"
 	echo "$(date -Is) $target" >>"$DIR/released.log"
 	log "  $target now serves $BUILD and checks it (there: safespace-netboot status)"
 done

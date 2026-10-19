@@ -1,12 +1,15 @@
 # Enabled by the initrd.target.wants symlink next to this file, not by an
 # [Install] section: the default initrd applies presets with "disable *".
+# The boot path from a stick / SD card: systemd-boot started the UKI from a
+# partition, so LoaderDevicePartUUID exists (over the network it does not,
+# and netroot.service runs instead).
 [Unit]
-Description=Authorize the USB path to the root partition
+Description=Find and open the root partition on the boot stick
 DefaultDependencies=no
-ConditionKernelCommandLine=usbcore.authorized_default=0
+ConditionPathExists=/sys/firmware/efi/efivars/LoaderDevicePartUUID-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
 After=systemd-udev-trigger.service systemd-udevd.service
 Wants=systemd-udev-trigger.service
-Before=initrd-root-device.target cryptsetup-pre.target sysroot.mount
+Before=initrd-root-device.target cryptsetup-pre.target veritysetup-pre.target sysroot.mount
 
 [Service]
 Type=oneshot

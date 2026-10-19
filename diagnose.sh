@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Read-only check of a stick/SD card written from a "usb" image (burn.sh):
+# Read-only check of a stick/SD card written by burn.sh:
 # ESP + signed UKI, dm-verity root (verified block by block), nothing writable.
 # Usage: sudo ./diagnose.sh [--db-cert db.pem] /dev/sdX
 #   --db-cert  the db certificate the signatures must verify against (default:
@@ -97,8 +97,9 @@ CMDLINE=$(objcopy -O binary --only-section=.cmdline "$UKI" /dev/stdout 2>/dev/nu
 	bad "systemd.volatile=state missing: /var would be on the read-only root"
 opts=(systemd.credentials_boot_policy=strict systemd.sysext=0 systemd.confext=0
 	rd.systemd.sysext=0 rd.systemd.confext=0)
-# systemd-veritysetup opens root, and stops the machine on a corrupted block.
-opts+=(systemd.verity_root_options=panic-on-corruption)
+# The initrd opens root itself (usb-bootdev, --panic-on-corruption) as
+# /dev/mapper/root; systemd's verity generator stays out of it.
+opts+=(root=/dev/mapper/root systemd.verity=no rd.systemd.verity=no)
 for opt in "${opts[@]}"; do
 	[[ " $CMDLINE " == *" $opt "* ]] && ok "$opt" || bad "$opt missing from the kernel command line"
 done
@@ -115,9 +116,9 @@ if [[ -z $ROOTHASH ]]; then
 else
 	ok "roothash=$ROOTHASH"
 	# The build on this host with that root hash, if any.
-	build=$(grep -lx "$ROOTHASH" "$HERE"/mkosi.output/usb/*/roothash 2>/dev/null | head -1)
+	build=$(grep -lx "$ROOTHASH" "$HERE"/mkosi.output/*/roothash 2>/dev/null | head -1)
 	if [[ -n $build ]]; then
-		ok "build: usb/$(basename "$(dirname "$build")") (./build.sh show for its packages)"
+		ok "build: $(basename "$(dirname "$build")") (./build.sh show for its packages)"
 	else
 		echo "  NOTE build: no build with this root hash on this host"
 	fi

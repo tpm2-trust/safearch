@@ -68,7 +68,8 @@ When the user requests a programming task, **do not start coding immediately.**
 ## This project
 
 safespace-arch: a read-only, Secure-Boot-signed Arch Linux image built with
-mkosi 27, in two variants (`usb`, `network`) and package groups. README.md is
+mkosi 27: one build boots from a USB stick / SD card and over the network, package
+groups decide what is in it. README.md is
 the user manual (read "Two roles" and "Deploy from scratch" first), NETBOOT.md
 the network-boot reference. Arch Linux only, everywhere.
 
@@ -77,10 +78,10 @@ the network-boot reference. Arch Linux only, everywhere.
 | Role | Files |
 |---|---|
 | build host (has the keys) | `build.sh` (entry point), `release.sh`, `fetch-images.sh`, `update-snapshot.sh`, `burn.sh`, `diagnose.sh`, `test-vm.sh`, `hwtest-image.sh` |
-| image configuration | `mkosi.conf` (base), `mkosi.profiles/{usb,network}/` (variants), `mkosi.profiles/{remotedesktop,docker}/` (groups), `mkosi.profiles/debug/` (`--debug`), `mkosi.repart/`, `mkosi.extra/`, `mkosi.postinst`, `mkosi.finalize`, `mkosi.postoutput` |
-| initrd | `mkosi.initrd.conf/` (common), `…/mkosi.profiles/network/…/netroot` (root over HTTP), `…/mkosi.profiles/usb/…/usb-bootdev` |
+| image configuration | `mkosi.conf` (the image, both boot paths), `mkosi.profiles/{remotedesktop,docker}/` (groups), `mkosi.profiles/debug/` (`--debug`), `mkosi.repart/`, `mkosi.extra/`, `mkosi.postinst`, `mkosi.finalize`, `mkosi.postoutput` |
+| initrd | `mkosi.initrd.conf/`: `usb-bootdev` (root from the stick) and `netroot` (root over HTTP), chosen at boot by `LoaderDevicePartUUID` |
 | distribution server | `server/` (`setup.sh`, `safespace-netboot`, units, nginx site, `server.conf.example`) |
-| shared shell code | `lib/repos.sh`, `lib/groups.sh`, `lib/keys.sh`, `lib/builds.sh` (the builds in `mkosi.output/<variant>/<groups>_<version>/`: their parts, list, select, prune), `lib/stick.sh` (a usb stick assembled from the parts), `lib/verify.sh` (also installed on the servers) |
+| shared shell code | `lib/repos.sh`, `lib/groups.sh`, `lib/keys.sh`, `lib/builds.sh` (the builds in `mkosi.output/<groups>_<version>/`: their parts, list, select, prune), `lib/stick.sh` (a stick assembled from the parts), `lib/verify.sh` (also installed on the servers) |
 | tests | `tests/run.sh`, `tests/lib/` |
 | per-host files (gitignored, templates `*.example`) | `users.conf`, `netboot.conf`, `release.conf`, `mkosi.local.conf`, `repos.local.conf`, `server/server.conf` |
 
@@ -96,11 +97,13 @@ the network-boot reference. Arch Linux only, everywhere.
   is confined by rrsync (write-only, no delete, share only).
 - **Root only through dm-verity** with the root hash from the signed command
   line; nothing on the boot medium is ever written; `/var` is RAM.
-- **One release per server and variant**, fixed file names; the initrd's
-  reaction to a replaced release must not turn into a reboot loop.
-- **Groups are the only difference between images** besides the variant.
-- **Both variants are kept and shipped as the same parts** (UKI, root, verity, root hash;
-  usb also systemd-boot and the partition table); no disk image is stored or shipped.
+- **One build serves both boot paths** (stick and network), chosen by the initrd at boot;
+  both open the root the same way (dm-verity, signed root hash, `--panic-on-corruption`).
+- **One release per server**, fixed file names; the initrd's reaction to a replaced release
+  must not turn into a reboot loop.
+- **Groups are the only difference between images.**
+- **Builds are kept and shipped as parts** (UKI, root, verity, root hash, systemd-boot,
+  partition table); no disk image is stored or shipped.
 
 ### Working on it
 

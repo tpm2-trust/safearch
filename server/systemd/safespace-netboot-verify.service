@@ -1,4 +1,4 @@
-# Checks the served releases (Secure Boot signature against
+# Checks the served release (Secure Boot signatures against
 # /etc/safespace/db.pem, root image against the signed root hash) and records
 # the result (safespace-netboot status). Report only: it changes nothing in
 # the share. A broken release leaves this unit failed (systemctl --failed).

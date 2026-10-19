@@ -4,13 +4,13 @@
 # safespace-netboot and server/setup.sh. After a change: sudo server/setup.sh
 # (or, for DHCP_* only: sudo systemctl restart safespace-dhcp).
 
-# Where releases are uploaded to and served from (nginx: /safespace/): one
-# release per variant, network/ and usb/, each upload replaces the last.
+# Where the release is uploaded to and served from (nginx: /safespace/): one
+# release, for network boot and for writing sticks; each upload replaces it.
 SHARE=/srv/safespace/share
 
-# How machines reach this server: the base of the share in the URL. The
-# network build's NETROOT_URL (netboot.conf on the build host) is
-# $SERVER_URL/network/, and the HTTP boot file is $SERVER_URL/network/boot.efi.
+# How machines reach this server: the share's URL. The build host's
+# NETROOT_URL (netboot.conf) is $SERVER_URL/, the HTTP boot file
+# $SERVER_URL/boot.efi.
 SERVER_URL=http://10.0.0.1/safespace
 
 # DHCP answers for network boot (safespace-dhcp.service, dnsmasq):

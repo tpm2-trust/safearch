@@ -4,8 +4,8 @@
 # (lib/stick.sh, as burn.sh writes a stick) and opened with snapshot=on.
 #
 #   ./test-vm.sh [SOURCE] [--secure-boot | --setup-mode | --sealed] [--ssh PORT]
-#     SOURCE: a usb build (./build.sh list), a directory with the parts, or a
-#     stick image file (.raw); default: the newest usb build
+#     SOURCE: a build (./build.sh list), a directory with the parts, or a
+#     stick image file (.raw); default: the newest build
 #   ./test-vm.sh --netboot [--tree DIR] [--tftp] [--secure-boot | ...] [--ssh PORT]
 #   ./test-vm.sh --netboot --url BOOT_URL [--secure-boot | ...] [--ssh PORT]
 #
@@ -18,10 +18,10 @@
 #   starts it, and its initrd then loads the root image over HTTP.
 #   QEMU's user network is the DHCP server here (that is what option
 #   bootfile= sets), a local python HTTP server on 127.0.0.1 serves the
-#   release (default mkosi.release/network/, written by release.sh), and the VM
+#   release (default mkosi.release/, written by release.sh), and the VM
 #   reaches the host as 10.0.2.2 -- so the image has to be built for that
 #   address:
-#     sudo ./build.sh network --url http://10.0.2.2:8000/ \
+#     sudo ./build.sh --url http://10.0.2.2:8000/ \
 #          --kernel-command-line console=ttyS0,115200
 #   (the console= part is optional and only makes the kernel and the netroot
 #   messages show up in mkosi.test/serial.log, where this script looks for
@@ -29,9 +29,9 @@
 # --tftp: hand the UKI over QEMU's built-in TFTP server instead of HTTP, for
 #   firmware without UEFI HTTP boot. The root image still comes over HTTP.
 # --tree DIR: the release to serve (a directory with boot.efi, root.img,
-#   root.verity, e.g. a distribution server's share/network/).
+#   root.verity, e.g. a distribution server's share).
 # --url BOOT_URL: no local server; UEFI HTTP boot of a published UKI from a
-#   distribution server, e.g. http://10.0.0.1/safespace/network/boot.efi.
+#   distribution server, e.g. http://10.0.0.1/safespace/boot.efi.
 #   The VM reaches it through QEMU's NAT and resolves names with the host's
 #   DNS, so a normal build (netboot.conf URL) is tested as published, exactly
 #   as a machine on the LAN would boot it.
@@ -89,22 +89,22 @@ if ((NETBOOT)) && [[ -n $BOOT_URL ]]; then
 	curl -fsS -o "$uki" "$BOOT_URL" || die "cannot download $BOOT_URL"
 	cmdline=$(objcopy -O binary --only-section=.cmdline "$uki" /dev/stdout 2>/dev/null | tr -d '\0')
 	NETROOT_URL=$(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace.netroot=//p' | head -1)
-	[[ -n $NETROOT_URL ]] || die "$BOOT_URL has no safespace.netroot= on its command line (not a network build)"
+	[[ -n $NETROOT_URL ]] || die "$BOOT_URL has no safespace.netroot= on its command line (built without NETROOT_URL)"
 	root_bytes=$(curl -fsSI "${NETROOT_URL%/}/root.img" | tr -d '\r' | awk 'tolower($1) == "content-length:" { print $2 }')
 	[[ $root_bytes =~ ^[0-9]+$ ]] || die "the server does not serve ${NETROOT_URL%/}/root.img"
 	MEM=${MEM:-$((root_bytes / 1048576 + 2048))}
 	log "UKI from $BOOT_URL, root from $NETROOT_URL"
 elif ((NETBOOT)); then
 	[[ -z $IMAGE ]] || die "--netboot takes no image (it boots the UKI from the netboot tree)"
-	BOOTDIR=${TREE:-$HERE/mkosi.release/network}
-	[[ -f $BOOTDIR/boot.efi ]] || die "no boot.efi in $BOOTDIR (run: ./release.sh network)"
+	BOOTDIR=${TREE:-$HERE/mkosi.release}
+	[[ -f $BOOTDIR/boot.efi ]] || die "no boot.efi in $BOOTDIR (run: ./release.sh)"
 	uki=$BOOTDIR/boot.efi
 	cmdline=$(objcopy -O binary --only-section=.cmdline "$uki" /dev/stdout 2>/dev/null | tr -d '\0')
 	NETROOT_URL=$(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace.netroot=//p' | head -1)
-	[[ -n $NETROOT_URL ]] || die "$uki has no safespace.netroot= on its command line (not a network build)"
+	[[ -n $NETROOT_URL ]] || die "$uki has no safespace.netroot= on its command line (built without NETROOT_URL)"
 	rest=${NETROOT_URL#*//}
 	hostport=${rest%%/*}
-	urlpath=${rest#*/}; urlpath=${urlpath%/}      # e.g. safespace/network, or empty
+	urlpath=${rest#*/}; urlpath=${urlpath%/}      # e.g. safespace, or empty
 	[[ $rest == */* ]] || urlpath=""
 	host=${hostport%%:*}; port=${hostport##*:}
 	[[ $port == "$host" ]] && port=80
@@ -145,13 +145,13 @@ else
 		if [[ -d $IMAGE ]]; then
 			SRC=$IMAGE
 		elif [[ -n $IMAGE ]]; then
-			SRC=$(builds_dir usb "$(builds_find "usb/${IMAGE#usb/}" | cut -d/ -f2)")
+			SRC=$(builds_dir "$(builds_find "$IMAGE")")
 		else
-			b=$(builds_newest usb)
-			[[ -n $b ]] || die "no usb build (run: sudo ./build.sh usb)"
-			SRC=$(builds_dir usb "$b")
+			b=$(builds_newest)
+			[[ -n $b ]] || die "no build (run: sudo ./build.sh)"
+			SRC=$(builds_dir "$b")
 		fi
-		[[ -f $SRC/layout.sfdisk ]] || die "$SRC is not a usb build (network builds: ./test-vm.sh --netboot)"
+		[[ -f $SRC/layout.sfdisk ]] || die "$SRC is not a build (or one from before the single build)"
 		RAW=$WORK/stick.raw
 		log "Assembling the stick image from $SRC"
 		stick_write "$RAW" "$SRC"

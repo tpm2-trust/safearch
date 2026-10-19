@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Prepare a distribution server: it receives releases from the build host
-# (one per variant, each replacing the last), serves them (HTTP, optionally
-# DHCP/PXE) and checks them after every upload. Needs no signing
+# (one at a time, each replacing the last), serves them for network boot
+# (HTTP, optionally DHCP/PXE) and for writing sticks, and checks every upload. Needs no signing
 # key, only the public db certificate. Run from a checkout of this repository,
 # as root; running it again applies changed settings and keeps everything else.
 #
@@ -23,7 +23,7 @@
 #   /etc/safespace/db.pem           the pinned db certificate
 #   user safespace                  owns the share, runs the checks; its ssh
 #                                   login is the upload account (rrsync)
-#   $SHARE (/srv/safespace/share)   network/, usb/
+#   $SHARE (/srv/safespace/share)   the release
 #   /usr/local/bin/safespace-netboot (+ /usr/local/lib/safespace-server/)
 #   units: safespace-netboot-verify.path/.service, safespace-dhcp.service
 #   nginx: the share under http://<server>/safespace/
@@ -128,7 +128,11 @@ chmod 0644 "$ak"
 # --- share, tool, units -------------------------------------------------------------------
 
 install -d -m 0755 "$(dirname "$SHARE")"
-install -d -m 0755 -o "$USER_NAME" -g "$USER_NAME" "$SHARE" "$SHARE/network" "$SHARE/usb"
+install -d -m 0755 -o "$USER_NAME" -g "$USER_NAME" "$SHARE"
+# The layout before one build served both boot paths.
+for d in network usb; do
+	[[ -d $SHARE/$d ]] && warn "$SHARE/$d is from an older layout and no longer served: remove it (rm -rf $SHARE/$d)"
+done
 install -d -m 0755 /usr/local/lib/safespace-server
 install -m 0644 "$REPO/lib/verify.sh" /usr/local/lib/safespace-server/verify.sh
 install -m 0755 "$HERE/safespace-netboot" /usr/local/bin/safespace-netboot
@@ -174,9 +178,9 @@ safespace-netboot verify || warn "a served release is broken (see above): releas
 host=$(hostname -f 2>/dev/null || hostname)
 log "Ready."
 cat <<EOF
-    upload (build host):  ./release.sh network --push $USER_NAME@$host
-    served:               ${SERVER_URL%/}/network/boot.efi   (DHCP option 67), ${SERVER_URL%/}/usb/
-    build host netboot:   NETROOT_URL=${SERVER_URL%/}/network/   (netboot.conf)
+    upload (build host):  ./release.sh --push $USER_NAME@$host
+    served:               ${SERVER_URL%/}/boot.efi   (DHCP option 67); sticks: burn.sh ${SERVER_URL%/}/ /dev/sdX
+    build host netboot:   NETROOT_URL=${SERVER_URL%/}/   (netboot.conf)
     state:                safespace-netboot status;  journalctl -u safespace-netboot-verify
     firewall:             TCP 22 (upload), TCP 80 (HTTP)$( [[ ${DHCP_MODE:-off} != off ]] && echo ", UDP 67, 69 and 4011 (DHCP/PXE/TFTP)")
 EOF

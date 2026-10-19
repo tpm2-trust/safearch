@@ -9,18 +9,6 @@ source "$SRCDIR/safespace.env"
 log() { echo "safespace: $*"; }
 die() { echo "safespace: ERROR: $*" >&2; exit 1; }
 
-# --- variant ------------------------------------------------------------------
-# One of the two profiles must be active, or the image gets neither a boot path
-# (usb: ESP, USB lockdown) nor a root path (network: netroot, root=).
-usb=0 network=0
-case " ${PROFILES:-} " in *" usb "*) usb=1 ;; esac
-case " ${PROFILES:-} " in *" network "*) network=1 ;; esac
-case $((usb + network)) in
-	1) log "variant: ${PROFILES// /, }" ;;
-	0) die "no variant selected: run ./build.sh usb|network (mkosi --profile=usb|network)" ;;
-	*) die "usb and network are two variants of the image, not two features: build them one at a time" ;;
-esac
-
 # --- package groups (lib/groups.sh) ----------------------------------------------
 # base is always in; the other groups are profiles of their own name.
 has_group() { case " ${PROFILES:-} " in *" $1 "*) return 0 ;; esac; return 1; }

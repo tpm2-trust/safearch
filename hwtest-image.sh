@@ -2,7 +2,7 @@
 # Build a diagnostic stick image that boots a UKI layer by layer, to find out
 # why a machine resets or hangs on the real stick. No root needed.
 #
-#   ./hwtest-image.sh [UKI]        (default: the newest usb build's UKI, mkosi.output/usb/*/boot.efi)
+#   ./hwtest-image.sh [UKI]        (default: the newest build's UKI, mkosi.output/*/boot.efi)
 #   sudo wipefs -a /dev/sdX
 #   sudo dd if=mkosi.test/hwtest.img of=/dev/sdX bs=4M conv=fsync oflag=direct status=progress
 #
@@ -26,10 +26,11 @@ HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 
-# Default: the newest usb UKI (a network UKI would load its root over HTTP,
-# which says nothing about why this machine will not boot from a medium).
-UKI=${1:-$(ls -t "$HERE"/mkosi.output/usb/*/boot.efi 2>/dev/null | head -1 || true)}
-[[ -n $UKI && -f $UKI ]] || die "no UKI found (mkosi.output/usb/*/boot.efi; run: sudo ./build.sh usb)"
+# Default: the newest build's UKI. Started from this stick's systemd-boot it
+# takes the stick path (usb-bootdev) and waits for a root partition, which the
+# test stick does not have: "waiting for root" is the expected end.
+UKI=${1:-$(ls -t "$HERE"/mkosi.output/*/boot.efi 2>/dev/null | head -1 || true)}
+[[ -n $UKI && -f $UKI ]] || die "no UKI found (mkosi.output/*/boot.efi; run: sudo ./build.sh)"
 STUB=/usr/lib/systemd/boot/efi/linuxx64.efi.stub
 BOOT=/usr/lib/systemd/boot/efi/systemd-bootx64.efi
 for f in "$STUB" "$BOOT"; do [[ -f $f ]] || die "$f missing (systemd, systemd-ukify)"; done
