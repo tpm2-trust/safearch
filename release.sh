@@ -12,7 +12,7 @@
 #                   (e.g. base-remotedesktop_20261019-0930). Releasing an older
 #                   build again is how a release is rolled back.
 #   --groups LIST   the newest build with exactly this group set ("combined":
-#                   the newest build.sh --combined build)
+#                   the newest whole-stack build)
 #   (neither)       the newest build, whatever its groups
 #   --builds DIR    where the builds are (default: mkosi.output; tests/vm.sh
 #                   keeps its test builds apart)
@@ -30,7 +30,7 @@
 #   layout.sfdisk, manifest.json; cmdline (the UKI's signed command line,
 #   readable), release (VERSION, BUILD, GROUPS, BUILT, SNAPSHOT, COMMIT,
 #   PACKAGES), SHA256SUMS
-#   a combined build (build.sh --combined): root-<name>.img, root-<name>.verity,
+#   a combined build (build.sh without --groups): root-<name>.img, root-<name>.verity,
 #   roothash-<name>, manifest-<name>.json per combination instead of the single
 #   root, and COMBINATIONS= in release
 # It is checked here exactly as a server checks it (lib/verify.sh): Secure
@@ -120,7 +120,7 @@ DEST=$STAGE_DIR
 [[ $DEST != / && $DEST != "$HERE" ]] || die "--stage $DEST: not a staging directory"
 rm -rf "$DEST"
 mkdir -p "$DEST"
-# A combined build (build.sh --combined) has one root per combination.
+# A combined build (build.sh without --groups) has one root per combination.
 COMBOS=$(builds_info "$DIR" combinations | tr ',' '\n' | cut -d: -f1 | tr '\n' ',')
 COMBOS=${COMBOS%,}
 PARTS=(boot.efi systemd-boot.efi layout.sfdisk)

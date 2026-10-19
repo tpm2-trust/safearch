@@ -42,7 +42,7 @@ network boot (trust model, other DHCP servers, firmware, troubleshooting);
 ```mermaid
 flowchart LR
   subgraph B["build host (has the signing keys)"]
-    BS["build.sh --groups …"] --> O["mkosi.output/&lt;groups&gt;_&lt;version&gt;/"]
+    BS["build.sh (the whole stack)"] --> O["mkosi.output/combined_&lt;version&gt;/"]
     O --> R["release.sh --push …"]
     O --> K["burn.sh: a stick"]
   end
@@ -125,7 +125,7 @@ tests/run.sh
 ### 2. First build
 
 ```sh
-sudo ./build.sh --groups base,remotedesktop    # -> mkosi.output/base-remotedesktop_<time>/
+sudo ./build.sh                                # the whole stack -> mkosi.output/combined_<time>/
 ./build.sh list
 ```
 
@@ -181,8 +181,10 @@ A stick from anywhere with a checkout: `sudo ./burn.sh http://<server>/safespace
 
 ## Package groups
 
-`--groups LIST` on `build.sh`: comma-separated, case-insensitive. Without it, an image has
-`base` only.
+Without options `build.sh` builds the whole stack: every combination of
+`combinations.conf` in one build ([Combinations](#combinations-the-whole-stack-in-one-build)).
+`--groups LIST` (comma-separated, case-insensitive) makes a single build of exactly that
+group set instead.
 
 | Group | What it adds | Where it is defined |
 |---|---|---|
@@ -191,9 +193,9 @@ A stick from anywhere with a checkout: `sudo ./burn.sh http://<server>/safespace
 | `docker` | Docker and containerd with their storage on a data disk at `/opt/docker`, the shipped images (`fetch-images.sh`) and their loader; users get the `docker` group. Docker is not started at boot (see [Docker](#docker)) | `mkosi.profiles/docker/` |
 
 ```sh
-sudo ./build.sh                                            # base only
-sudo ./build.sh --groups base,RemoteDesktop                # + desktop
-sudo ./build.sh --groups base,remotedesktop,docker         # everything
+sudo ./build.sh                                            # the whole stack (combinations.conf)
+sudo ./build.sh --groups base                              # a single build: base only
+sudo ./build.sh --groups base,RemoteDesktop                # a single build: + desktop
 ```
 
 Each group except `base` is a mkosi profile of its own name, with its packages, files
@@ -209,9 +211,9 @@ dmidecode, pciutils, usbutils, lshw, iperf3, tcpdump, kexec-tools) and marks the
 past Secure Boot, because the kernel does not enforce lockdown (see "Known open points"):
 do not release debug builds to production servers.
 
-## Combinations: several group sets in one build (proof of concept)
+## Combinations: the whole stack in one build
 
-`sudo ./build.sh --combined` builds every combination of `combinations.conf`
+`sudo ./build.sh` (no `--groups`) builds every combination of `combinations.conf`
 (`<name>=<groups>`, the first must be `base=base`; shipped: `base` and `docker=base,docker`)
 in one run and composes them into one build, `mkosi.output/combined_<version>/`:
 
@@ -224,7 +226,7 @@ in one run and composes them into one build, `mkosi.output/combined_<version>/`:
   combination (partitions `root-<name>`, `root-<name>-verity`, UUIDs from each root hash).
 
 Every combination is a complete root, built and verified like a single build; nothing is
-layered at runtime. `release.sh --groups combined` releases the newest one (`COMBINATIONS=`
+layered at runtime. `release.sh` (or `--groups combined`) releases the newest one (`COMBINATIONS=`
 in `release`), the server checks every root against its signed hash, `burn.sh` writes all
 pairs onto the stick. Over the network a machine downloads only the root it boots.
 
@@ -253,7 +255,7 @@ stops the boot with a message instead of falling back silently. The choice is no
 into a PCR yet (Open decisions).
 
 Tested by `tests/run.sh combined` (compose with ukify, release check, tampering, stick,
-selection order, netroot downloading only the selected root) and `tests/vm.sh --combined`
+selection order, netroot downloading only the selected root) and `tests/vm.sh` (default)
 (step `select` on the sealed firmware: base → `set docker` → docker → `once base` → base →
 docker).
 
@@ -349,8 +351,8 @@ starts both over when they are suspect or too big.
 ### Every release
 
 ```sh
-sudo ./build.sh --groups base,remotedesktop       # -f to rebuild unchanged packages
-./release.sh --groups base,remotedesktop          # the newest build of that group set
+sudo ./build.sh                                   # the whole stack; -f to rebuild unchanged packages
+./release.sh --groups base,remotedesktop          # the newest single build of that group set
 ./release.sh --build base_20261019-1012           # exactly this build
 ./release.sh                                      # the newest build, whatever its groups
 ```
@@ -563,9 +565,9 @@ boots with enforced Secure Boot, and checks each boot over ssh. It touches no re
 build or server. Exit 0 only if every step passed.
 
 ```sh
-tests/vm.sh                          # build --groups base, release, all steps
+tests/vm.sh                          # build the whole stack, release, all steps (~20 min, warm cache)
 tests/vm.sh --no-build stick net     # the last test build, two steps only
-tests/vm.sh --groups base,docker     # another group set
+tests/vm.sh --groups base,docker     # a single build of this group set (no step select)
 ```
 
 | Step | What | Checked |
@@ -575,6 +577,7 @@ tests/vm.sh --groups base,docker     # another group set
 | `net` | UEFI HTTP boot of the share | `netroot` opened the root, no `usb-bootdev`, no `LoaderDevicePartUUID`, `verified`, `running` |
 | `seal` | Setup Mode → `safespace-seal` → the sealed firmware | Secure Boot `enabled (user)`, `verified`, `running` |
 | `net-sb` | network boot with enforced Secure Boot | Secure Boot enabled, `verified`, `running` |
+| `select` (whole stack) | on the sealed firmware: no selection, `safespace-select set docker`, `once base`, then again | `base`, `docker` (the docker command present), `base` once, `docker` again; each Secure Boot enabled and `verified` |
 
 **Kept apart from everything real**, in `mkosi.test/vm/` (gitignored): the test user
 `tester` and its key (created on the first run), the test builds (`build.sh --users
@@ -1026,20 +1029,20 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 
 | Task | Command |
 |---|---|
-| Build | `sudo ./build.sh --groups base,…` (`-f` to rebuild unchanged; erofs threads: all CPUs, `--workers N` for this run) |
+| Build | `sudo ./build.sh` (the whole stack; `--groups base,…` for a single build; `-f` to rebuild unchanged; erofs threads: all CPUs, `--workers N` for this run) |
 | Release | `./release.sh [--groups LIST \| --build BUILD] [--push safespace@<server>]` (an older `--build` = going back) |
 | Builds on this host | `./build.sh list`, `./build.sh show BUILD`, `./build.sh diff A B`, `./build.sh prune` |
 | On a distribution server | `safespace-netboot status`, `sudo safespace-netboot verify`, `journalctl -u safespace-netboot-verify` |
 | Other mirror / newest packages | `SNAPSHOT=`/`MIRROR=` in `repos.local.conf` (["Package source"](#package-source-snapshot-and-mirror)) |
-| Update packages | `./update-snapshot.sh && sudo ./build.sh --groups … -f` |
-| Update shipped images | edit `docker-images.txt`, `./fetch-images.sh`, `sudo ./build.sh --groups … -f` |
-| Force reinstalling all packages | `sudo ./build.sh --groups … -ff` |
+| Update packages | `./update-snapshot.sh && sudo ./build.sh -f` |
+| Update shipped images | edit `docker-images.txt`, `./fetch-images.sh`, `sudo ./build.sh -f` |
+| Force reinstalling all packages | `sudo ./build.sh -ff` |
 | Show the resolved configuration | `./build.sh --groups … summary` |
 | Look inside the image | `sudo mkosi shell` (with `--profile=<group>` per group) |
 | Test in a VM (no root) | `./test-vm.sh` / `./test-vm.sh --secure-boot`, or `./test-vm.sh --netboot` (DHCP + HTTP boot, no disk; needs `qemu-desktop edk2-ovmf`, for Secure Boot `virt-firmware`) |
 | Machine does not boot the stick | `./hwtest-image.sh`, write `mkosi.test/hwtest.img` with `dd`, try the menu entries in order |
 | Burn / check (usb) | `sudo ./burn.sh [IMAGE\|URL] /dev/sdX`, `sudo ./diagnose.sh [--db-cert db.pem] /dev/sdX` |
-| Debug build with diagnostic tools | `sudo ./build.sh --groups … --debug` |
+| Debug build with diagnostic tools | `sudo ./build.sh --debug` |
 | Run the tests | `tests/run.sh` (no root; `tests/run.sh keys server` for single parts); `tests/vm.sh` (build, release, boots in QEMU) |
 | Delete old builds / the caches | `./build.sh prune` / `sudo ./build.sh purge-cache [--packages]` |
 
@@ -1137,7 +1140,7 @@ sectors and a CD boot header; both are fixed (`-S512`, `ElTorito=no`).
 
 ## Known open points
 
-- Combinations (`--combined`): the selected combination is not measured into a PCR. PCR 11
+- Combinations: the selected combination is not measured into a PCR. PCR 11
   holds the UKI's signed expected values and must not be extended; a free PCR or an NvPCR
   needs its own design. A single-root build per combination remains possible (`--groups`).
 

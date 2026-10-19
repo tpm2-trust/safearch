@@ -80,7 +80,7 @@ the network-boot reference. Arch Linux only, everywhere.
 | build host (has the keys) | `build.sh` (entry point), `release.sh`, `fetch-images.sh`, `update-snapshot.sh`, `burn.sh`, `diagnose.sh`, `test-vm.sh`, `hwtest-image.sh` |
 | image configuration | `mkosi.conf` (the image, both boot paths), `mkosi.profiles/{remotedesktop,docker}/` (groups), `mkosi.profiles/debug/` (`--debug`), `mkosi.repart/`, `mkosi.extra/`, `mkosi.postinst`, `mkosi.finalize`, `mkosi.postoutput` |
 | initrd | `mkosi.initrd.conf/`: `usb-bootdev` (root from the stick) and `netroot` (root over HTTP), chosen at boot by `LoaderDevicePartUUID`; `select` (sourced by both: which root of a combined build) |
-| combinations | `combinations.conf`, `lib/compose.sh` (`build.sh --combined`: one UKI for several roots), `mkosi.extra/usr/local/sbin/safespace-select` |
+| combinations | `combinations.conf`, `lib/compose.sh` (`build.sh` without `--groups`, the default: one UKI for several roots), `mkosi.extra/usr/local/sbin/safespace-select` |
 | distribution server | `server/` (`setup.sh`, `safespace-netboot`, units, nginx site, `server.conf.example`) |
 | shared shell code | `lib/repos.sh`, `lib/groups.sh`, `lib/keys.sh`, `lib/builds.sh` (the builds in `mkosi.output/<groups>_<version>/`: their parts, list, select, prune), `lib/stick.sh` (a stick assembled from the parts), `lib/verify.sh` (also installed on the servers) |
 | tests | `tests/run.sh` (no root), `tests/vm.sh` (integration in QEMU), `tests/lib/` |
@@ -116,7 +116,8 @@ the network-boot reference. Arch Linux only, everywhere.
 - After a change to the image, the initrd, the build, the release or the server, run the
   integration test `tests/vm.sh` (test build with a throwaway user, release into its own
   share, server check, QEMU boots from a stick and over the network, sealing, Secure Boot;
-  ~15 min). It needs the build host's sudo rule for `build.sh`; if a prerequisite is
+  ~20 min with a warm cache; without --groups it builds and tests the whole stack, incl.
+  preselecting a combination). It needs the build host's sudo rule for `build.sh`; if a prerequisite is
   missing it says which: hand that to the user instead of working around it. Never release
   a test build (`mkosi.test/vm/builds/`) to a real server: it carries the test key.
 - Not testable without root or hardware — say so and hand it to the user with

@@ -9,7 +9,7 @@ it from a partition.)
 
 **The whole path, for an x86-64 UEFI machine:**
 
-1. on the build host: `sudo ./build.sh --groups …` — [Build and release](#build-and-release)
+1. on the build host: `sudo ./build.sh` — [Build and release](#build-and-release)
 2. on the build host: `./release.sh --push safespace@SERVER` — the same section;
    it replaces the server's release, and the server checks it
 3. once on the server: `sudo server/setup.sh …` (nginx, the check, optional
@@ -114,7 +114,7 @@ distribution servers (`SERVER_URL` of their `server.conf` + `/`):
 
 ```sh
 cp netboot.conf.example netboot.conf     # NETROOT_URL=http://10.0.0.1/safespace/
-sudo ./build.sh --groups base            # -> mkosi.output/base_<time>/
+sudo ./build.sh                          # the whole stack -> mkosi.output/combined_<time>/
 ./release.sh --push safespace@10.0.0.1
 ```
 
@@ -145,7 +145,7 @@ old file. A machine that got the old `boot.efi` and then asks for the root image
 firmware loads the new `boot.efi`. If the image is refused although the server still claims
 this UKI's release, that is a real error and the boot stops (no reboot loop).
 
-**Combined builds** (`build.sh --combined`, README "Combinations"): the share holds
+**The whole stack** (`build.sh` without `--groups`, README "Combinations"): the share holds
 `root-<name>.img`, `root-<name>.verity` and `roothash-<name>` per combination instead of the
 single root. The initrd picks the combination (`safespace.select=`, the EFI variables set by
 `safespace-select`, else `base`) and downloads only that root; the replaced-release check
@@ -502,7 +502,7 @@ vim users.conf mkosi.conf            # users, packages, …
 ./fetch-images.sh                    # shipped Docker images (docker group)
 
 # 2. build (-f also rebuilds unchanged packages, -ff reinstalls everything)
-sudo ./build.sh --groups base,remotedesktop -f
+sudo ./build.sh -f                   # the whole stack (--groups LIST: a single build)
 
 # 3. release: replaces the release on every server, which then checks it
 ./release.sh

@@ -128,6 +128,8 @@ if wanted groups; then
 	check "case-insensitive, deduplicated, base first" t_groups "RemoteDesktop,docker,BASE,docker" "base remotedesktop docker"
 	refuse "unknown group refused" t_groups "base,foo" ""
 	refuse "shell characters refused" t_groups 'base;rm' ""
+	check "build.sh: --combined is gone (the whole stack is the default)" \
+		bash -c '"$1" --combined 2>&1 | grep -q "no --combined any more"' _ "$REPO/build.sh"
 	if need mkosi; then
 		pk() { mkosi --directory "$REPO" "$@" --json summary 2>/dev/null |
 			python3 -I -c 'import json, sys; print(" ".join(json.load(sys.stdin)["Images"][-1]["Packages"]))'; }
@@ -365,7 +367,7 @@ if wanted initrd; then
 fi
 
 # --- combined: several group sets in one build, selected at boot -------------------------
-# Two fixture builds with the same kernel, composed as build.sh --combined does
+# Two fixture builds with the same kernel, composed as build.sh does without --groups
 # (lib/compose.sh, real ukify with throwaway keys), released, written to a stick,
 # and the initrd's choice of the root (select, efivars in a directory).
 if wanted combined && fixtures && need ukify openssl; then

@@ -8,7 +8,7 @@
 #
 # SRC is a directory with layout.sfdisk, systemd-boot.efi, boot.efi and the
 # root/verity files the layout names: root.img and root.verity (one root), or
-# root-<name>.img and root-<name>.verity per combination (build.sh --combined;
+# root-<name>.img and root-<name>.verity per combination (build.sh without --groups;
 # the partitions are named root-<name> and root-<name>-verity). FETCH is a
 # command that prints a file's content (FETCH root.img), so burn.sh can stream
 # the large files from a server; without it they are read from SRC. Each is

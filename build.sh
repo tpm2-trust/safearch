@@ -4,7 +4,7 @@
 # USB stick / SD card (./burn.sh) and over the network (./release.sh to the
 # distribution servers, NETBOOT.md).
 #
-#   sudo ./build.sh [--groups LIST | --combined] [--url BASE_URL]... [--workers N] [--debug]
+#   sudo ./build.sh [--groups LIST] [--url BASE_URL]... [--workers N] [--debug]
 #                   [--users FILE] [--output-root DIR] [MKOSI OPTIONS...]
 #
 #   ./build.sh list                 the builds: groups, built at, snapshot,
@@ -20,25 +20,26 @@
 #                                   --packages the downloaded packages); the
 #                                   next build installs everything anew
 #
+# Without --groups: the whole stack. Every combination of combinations.conf
+# is built (each as with --groups), then one signed UKI is composed that names
+# them all (lib/compose.sh): mkosi.output/combined_<version>/. A machine boots
+# "base" unless safespace-select preselects another (an EFI variable).
+#
 # Each build gets a directory of its own, named by its group set and build
 # time, so the builds of one group set sort together:
 #   mkosi.output/<groups>_<version>/   e.g. mkosi.output/base-remotedesktop_20261019-0930/
+#   mkosi.output/combined_<version>/   the whole stack (no --groups)
 # with the parts (boot.efi, root.img, root.verity, roothash, systemd-boot.efi,
 # layout.sfdisk, manifest.json; lib/builds.sh), build.json (what, when, from
 # which package snapshot and commit); release.sh adds released.log. BUILD in
 # the commands above is that directory name.
 #
-# --groups LIST  package groups, comma-separated, case-insensitive (default:
-#              base). base: the base system only (always included);
+# --groups LIST  a single build of exactly these package groups instead of
+#              the whole stack; comma-separated, case-insensitive. base: the
+#              base system only (always included);
 #              remotedesktop: XFCE desktop over VNC; docker: Docker with its
 #              data disk. E.g. --groups base,RemoteDesktop,docker.
 #              See lib/groups.sh and mkosi.profiles/<group>/.
-#
-# --combined   every combination of combinations.conf in one run: each is built
-#              as with --groups, then one signed UKI is composed that names
-#              them all (lib/compose.sh); the build is
-#              mkosi.output/combined_<version>/. A machine boots "base" unless
-#              safespace-select preselects another (an EFI variable).
 #
 # --url BASE_URL  where a network-booted machine loads root.img and
 #              root.verity from: the distribution servers' share, e.g.
@@ -152,8 +153,8 @@ while (($#)); do
 		--url=*) URLS+=("${1#--url=}"); shift ;;
 		--groups) GROUP_LIST=${2:?--groups needs a comma-separated list}; GROUPS_GIVEN=1; shift 2 ;;
 		--groups=*) GROUP_LIST=${1#--groups=}; GROUPS_GIVEN=1; shift ;;
-		--combined) COMBINED=1; shift ;;
-		# Internal (--combined): the version of all combinations of one run.
+		--combined) die "there is no --combined any more: without --groups build.sh builds the whole stack" ;;
+		# Internal (the whole stack): the version of all combinations of one run.
 		--version) FIXED_VERSION=${2:?--version needs a version}; shift 2 ;;
 		--users) USERS_FILE=${2:?--users needs a file}; shift 2 ;;
 		--output-root) OUTPUT_ROOT=${2:?--output-root needs a directory}; shift 2 ;;
@@ -208,6 +209,9 @@ for a in ${MKOSI_ARGS[@]+"${MKOSI_ARGS[@]}"}; do
 			VERB=$a; break ;;
 	esac
 done
+# No --groups: the whole stack (a build only; mkosi verbs work on a single
+# group set, base unless --groups says otherwise).
+[[ $VERB == build && $GROUPS_GIVEN == 0 ]] && COMBINED=1
 APPEND_VERB=""
 [[ " ${MKOSI_ARGS[*]-} " == *" $VERB "* ]] || APPEND_VERB=1
 case $VERB in
@@ -232,8 +236,11 @@ if [[ $VERB == build ]]; then
 	free_gib() { df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc 0-9; }
 	mkdir -p "$BUILDS_ROOT"
 	out_free=$(free_gib "$BUILDS_ROOT") tmp_free=$(free_gib /var/tmp)
-	[[ -z $out_free ]] || ((out_free >= 8)) ||
-		die "only ${out_free} GiB free for the build in ${BUILDS_ROOT#"$HERE"/}/ (needs ~8 GiB; ./build.sh prune, sudo ./build.sh purge-cache)"
+	# The whole stack: the parts of every combination exist at once.
+	need_out=8
+	((COMBINED)) && need_out=$((8 + 2 * $(grep -c '^[a-z]' "$HERE/combinations.conf")))
+	[[ -z $out_free ]] || ((out_free >= need_out)) ||
+		die "only ${out_free} GiB free for the build in ${BUILDS_ROOT#"$HERE"/}/ (needs ~$need_out GiB; ./build.sh prune, sudo ./build.sh purge-cache)"
 	[[ -z $tmp_free ]] || ((tmp_free >= 8)) ||
 		die "only ${tmp_free} GiB free in /var/tmp, where mkosi builds the image (needs ~8 GiB)"
 	mem=$(awk '/^MemAvailable:/ { print int($2 / 1048576) }' /proc/meminfo)
@@ -241,10 +248,8 @@ if [[ $VERB == build ]]; then
 	log "resources: $(nproc) CPUs, ${mem} GiB RAM available, ${out_free:-?} GiB free for builds, ${tmp_free:-?} GiB in /var/tmp"
 fi
 
-# --- --combined: build every combination, then compose ---------------------------
+# --- the whole stack: build every combination, then compose ----------------------
 if ((COMBINED)); then
-	((!GROUPS_GIVEN)) || die "--combined builds the combinations of combinations.conf: no --groups"
-	[[ $VERB == build ]] || die "--combined only builds (no mkosi verbs)"
 	# shellcheck source=lib/compose.sh
 	source "$HERE/lib/compose.sh"
 	combos_load "$HERE/combinations.conf"
@@ -260,7 +265,6 @@ if ((COMBINED)); then
 	for a in "${ORIG_ARGS[@]}"; do
 		((skip)) && { skip=0; continue; }
 		case $a in
-			--combined) ;;
 			--output-root | --version) skip=1 ;;
 			*) sub+=("$a") ;;
 		esac

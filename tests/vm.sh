@@ -6,15 +6,16 @@
 # unattended; no LLM, no window, no access to real users, keys or servers.
 # Exit 0 only if every step passed.
 #
-#   tests/vm.sh [--no-build | --build BUILD] [--groups LIST | --combined] [STEP...]
+#   tests/vm.sh [--no-build | --build BUILD] [--groups LIST] [STEP...]
 #
-#   --groups LIST   group set to build and test (default: base)
-#   --combined      build and test the combinations of combinations.conf in one
-#                   build (build.sh --combined); adds the step select
-#   --no-build      test the newest existing test build of that group set
+#   (default)       build and test the whole stack: every combination of
+#                   combinations.conf in one build, as build.sh builds it
+#                   without --groups; includes the step select
+#   --groups LIST   build and test a single build of this group set instead
+#   --no-build      test the newest existing test build (of that group set)
 #   --build BUILD   test this existing test build (mkosi.test/vm/builds/)
 #   STEP            stick net seal net-sb select (default: all; select only
-#                   with --combined, it needs seal)
+#                   for the whole stack, it needs seal)
 #
 # Kept apart from everything real, in mkosi.test/vm/ (gitignored):
 #   id_ed25519, users.conf   the test user "tester" and its key (created once)
@@ -37,7 +38,7 @@
 #   seal    Setup Mode -> safespace-seal -> boot with the sealed firmware:
 #           Secure Boot enabled (user), verified, running
 #   net-sb  network boot with enforced Secure Boot: enabled, verified, running
-#   select  (--combined) on the sealed firmware of seal: base without a
+#   select  (whole stack) on the sealed firmware of seal: base without a
 #           selection; safespace-select set docker -> docker booted (the
 #           docker command present); once base -> base for one boot; then
 #           docker again. Every boot with Secure Boot enabled and verified.
@@ -52,7 +53,7 @@
 #   - the public keys of a real build (mkosi.extra/usr/share/safespace/
 #     secureboot/db.pem: build.sh writes them on every build)
 #   - TCP port 8790 free on 127.0.0.1 (the test's HTTP server)
-#   - 4 GiB RAM available, 6 GiB free in mkosi.test/ (12 GiB with --combined)
+#   - 4 GiB RAM available, 12 GiB free in mkosi.test/ (6 GiB with --groups)
 set -Euo pipefail
 
 REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
@@ -61,13 +62,12 @@ log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,${/^#/!q;s/^# \?//;p}' "$0"; }
 
-BUILD_MODE=build BUILD="" GROUP_LIST=base COMBINED=0 STEPS=()
+BUILD_MODE=build BUILD="" GROUP_LIST="" COMBINED=1 STEPS=()
 while (($#)); do
 	case $1 in
 		--no-build) BUILD_MODE=existing; shift ;;
 		--build) BUILD_MODE=given; BUILD=${2:?--build needs a build}; shift 2 ;;
-		--groups) GROUP_LIST=${2:?--groups needs a list}; shift 2 ;;
-		--combined) COMBINED=1; shift ;;
+		--groups) GROUP_LIST=${2:?--groups needs a list}; COMBINED=0; shift 2 ;;
 		-h | --help) usage; exit 0 ;;
 		stick | net | seal | net-sb | select) STEPS+=("$1"); shift ;;
 		*) usage >&2; die "unknown argument $1" ;;
@@ -79,14 +79,13 @@ if ((${#STEPS[@]} == 0)); then
 fi
 wants() { [[ " ${STEPS[*]} " == *" $1 "* ]]; }
 if wants select; then
-	((COMBINED)) || die "the step select needs --combined"
+	((COMBINED)) || die "the step select needs the whole stack (no --groups)"
 	wants seal || STEPS=(seal "${STEPS[@]}") # select boots the firmware seal sealed
 fi
 cd "$REPO"
 # shellcheck source=../lib/groups.sh
 source "$REPO/lib/groups.sh"
 if ((COMBINED)); then
-	[[ $GROUP_LIST == base ]] || die "--combined or --groups, not both"
 	GROUPS_CSV=combined
 else
 	groups_parse "$GROUP_LIST"
@@ -157,9 +156,9 @@ result() { RESULTS+=("$1 $2${3:+  ($3)}"); printf '  \e[%sm%s\e[0m %s%s\n' "$([[
 
 case $BUILD_MODE in
 	build)
-		if ((COMBINED)); then what=(--combined); else what=(--groups "$GROUPS_CSV"); fi
-		log "building ${what[*]} (test user, root from $URL)"
-		sudo "$REPO/build.sh" "${what[@]}" --users "$VM/users.conf" --output-root "$VM/builds" --url "$URL" \
+		if ((COMBINED)); then what=(); else what=(--groups "$GROUPS_CSV"); fi
+		log "building ${what[*]:-the whole stack} (test user, root from $URL)"
+		sudo "$REPO/build.sh" ${what[@]+"${what[@]}"} --users "$VM/users.conf" --output-root "$VM/builds" --url "$URL" \
 			>"$LOGS/build.log" 2>&1 || die "build failed (see ${LOGS#"$REPO"/}/build.log)"
 		BUILD=$(builds_newest "$GROUPS_CSV")
 		# Only the newest test build per group set stays.

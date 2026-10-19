@@ -11,7 +11,7 @@
 #     systemd-boot.efi    the signed systemd-boot (\EFI\BOOT\BOOTX64.EFI on a stick)
 #     layout.sfdisk       a stick's partition table (lib/stick.sh)
 #     manifest.json       the packages
-#     systemd-stub.efi    the image's systemd-stub (only for build.sh --combined; never released)
+#     systemd-stub.efi    the image's systemd-stub (only for build.sh without --groups; never released)
 #     vnc-password        remotedesktop: the generated VNC password (0600)
 #     build.json          what, when, from what (builds_write_info)
 #     released.log        "<time> <target>" per push (release.sh)

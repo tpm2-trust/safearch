@@ -1,5 +1,5 @@
 # Combinations: several group sets in one build, one signed UKI for all.
-# Sourced by build.sh (--combined); expects die(), log() and lib/groups.sh.
+# Sourced by build.sh (without --groups); expects die(), log() and lib/groups.sh.
 #
 #   combos_load FILE            read combinations.conf into COMBO_NAMES/COMBO_GROUPS
 #   compose_build DEST DIR...   one build directory per combination (same

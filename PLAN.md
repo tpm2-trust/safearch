@@ -728,3 +728,36 @@ network only the chosen combination's root is downloaded.
 
 - After the proof of concept: make `--combined` the default build, and drop single
   group builds?
+
+---
+# PLAN: the combined build is the default
+
+## Goal
+
+`sudo ./build.sh` without group options builds the whole stack: every combination of
+`combinations.conf` in one combined build. A single group set stays available explicitly
+with `--groups LIST` (also what the combined build runs internally). `--combined` is removed
+(it is refused with a hint).
+
+## Steps
+
+- [x] 1. `build.sh`: no `--groups` → combined; `--groups LIST` → single build; `--combined`
+      removed. Resource check for combined: 8 GiB + 2 GiB per
+      combination where the build lands (the parts of all combinations exist at once).
+- [x] 2. `tests/vm.sh`: default combined (step `select` included); `--groups LIST` tests a
+      single build.
+- [x] 3. Usage texts, README ("Deploy from scratch", "Package groups", "Combinations",
+      "Builds", "Integration test"), AGENTS.md (map, test duration), NETBOOT.md wording.
+- [ ] 4. `tests/run.sh` (`--combined` refused); then `tests/vm.sh` (default = whole stack).
+
+## Breaks / changes in behaviour
+
+- `sudo ./build.sh` takes about as long as one build per combination (today: 2) and needs
+  more disk; the result is `combined_<version>`, so `./release.sh` without options releases
+  that.
+- Machines booting from a release of a single build keep working with a combined release:
+  without a selection they boot `base`.
+
+## Open questions
+
+- (answered: `--combined` goes away.)
