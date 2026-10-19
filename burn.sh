@@ -59,19 +59,16 @@ done
 
 TMP=$(mktemp -d -t safespace-burn.XXXXXX)
 trap 'rm -rf "$TMP"' EXIT
-ROOT_URL="" ROOT_SUM=""
+BASE_URL=""
 if [[ $SOURCE =~ ^https?:// ]]; then
 	command -v curl >/dev/null || die "missing 'curl'"
-	base=${SOURCE%/}
-	log "Fetching the release from $base/"
-	for f in SHA256SUMS release roothash layout.sfdisk systemd-boot.efi boot.efi root.verity; do
-		curl -fsS -o "$TMP/$f" "$base/$f" || die "cannot fetch $base/$f (not a safespace release?)"
+	BASE_URL=${SOURCE%/}
+	log "Fetching the release from $BASE_URL/"
+	for f in SHA256SUMS release layout.sfdisk systemd-boot.efi boot.efi; do
+		curl -fsS -o "$TMP/$f" "$BASE_URL/$f" || die "cannot fetch $BASE_URL/$f (not a safespace release?)"
 	done
-	(cd "$TMP" && grep -E ' \*?(release|roothash|layout\.sfdisk|systemd-boot\.efi|boot\.efi|root\.verity)$' SHA256SUMS |
+	(cd "$TMP" && grep -E ' \*?(release|layout\.sfdisk|systemd-boot\.efi|boot\.efi)$' SHA256SUMS |
 		sha256sum --quiet --strict -c) || die "the release's files do not match its SHA256SUMS"
-	ROOT_URL=$base/root.img
-	ROOT_SUM=$(awk '$2 == "root.img" || $2 == "*root.img" { print $1 }' "$TMP/SHA256SUMS")
-	[[ $ROOT_SUM =~ ^[0-9a-f]{64}$ ]] || die "no root.img in SHA256SUMS"
 	SRC=$TMP
 elif [[ -d $SOURCE ]]; then
 	SRC=$(readlink -f "$SOURCE")
@@ -83,7 +80,7 @@ else
 	SRC=$(builds_dir "$b")
 fi
 [[ -f $SRC/layout.sfdisk ]] || die "$SRC has no layout.sfdisk: not a build or release (or one from before the single build)"
-if [[ -z $ROOT_URL && -f $SRC/SHA256SUMS ]]; then
+if [[ -z $BASE_URL && -f $SRC/SHA256SUMS ]]; then
 	log "Checking $SRC against its SHA256SUMS"
 	(cd "$SRC" && sha256sum --quiet --strict -c SHA256SUMS) || die "$SRC does not match its SHA256SUMS"
 fi
@@ -131,32 +128,45 @@ fi
 
 # --- write -------------------------------------------------------------------------
 
-log "Writing the partition table, the ESP, root.verity and root.img"
-if [[ -n $ROOT_URL ]]; then
-	# The root partition goes from the server onto the stick in one stream;
-	# its checksum is taken on the way (fifo -> sha256sum) and compared after.
-	mkfifo "$TMP/root.fifo"
-	sha256sum <"$TMP/root.fifo" | cut -d' ' -f1 >"$TMP/root.sha" &
-	sum_pid=$!
-	ok=1
-	curl -fsS "$ROOT_URL" | tee "$TMP/root.fifo" | stick_write "$TARGET" "$SRC" - || ok=0
-	wait "$sum_pid" || true
-	if ((!ok)) || [[ $(cat "$TMP/root.sha" 2>/dev/null) != "$ROOT_SUM" ]]; then
-		if [[ -b $TARGET ]]; then wipefs -aq "$TARGET"; else rm -f "$TARGET"; fi
-		die "the download of root.img failed or does not match SHA256SUMS: $TARGET $([[ -b $TARGET ]] && echo 'was wiped again' || echo 'was removed')"
+log "Writing the partition table, the ESP, the hash trees and the root partitions"
+# From a server, the root and hash tree files go onto the stick in one stream
+# each; their checksums are taken on the way (fifo -> sha256sum) and compared
+# with SHA256SUMS afterwards.
+fetch_url() { # FILE
+	local rc
+	mkfifo "$TMP/$1.fifo"
+	sha256sum <"$TMP/$1.fifo" | cut -d' ' -f1 >"$TMP/$1.sha" &
+	curl -fsS "$BASE_URL/$1" | tee "$TMP/$1.fifo"
+	rc=$?
+	wait $!
+	return $rc
+}
+bad=""
+if [[ -n $BASE_URL ]]; then
+	(stick_write "$TARGET" "$SRC" fetch_url) || bad="the download or the write failed"
+	if [[ -z $bad ]]; then
+		while read -r f _; do
+			want=$(awk -v f="$f" '$2 == f || $2 == "*" f { print $1 }' "$TMP/SHA256SUMS")
+			[[ -n $want && $(cat "$TMP/$f.sha" 2>/dev/null) == "$want" ]] || { bad="$f does not match SHA256SUMS"; break; }
+		done < <(stick_files "$SRC")
 	fi
 else
-	stick_write "$TARGET" "$SRC"
+	(stick_write "$TARGET" "$SRC") || bad="the write failed"
+fi
+if [[ -n $bad ]]; then
+	if [[ -b $TARGET ]]; then wipefs -aq "$TARGET"; else rm -f "$TARGET"; fi
+	die "$bad: $TARGET $([[ -b $TARGET ]] && echo 'was wiped again' || echo 'was removed')"
 fi
 
 if [[ -b $TARGET ]]; then
 	blockdev --rereadpt "$TARGET"
 	udevadm settle
+	nparts=$((1 + $(stick_files "$SRC" | wc -l)))
 	for _ in {1..10}; do
-		(($(lsblk -lnpo TYPE "$TARGET" | grep -c part) == 3)) && break
+		(($(lsblk -lnpo TYPE "$TARGET" | grep -c part) == nparts)) && break
 		sleep 1
 	done
-	(($(lsblk -lnpo TYPE "$TARGET" | grep -c part) == 3)) || die "the partitions on $TARGET did not show up after writing"
+	(($(lsblk -lnpo TYPE "$TARGET" | grep -c part) == nparts)) || die "the partitions on $TARGET did not show up after writing"
 	blockdev --flushbufs "$TARGET"
 	lsblk -o NAME,SIZE,FSTYPE,LABEL,PARTLABEL "$TARGET"
 	log "Done. $TARGET can be unplugged (check it with: sudo ./diagnose.sh $TARGET)."

@@ -1,0 +1,78 @@
+#!/bin/bash
+# Preselect the combination this machine boots (combined builds, build.sh
+# --combined). The initrd reads the choice from an EFI variable; the root hash
+# of every combination is on the UKI's signed command line, so only the names
+# offered there can be selected (see /usr/local/lib/safespace/select in the
+# initrd).
+#
+#   safespace-select [list]     the combinations of this build, the booted one,
+#                               the preselection
+#   safespace-select set NAME   boot NAME from the next boot on
+#   safespace-select once NAME  boot NAME on the next boot only
+#   safespace-select clear      no preselection: base
+#
+# The variables (NV, BS, RT; vendor GUID 8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34):
+#   SafespaceSelect      the persistent preselection
+#   SafespaceSelectOnce  the next boot only (the initrd deletes it)
+# A seal (safespace-seal) is not touched by this: the variables only choose
+# between signed combinations. The firmware password protects them against
+# changes from the firmware setup.
+set -euo pipefail
+
+GUID=8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34
+VARS=/sys/firmware/efi/efivars
+die() { printf 'safespace-select: %s\n' "$*" >&2; exit 1; }
+
+cmdline=$(cat /proc/cmdline)
+mapfile -t NAMES < <(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace\.root\.\([a-z][a-z0-9-]*\)=[0-9a-f]\{64\}$/\1/p')
+((${#NAMES[@]})) || die "this build has no combinations (not built with build.sh --combined)"
+
+# efivarfs makes variables of unknown vendors immutable: chattr -i before
+# deleting or replacing one.
+var_rm() { local f; for f; do [[ -e $VARS/$f-$GUID ]] || continue; chattr -i "$VARS/$f-$GUID" 2>/dev/null || true; rm -f "$VARS/$f-$GUID"; done; }
+var_get() { [[ -r $VARS/$1-$GUID ]] && tail -c +5 "$VARS/$1-$GUID" | tr -d '\000\n' || true; }
+var_set() { # NAME VALUE: non-volatile, boot service and runtime access
+	[[ $EUID -eq 0 ]] || die "must run as root"
+	var_rm "$1"
+	printf '\x07\x00\x00\x00%s' "$2" >"$VARS/$1-$GUID" || die "could not write $1 (efivarfs read-only?)"
+}
+check_name() {
+	[[ " ${NAMES[*]} " == *" $1 "* ]] || die "'$1' is not a combination of this build (it has: ${NAMES[*]})"
+}
+
+booted() {
+	# What the initrd logged for this boot.
+	journalctl -b -k -o cat 2>/dev/null | sed -n 's/^\(usb-bootdev\|netroot\): combination \([a-z0-9-]*\) .*/\2/p' | tail -1
+}
+
+case ${1:-list} in
+	list)
+		echo "combinations: ${NAMES[*]}"
+		echo "booted:       $(booted || true)"
+		p=$(var_get SafespaceSelect) o=$(var_get SafespaceSelectOnce)
+		echo "preselected:  ${p:-base (none set)}"
+		[[ -z $o ]] || echo "next boot:    $o (once)"
+		;;
+	set)
+		check_name "${2:?set needs a name}"
+		if [[ $2 == base ]]; then
+			[[ $EUID -eq 0 ]] || die "must run as root"
+			var_rm SafespaceSelect
+		else
+			var_set SafespaceSelect "$2"
+		fi
+		echo "from the next boot on: $2"
+		;;
+	once)
+		check_name "${2:?once needs a name}"
+		var_set SafespaceSelectOnce "$2"
+		echo "next boot only: $2"
+		;;
+	clear)
+		[[ $EUID -eq 0 ]] || die "must run as root"
+		var_rm SafespaceSelect SafespaceSelectOnce
+		echo "no preselection: base"
+		;;
+	-h | --help) sed -n '2,${/^#/!q;s/^# \?//;p}' "$0" ;;
+	*) die "unknown command $1 (list, set, once, clear)" ;;
+esac

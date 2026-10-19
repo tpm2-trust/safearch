@@ -666,3 +666,65 @@ build.
       < 2 GiB RAM available warns; one log line with what was found.
 - [x] 3. `mkosi.local.conf.example` (the workers line commented out), README.
 - [ ] 4. Test: by the user, with the next build (asked not to run a separate test).
+
+---
+
+# PLAN: combinations in one build, preselected by an EFI variable (option A)
+
+## Goal
+
+One build run produces every group **combination** as a complete, verified root (no runtime
+layering). One signed UKI serves them all: its command line names each combination with its
+root hash. A machine boots `base` by default (seal it there), and `safespace-select` sets an
+EFI variable that preselects the combination for the following boots (or once). Over the
+network only the chosen combination's root is downloaded.
+
+## Design
+
+- `combinations.conf` (tracked): `name=groups` per line, e.g. `base=base`,
+  `docker=base,docker`.
+- **Build:** each combination is built as today (mkosi, `base` installed once through the
+  cache); then a **compose** step builds the common UKI with ukify from the kernel, initrd
+  and microcode of the `base` UKI, a command line with `safespace.root.<name>=<root hash>`
+  for every combination instead of `roothash=`, signed with the db key and with signed
+  expected PCRs. The combined build holds `boot.efi`, `systemd-boot.efi`, `layout.sfdisk`
+  (ESP + one root/verity pair per combination, UUIDs from each root hash), per combination
+  `root-<name>.img`, `root-<name>.verity`, `roothash-<name>`, `manifest-<name>.json`, and
+  `build.json` (combinations).
+- **Selection in the initrd** (shared helper for `usb-bootdev` and `netroot`), first match:
+  1. `safespace.select=<name>` on the command line (a boot menu entry / UKI profile)
+  2. EFI variable `SafespaceSelectOnce-<GUID>` (deleted by the initrd after reading)
+  3. EFI variable `SafespaceSelect-<GUID>` (persistent)
+  4. `base`
+  An unknown name stops the boot with a message. Only names whose root hash is on the
+  signed command line can be chosen: the variable selects, it never supplies a hash.
+  (Recording the choice in a PCR is left for later: PCR 11 carries the signed expected
+  values, so it must not be extended; a free PCR or a named NvPCR needs its own design.)
+  Without
+  `safespace.root.*` (a single build) everything works as today (`roothash=`).
+- **Stick:** `usb-bootdev` waits for the chosen pair's partitions (UUIDs from its hash).
+  **Network:** `netroot` loads `root-<name>.img` / `root-<name>.verity` (and compares
+  `roothash-<name>` for the replaced-release reboot).
+- **`safespace-select`** (in the image): `list`, `set NAME`, `once NAME`, `clear`; names
+  only from the running UKI's signed command line.
+- Release, server check, `burn.sh` (all pairs), `test-vm.sh` handle combined builds.
+
+## Steps (proof of concept: base + docker)
+
+- [x] 1. `combinations.conf`; `build.sh --combined` builds every combination and composes
+      (`lib/compose.sh`: UKI with ukify, layout, parts).
+- [x] 2. initrd: selection helper, `usb-bootdev` and `netroot` use it; one-shot deletion.
+- [x] 3. `safespace-select` in the image.
+- [x] 4. `lib/verify.sh`, `release.sh`, `lib/stick.sh`/`burn.sh`, `test-vm.sh` for combined
+      builds.
+- [x] 5. Tests: `tests/run.sh` (compose layout, verify of a combined release, selection
+      logic with shims); `tests/vm.sh` step `select`: boot base, seal, `set docker`, reboot
+      → docker, `once base` → base once, then docker again (network boot with the variable:
+      covered in `tests/run.sh combined`, the VM netboot has no persistent variables).
+- [x] 6. Docs (README, NETBOOT.md, AGENTS.md).
+- [x] 7. `tests/vm.sh --combined`: all PASS (combined_20261019-1353, 2026-10-19).
+
+## Open questions
+
+- After the proof of concept: make `--combined` the default build, and drop single
+  group builds?

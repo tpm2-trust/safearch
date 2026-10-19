@@ -35,7 +35,11 @@ msg() { echo "usb-bootdev: $*" >/dev/kmsg; }
 cmdline=$(cat /proc/cmdline)
 arg() { printf '%s\n' "$cmdline" | tr ' ' '\n' | sed -n "s/^$1=//p" | tail -n 1; }
 
-roothash=$(arg roothash)
+# Which root: a single build's roothash=, or the selected combination's
+# (select, next to this script).
+. "${0%/*}/select"
+select_root || exit 1
+roothash=$SELECT_HASH
 # (No grep in the initrd: a shell pattern instead.)
 case $roothash in
 	*[!0-9a-f]* | '') roothash="" ;;

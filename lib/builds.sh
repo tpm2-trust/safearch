@@ -11,6 +11,7 @@
 #     systemd-boot.efi    the signed systemd-boot (\EFI\BOOT\BOOTX64.EFI on a stick)
 #     layout.sfdisk       a stick's partition table (lib/stick.sh)
 #     manifest.json       the packages
+#     systemd-stub.efi    the image's systemd-stub (only for build.sh --combined; never released)
 #     vnc-password        remotedesktop: the generated VNC password (0600)
 #     build.json          what, when, from what (builds_write_info)
 #     released.log        "<time> <target>" per push (release.sh)
@@ -160,16 +161,16 @@ builds_prune() { # KEEP YES
 builds_write_info() { # DIR, then KEY=VALUE pairs (VALUE with commas = a list for groups/netroot)
 	local d=$1; shift
 	python3 -I - "$d" "$@" <<-'EOF'
-		import json, sys, os
+		import json, sys, os, glob
 		d, pairs = sys.argv[1], sys.argv[2:]
 		info = {}
 		for p in pairs:
 		    k, _, v = p.partition("=")
-		    info[k] = [x for x in v.split(",") if x] if k in ("groups", "netroot") else v
-		m = d + "/manifest.json"
-		info["packages"] = len(json.load(open(m))["packages"]) if os.path.exists(m) else 0
-		for k, f in (("uki_bytes", "boot.efi"), ("root_bytes", "root.img")):
-		    info[k] = os.path.getsize(d + "/" + f) if os.path.exists(d + "/" + f) else 0
+		    info[k] = [x for x in v.split(",") if x] if k in ("groups", "netroot", "combinations") else v
+		ms = [d + "/manifest.json"] if os.path.exists(d + "/manifest.json") else sorted(glob.glob(d + "/manifest-*.json"))
+		info["packages"] = sum(len(json.load(open(m))["packages"]) for m in ms)
+		info["uki_bytes"] = os.path.getsize(d + "/boot.efi") if os.path.exists(d + "/boot.efi") else 0
+		info["root_bytes"] = sum(os.path.getsize(f) for f in glob.glob(d + "/root*.img"))
 		with open(d + "/build.json", "w") as f:
 		    json.dump(info, f, indent=2)
 		    f.write("\n")
@@ -189,6 +190,7 @@ builds_finalize() { # DIR VERSION
 		mv -f "$b.${f%%:*}" "$d/${f#*:}"
 	done
 	[[ -f $b.vnc-password ]] && mv -f "$b.vnc-password" "$d/vnc-password"
+	[[ -f $b.systemd-stub ]] && mv -f "$b.systemd-stub" "$d/systemd-stub.efi"
 	[[ -f $b.raw ]] || die "builds_finalize: no disk image $(basename "$b").raw"
 	# The table as systemd-repart wrote it (types, UUIDs derived from the root
 	# hash, sizes, attributes), without the image's file name.

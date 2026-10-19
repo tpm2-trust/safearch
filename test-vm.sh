@@ -90,8 +90,13 @@ if ((NETBOOT)) && [[ -n $BOOT_URL ]]; then
 	cmdline=$(objcopy -O binary --only-section=.cmdline "$uki" /dev/stdout 2>/dev/null | tr -d '\0')
 	NETROOT_URL=$(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace.netroot=//p' | head -1)
 	[[ -n $NETROOT_URL ]] || die "$BOOT_URL has no safespace.netroot= on its command line (built without NETROOT_URL)"
-	root_bytes=$(curl -fsSI "${NETROOT_URL%/}/root.img" | tr -d '\r' | awk 'tolower($1) == "content-length:" { print $2 }')
-	[[ $root_bytes =~ ^[0-9]+$ ]] || die "the server does not serve ${NETROOT_URL%/}/root.img"
+	# The largest root the VM might load: root.img, or one per combination.
+	root_bytes=0
+	for f in root.img $(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace\.root\.\([a-z0-9-]*\)=.*/root-\1.img/p'); do
+		b=$(curl -fsSI "${NETROOT_URL%/}/$f" 2>/dev/null | tr -d '\r' | awk 'tolower($1) == "content-length:" { print $2 }')
+		[[ $b =~ ^[0-9]+$ ]] && ((b > root_bytes)) && root_bytes=$b
+	done
+	((root_bytes > 0)) || die "the server serves no root image under ${NETROOT_URL%/}/"
 	MEM=${MEM:-$((root_bytes / 1048576 + 2048))}
 	log "UKI from $BOOT_URL, root from $NETROOT_URL"
 elif ((NETBOOT)); then
@@ -111,10 +116,10 @@ elif ((NETBOOT)); then
 	[[ $host == 10.0.2.2 ]] ||
 		die "this UKI loads its root from $host, which the VM cannot reach: QEMU's user network is the host at 10.0.2.2. Rebuild with: sudo ./build.sh network --url http://10.0.2.2:8000/"
 	((port >= 1024)) || die "port $port would need root for the test server; rebuild with e.g. --url http://10.0.2.2:8000/"
-	[[ -f $BOOTDIR/root.img ]] || die "no root.img in $BOOTDIR"
+	ls "$BOOTDIR"/root*.img >/dev/null 2>&1 || die "no root image in $BOOTDIR"
 	# The root image is about as large as the system itself and is downloaded
 	# into a tmpfs, so the VM needs the RAM for it (override with MEM=).
-	root_mib=$(($(stat -c %s "$BOOTDIR/root.img") / 1048576))
+	root_mib=$(($(stat -c %s "$BOOTDIR"/root*.img | sort -n | tail -1) / 1048576))
 	MEM=${MEM:-$((root_mib + 2048))}
 
 	# Serve the published files under the exact path the signed URL names, so

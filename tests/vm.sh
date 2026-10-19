@@ -6,12 +6,15 @@
 # unattended; no LLM, no window, no access to real users, keys or servers.
 # Exit 0 only if every step passed.
 #
-#   tests/vm.sh [--no-build | --build BUILD] [--groups LIST] [STEP...]
+#   tests/vm.sh [--no-build | --build BUILD] [--groups LIST | --combined] [STEP...]
 #
 #   --groups LIST   group set to build and test (default: base)
+#   --combined      build and test the combinations of combinations.conf in one
+#                   build (build.sh --combined); adds the step select
 #   --no-build      test the newest existing test build of that group set
 #   --build BUILD   test this existing test build (mkosi.test/vm/builds/)
-#   STEP            stick net seal net-sb (default: all)
+#   STEP            stick net seal net-sb select (default: all; select only
+#                   with --combined, it needs seal)
 #
 # Kept apart from everything real, in mkosi.test/vm/ (gitignored):
 #   id_ed25519, users.conf   the test user "tester" and its key (created once)
@@ -34,6 +37,10 @@
 #   seal    Setup Mode -> safespace-seal -> boot with the sealed firmware:
 #           Secure Boot enabled (user), verified, running
 #   net-sb  network boot with enforced Secure Boot: enabled, verified, running
+#   select  (--combined) on the sealed firmware of seal: base without a
+#           selection; safespace-select set docker -> docker booted (the
+#           docker command present); once base -> base for one boot; then
+#           docker again. Every boot with Secure Boot enabled and verified.
 #
 # Prerequisites (all checked before anything starts; the list of what is
 # missing, then exit 2):
@@ -45,7 +52,7 @@
 #   - the public keys of a real build (mkosi.extra/usr/share/safespace/
 #     secureboot/db.pem: build.sh writes them on every build)
 #   - TCP port 8790 free on 127.0.0.1 (the test's HTTP server)
-#   - 4 GiB RAM available, 6 GiB free in mkosi.test/
+#   - 4 GiB RAM available, 6 GiB free in mkosi.test/ (12 GiB with --combined)
 set -Euo pipefail
 
 REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
@@ -54,24 +61,37 @@ log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,${/^#/!q;s/^# \?//;p}' "$0"; }
 
-BUILD_MODE=build BUILD="" GROUP_LIST=base STEPS=()
+BUILD_MODE=build BUILD="" GROUP_LIST=base COMBINED=0 STEPS=()
 while (($#)); do
 	case $1 in
 		--no-build) BUILD_MODE=existing; shift ;;
 		--build) BUILD_MODE=given; BUILD=${2:?--build needs a build}; shift 2 ;;
 		--groups) GROUP_LIST=${2:?--groups needs a list}; shift 2 ;;
+		--combined) COMBINED=1; shift ;;
 		-h | --help) usage; exit 0 ;;
-		stick | net | seal | net-sb) STEPS+=("$1"); shift ;;
+		stick | net | seal | net-sb | select) STEPS+=("$1"); shift ;;
 		*) usage >&2; die "unknown argument $1" ;;
 	esac
 done
-((${#STEPS[@]})) || STEPS=(stick net seal net-sb)
+if ((${#STEPS[@]} == 0)); then
+	STEPS=(stick net seal net-sb)
+	((COMBINED)) && STEPS+=(select)
+fi
 wants() { [[ " ${STEPS[*]} " == *" $1 "* ]]; }
+if wants select; then
+	((COMBINED)) || die "the step select needs --combined"
+	wants seal || STEPS=(seal "${STEPS[@]}") # select boots the firmware seal sealed
+fi
 cd "$REPO"
 # shellcheck source=../lib/groups.sh
 source "$REPO/lib/groups.sh"
-groups_parse "$GROUP_LIST"
-GROUPS_CSV=$(IFS=,; echo "${SAFESPACE_GROUPS[*]}")
+if ((COMBINED)); then
+	[[ $GROUP_LIST == base ]] || die "--combined or --groups, not both"
+	GROUPS_CSV=combined
+else
+	groups_parse "$GROUP_LIST"
+	GROUPS_CSV=$(IFS=,; echo "${SAFESPACE_GROUPS[*]}")
+fi
 
 VM=mkosi.test/vm                  # relative: build.sh takes paths inside the checkout
 PORT_HTTP=8790
@@ -111,7 +131,8 @@ avail=$(awk '/^MemAvailable:/ { print int($2 / 1048576) }' /proc/meminfo)
 ((avail >= 4)) || miss "4 GiB of available RAM (have $avail GiB)"
 mkdir -p "$VM/builds"
 free=$(df -BG --output=avail "$VM" | tail -1 | tr -dc 0-9)
-((free >= 6)) || miss "6 GiB free disk in mkosi.test/ (have $free GiB)"
+need_disk=$((COMBINED ? 12 : 6))
+((free >= need_disk)) || miss "$need_disk GiB free disk in mkosi.test/ (have $free GiB)"
 if ((${#MISSING[@]})); then
 	printf '\e[1;31m==> missing prerequisites:\e[0m\n' >&2
 	printf '  - %s\n' "${MISSING[@]}" >&2
@@ -136,8 +157,9 @@ result() { RESULTS+=("$1 $2${3:+  ($3)}"); printf '  \e[%sm%s\e[0m %s%s\n' "$([[
 
 case $BUILD_MODE in
 	build)
-		log "building --groups $GROUPS_CSV (test user, root from $URL)"
-		sudo "$REPO/build.sh" --groups "$GROUPS_CSV" --users "$VM/users.conf" --output-root "$VM/builds" --url "$URL" \
+		if ((COMBINED)); then what=(--combined); else what=(--groups "$GROUPS_CSV"); fi
+		log "building ${what[*]} (test user, root from $URL)"
+		sudo "$REPO/build.sh" "${what[@]}" --users "$VM/users.conf" --output-root "$VM/builds" --url "$URL" \
 			>"$LOGS/build.log" 2>&1 || die "build failed (see ${LOGS#"$REPO"/}/build.log)"
 		BUILD=$(builds_newest "$GROUPS_CSV")
 		# Only the newest test build per group set stays.
@@ -218,6 +240,8 @@ if [ -n "$disk" ]; then
 fi
 echo state=$(systemctl is-system-running)
 echo failed=$(systemctl --failed --no-legend --plain | wc -l)
+echo combination=$(sudo dmesg | sed -n "s/.*\(usb-bootdev\|netroot\): combination \([a-z0-9-]*\) .*/\2/p" | tail -1)
+command -v docker >/dev/null && echo docker=yes || echo docker=no
 echo secure_boot=$(bootctl status 2>/dev/null | sed -n "s/^ *Secure Boot: *//p" | head -1 | tr " " _)
 '
 probe() { vm_ssh "$PROBE" >"$LOGS/$1.probe" 2>&1; }
@@ -298,6 +322,31 @@ if wants net-sb; then
 		result FAIL net-sb "$ERR"
 	fi
 	vm_stop net-sb
+fi
+
+if wants select; then
+	log "step select: preselect a combination on the sealed firmware"
+	SEALED=(secure_boot=enabled* path_var=set usb_bootdev=1 "${COMMON[@]}")
+	# select-N NAME COMMAND-AFTER EXPECTATIONS...: boot sealed, check, run a command, power off
+	sel_boot() {
+		local name=$1 cmd=$2; shift 2
+		if vm_start "$name" "$STICK" --sealed; then
+			probe "$name"
+			expect "$name" "$@" "${SEALED[@]}"
+			[[ -z $cmd ]] || vm_ssh "$cmd" >>"$LOGS/select.log" 2>&1 || result FAIL "$name" "'$cmd' failed (see ${LOGS#"$REPO"/}/select.log)"
+		else
+			result FAIL "$name" "$ERR"
+		fi
+		vm_stop "$name"
+	}
+	if [[ -f $REPO/mkosi.test/sealed-vars.fd ]]; then
+		sel_boot select-default 'sudo safespace-select list && sudo safespace-select set docker' combination=base docker=no
+		sel_boot select-docker 'sudo safespace-select list && sudo safespace-select once base' combination=docker docker=yes
+		sel_boot select-once 'sudo safespace-select list' combination=base docker=no
+		sel_boot select-persistent 'sudo safespace-select clear' combination=docker docker=yes
+	else
+		result FAIL select "no sealed firmware variables (the step seal failed?)"
+	fi
 fi
 
 # --- report --------------------------------------------------------------------------------

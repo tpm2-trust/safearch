@@ -4,7 +4,7 @@
 # USB stick / SD card (./burn.sh) and over the network (./release.sh to the
 # distribution servers, NETBOOT.md).
 #
-#   sudo ./build.sh [--groups LIST] [--url BASE_URL]... [--workers N] [--debug]
+#   sudo ./build.sh [--groups LIST | --combined] [--url BASE_URL]... [--workers N] [--debug]
 #                   [--users FILE] [--output-root DIR] [MKOSI OPTIONS...]
 #
 #   ./build.sh list                 the builds: groups, built at, snapshot,
@@ -33,6 +33,12 @@
 #              remotedesktop: XFCE desktop over VNC; docker: Docker with its
 #              data disk. E.g. --groups base,RemoteDesktop,docker.
 #              See lib/groups.sh and mkosi.profiles/<group>/.
+#
+# --combined   every combination of combinations.conf in one run: each is built
+#              as with --groups, then one signed UKI is composed that names
+#              them all (lib/compose.sh); the build is
+#              mkosi.output/combined_<version>/. A machine boots "base" unless
+#              safespace-select preselects another (an EFI variable).
 #
 # --url BASE_URL  where a network-booted machine loads root.img and
 #              root.verity from: the distribution servers' share, e.g.
@@ -131,9 +137,10 @@ case ${1:-} in
 	-h | --help) usage; exit 0 ;;
 esac
 
+ORIG_ARGS=("$@")
 URLS=()
 NETROOT=()
-GROUP_LIST=base
+GROUP_LIST=base GROUPS_GIVEN=0 COMBINED=0 FIXED_VERSION=""
 USERS_FILE=users.conf
 OUTPUT_ROOT=mkosi.output
 WORKERS=""
@@ -143,8 +150,11 @@ while (($#)); do
 	case $1 in
 		--url) URLS+=("${2:?--url needs a base URL}"); shift 2 ;;
 		--url=*) URLS+=("${1#--url=}"); shift ;;
-		--groups) GROUP_LIST=${2:?--groups needs a comma-separated list}; shift 2 ;;
-		--groups=*) GROUP_LIST=${1#--groups=}; shift ;;
+		--groups) GROUP_LIST=${2:?--groups needs a comma-separated list}; GROUPS_GIVEN=1; shift 2 ;;
+		--groups=*) GROUP_LIST=${1#--groups=}; GROUPS_GIVEN=1; shift ;;
+		--combined) COMBINED=1; shift ;;
+		# Internal (--combined): the version of all combinations of one run.
+		--version) FIXED_VERSION=${2:?--version needs a version}; shift 2 ;;
 		--users) USERS_FILE=${2:?--users needs a file}; shift 2 ;;
 		--output-root) OUTPUT_ROOT=${2:?--output-root needs a directory}; shift 2 ;;
 		--workers) WORKERS=${2:?--workers needs a thread count}; shift 2 ;;
@@ -231,10 +241,68 @@ if [[ $VERB == build ]]; then
 	log "resources: $(nproc) CPUs, ${mem} GiB RAM available, ${out_free:-?} GiB free for builds, ${tmp_free:-?} GiB in /var/tmp"
 fi
 
+# --- --combined: build every combination, then compose ---------------------------
+if ((COMBINED)); then
+	((!GROUPS_GIVEN)) || die "--combined builds the combinations of combinations.conf: no --groups"
+	[[ $VERB == build ]] || die "--combined only builds (no mkosi verbs)"
+	# shellcheck source=lib/compose.sh
+	source "$HERE/lib/compose.sh"
+	combos_load "$HERE/combinations.conf"
+	VERSION=$("$HERE/mkosi.version")
+	SUFFIX=""
+	((DEBUG)) && SUFFIX=-debug
+	[[ -e $BUILDS_ROOT/combined_$VERSION$SUFFIX ]] && VERSION=$(date +%Y%m%d-%H%M%S)
+	PARTS=${OUTPUT_ROOT%/}/.parts-$VERSION$SUFFIX
+	# The parts of an earlier failed run (kept for a look at them) go now.
+	find "$BUILDS_ROOT" -mindepth 1 -maxdepth 1 -type d -name '.parts-*' -exec rm -rf -- {} + 2>/dev/null || true
+	sub=()
+	skip=0
+	for a in "${ORIG_ARGS[@]}"; do
+		((skip)) && { skip=0; continue; }
+		case $a in
+			--combined) ;;
+			--output-root | --version) skip=1 ;;
+			*) sub+=("$a") ;;
+		esac
+	done
+	log "combined build $VERSION$SUFFIX: ${COMBO_NAMES[*]}"
+	dirs=()
+	for i in "${!COMBO_NAMES[@]}"; do
+		log "--- combination ${COMBO_NAMES[i]} (groups ${COMBO_GROUPS[i]})"
+		"$HERE/build.sh" --groups "${COMBO_GROUPS[i]}" --version "$VERSION" --output-root "$PARTS" ${sub[@]+"${sub[@]}"} ||
+			die "the build of ${COMBO_NAMES[i]} failed (parts in $PARTS)"
+		dirs+=("$HERE/$PARTS/$(builds_id "${COMBO_GROUPS[i]}" "$VERSION$SUFFIX")")
+	done
+	# shellcheck source=lib/keys.sh
+	source "$HERE/lib/keys.sh"
+	summary=$(mktemp)
+	mkosi ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --json summary >"$summary" || { rm -f "$summary"; die "mkosi summary failed"; }
+	keys_load "$summary"
+	rm -f "$summary"
+	BUILD=combined_$VERSION$SUFFIX
+	OUTDIR=$(builds_dir "$BUILD")
+	log "composing $BUILD"
+	compose_build "$OUTDIR" "${dirs[@]}"
+	combos=""
+	for i in "${!COMBO_NAMES[@]}"; do combos+="${COMBO_NAMES[i]}:${COMBO_GROUPS[i]//,/+},"; done
+	git=(git -c safe.directory="$HERE" -C "$HERE")
+	builds_write_info "$OUTDIR" build="$BUILD" version="$VERSION$SUFFIX" groups=combined combinations="${combos%,}" \
+		started="$(builds_info "${dirs[0]}" started)" finished="$(date -Is)" snapshot="$SNAPSHOT" mirror="${MIRROR:-default}" \
+		commit="$("${git[@]}" rev-parse --short HEAD 2>/dev/null || echo none)" \
+		uncommitted_changes="$([[ -z $("${git[@]}" status --porcelain 2>/dev/null) ]] && echo no || echo yes)" \
+		signer="$(keys_fingerprint "$KEYS_SB_CERT")" builder="$(uname -n)" users="$USERS_FILE"
+	rm -rf -- "${HERE:?}/${PARTS:?}"
+	[[ -n ${SUDO_UID:-} ]] && chown -R "$SUDO_UID:$SUDO_GID" "$OUTDIR"
+	log "Build $BUILD in ${OUTDIR#"$HERE"/} (${COMBO_NAMES[*]})"
+	log "Next: ./release.sh --build $BUILD, sudo ./burn.sh $BUILD /dev/sdX"
+	exit 0
+fi
+
 # The version goes into the output names and the release; fixed here so that
 # mkosi does not run ./mkosi.version twice. A second build of the same group
 # set in the same minute gets the seconds too.
-VERSION=$("$HERE/mkosi.version")
+VERSION=${FIXED_VERSION:-$("$HERE/mkosi.version")}
+[[ $VERSION =~ ^[0-9]{8}-[0-9]{4,6}$ ]] || die "invalid version '$VERSION'"
 GROUPS_CSV=$(IFS=,; echo "${SAFESPACE_GROUPS[*]}")
 SUFFIX=""
 ((DEBUG)) && SUFFIX=-debug

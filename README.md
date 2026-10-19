@@ -209,6 +209,54 @@ dmidecode, pciutils, usbutils, lshw, iperf3, tcpdump, kexec-tools) and marks the
 past Secure Boot, because the kernel does not enforce lockdown (see "Known open points"):
 do not release debug builds to production servers.
 
+## Combinations: several group sets in one build (proof of concept)
+
+`sudo ./build.sh --combined` builds every combination of `combinations.conf`
+(`<name>=<groups>`, the first must be `base=base`; shipped: `base` and `docker=base,docker`)
+in one run and composes them into one build, `mkosi.output/combined_<version>/`:
+
+- one signed UKI (`boot.efi`): kernel, initrd and microcode of `base`, built with ukify from
+  the image's own systemd-stub, signed with the db key and with signed expected PCRs. Its
+  command line names every combination with its root hash, `safespace.root.<name>=<hash>`,
+  instead of `roothash=`;
+- per combination `root-<name>.img`, `root-<name>.verity`, `roothash-<name>`,
+  `manifest-<name>.json`; one `layout.sfdisk` with the ESP and a root/verity pair per
+  combination (partitions `root-<name>`, `root-<name>-verity`, UUIDs from each root hash).
+
+Every combination is a complete root, built and verified like a single build; nothing is
+layered at runtime. `release.sh --groups combined` releases the newest one (`COMBINATIONS=`
+in `release`), the server checks every root against its signed hash, `burn.sh` writes all
+pairs onto the stick. Over the network a machine downloads only the root it boots.
+
+**Which root boots** is decided in the initrd (`mkosi.initrd.conf/.../select`), first match:
+
+1. `safespace.select=<name>` on the command line
+2. EFI variable `SafespaceSelectOnce-8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34`: this boot only,
+   the initrd deletes it before opening the root
+3. EFI variable `SafespaceSelect-8a3e6c1d-…`: the persistent preselection
+4. `base`
+
+On the machine (root):
+
+```sh
+safespace-select              # combinations of this build, the booted one, the preselection
+safespace-select set docker   # boot docker from the next boot on
+safespace-select once base    # next boot only
+safespace-select clear        # back to base
+```
+
+So a machine is sealed once on `base` (`safespace-seal`), then preselected. The variable only
+**names** a combination; its root hash always comes from the signed command line, so
+whoever can write the variable (root on the machine, or the firmware setup without a
+password) can choose between the signed roots, never boot an unsigned one. An unknown name
+stops the boot with a message instead of falling back silently. The choice is not measured
+into a PCR yet (Open decisions).
+
+Tested by `tests/run.sh combined` (compose with ukify, release check, tampering, stick,
+selection order, netroot downloading only the selected root) and `tests/vm.sh --combined`
+(step `select` on the sealed firmware: base → `set docker` → docker → `once base` → base →
+docker).
+
 ## Secure Boot keys
 
 Every image is signed. `build.sh` finds the keys through **sbctl**, as a key set of PK, KEK
@@ -1088,6 +1136,10 @@ sectors and a CD boot header; both are fixed (`-S512`, `ElTorito=no`).
      certificate) or a signing service.
 
 ## Known open points
+
+- Combinations (`--combined`): the selected combination is not measured into a PCR. PCR 11
+  holds the UKI's signed expected values and must not be extended; a free PCR or an NvPCR
+  needs its own design. A single-root build per combination remains possible (`--groups`).
 
 - **The single build on real hardware:** booted in QEMU from a stick and over UEFI HTTP
   (also sealed and with enforced Secure Boot), not yet on real hardware: the T450s over PXE

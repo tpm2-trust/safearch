@@ -145,6 +145,12 @@ old file. A machine that got the old `boot.efi` and then asks for the root image
 firmware loads the new `boot.efi`. If the image is refused although the server still claims
 this UKI's release, that is a real error and the boot stops (no reboot loop).
 
+**Combined builds** (`build.sh --combined`, README "Combinations"): the share holds
+`root-<name>.img`, `root-<name>.verity` and `roothash-<name>` per combination instead of the
+single root. The initrd picks the combination (`safespace.select=`, the EFI variables set by
+`safespace-select`, else `base`) and downloads only that root; the replaced-release check
+compares `roothash-<name>`.
+
 ## The distribution server
 
 A distribution server needs two things for network boot: an HTTP server for the files and a

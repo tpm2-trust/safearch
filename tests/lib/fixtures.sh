@@ -24,13 +24,22 @@ fx_root() {
 }
 
 # fx_uki OUT CMDLINE KEY CERT: a signed PE (systemd-stub) carrying CMDLINE
-# as .cmdline, which is all the release checks look at.
+# as .cmdline (all the release checks look at), and small dummy .linux,
+# .initrd, .ucode, .osrel, .uname (what lib/compose.sh takes from a UKI).
 fx_uki() {
-	local out=$1 tmp
+	local out=$1 tmp s vma=0x30000 args=()
 	tmp=$(mktemp -d)
 	printf '%s' "$2" >"$tmp/cmdline"
-	objcopy --add-section .cmdline="$tmp/cmdline" --change-section-vma .cmdline=0x30000 \
-		--set-section-flags .cmdline=data,readonly /usr/lib/systemd/boot/efi/linuxx64.efi.stub "$tmp/uki.efi" 2>/dev/null
+	head -c 4096 /dev/urandom >"$tmp/linux"
+	head -c 2048 /dev/urandom >"$tmp/initrd"
+	head -c 512 /dev/urandom >"$tmp/ucode"
+	printf 'ID=arch\nNAME="Arch Linux"\n' >"$tmp/osrel"
+	printf '6.0.0-fixture' >"$tmp/uname"
+	for s in cmdline linux initrd ucode osrel uname; do
+		args+=(--add-section ".$s=$tmp/$s" --change-section-vma ".$s=$vma" --set-section-flags ".$s=data,readonly")
+		vma=$(printf '0x%x' $((vma + 0x2000)))
+	done
+	objcopy "${args[@]}" /usr/lib/systemd/boot/efi/linuxx64.efi.stub "$tmp/uki.efi" 2>/dev/null
 	sbsign --key "$3" --cert "$4" --output "$out" "$tmp/uki.efi" >/dev/null 2>&1
 	rm -rf "$tmp"
 }
@@ -93,7 +102,7 @@ fx_build() {
 	fx_uki "$b.efi" "$cmdline" "$kd/db/db.key" "$kd/db/db.pem"
 	cp "$tmp/root.img" "$b.root.raw"
 	cp "$tmp/root.verity" "$b.root-verity.raw"
-	echo "$hash" >"$b.roothash"
+	printf %s "$hash" >"$b.roothash" # as mkosi writes it: no newline
 	fx_manifest "$b.manifest" "${@:-linux=1}"
 	{
 		sbsign --key "$kd/db/db.key" --cert "$kd/db/db.pem" --output "$tmp/boot.efi" \
@@ -114,6 +123,7 @@ fx_build() {
 		dd if="$tmp/root.verity" of="$b.raw" bs=1M seek=$(((18432 + rs) * 512)) oflag=seek_bytes conv=notrunc status=none
 		ln -sf "$(basename "$b.raw")" "$b"
 	}
+	cp /usr/lib/systemd/boot/efi/linuxx64.efi.stub "$b.systemd-stub"
 	echo initrd >"$d/initrd.cpio.zst"
 	ln -sf initrd.cpio.zst "$d/initrd"
 	rm -rf "$tmp"

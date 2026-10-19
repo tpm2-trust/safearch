@@ -11,7 +11,8 @@
 #   --build BUILD   the build to release, as ./build.sh list shows it
 #                   (e.g. base-remotedesktop_20261019-0930). Releasing an older
 #                   build again is how a release is rolled back.
-#   --groups LIST   the newest build with exactly this group set
+#   --groups LIST   the newest build with exactly this group set ("combined":
+#                   the newest build.sh --combined build)
 #   (neither)       the newest build, whatever its groups
 #   --builds DIR    where the builds are (default: mkosi.output; tests/vm.sh
 #                   keeps its test builds apart)
@@ -29,6 +30,9 @@
 #   layout.sfdisk, manifest.json; cmdline (the UKI's signed command line,
 #   readable), release (VERSION, BUILD, GROUPS, BUILT, SNAPSHOT, COMMIT,
 #   PACKAGES), SHA256SUMS
+#   a combined build (build.sh --combined): root-<name>.img, root-<name>.verity,
+#   roothash-<name>, manifest-<name>.json per combination instead of the single
+#   root, and COMBINATIONS= in release
 # It is checked here exactly as a server checks it (lib/verify.sh): Secure
 # Boot signatures against the exported db.pem, root image against the signed
 # root hash, the stick's partition table. test-vm.sh --netboot serves
@@ -84,8 +88,12 @@ DB=$HERE/mkosi.extra/usr/share/safespace/secureboot/db.pem
 
 [[ -z $BUILD || -z $WANT_GROUPS ]] || die "--build or --groups, not both"
 if [[ -n $WANT_GROUPS ]]; then
-	groups_parse "$WANT_GROUPS"
-	WANT_GROUPS=$(IFS=,; echo "${SAFESPACE_GROUPS[*]}")
+	if [[ ${WANT_GROUPS,,} == combined ]]; then
+		WANT_GROUPS=combined
+	else
+		groups_parse "$WANT_GROUPS"
+		WANT_GROUPS=$(IFS=,; echo "${SAFESPACE_GROUPS[*]}")
+	fi
 	BUILD=$(builds_newest "$WANT_GROUPS")
 	[[ -n $BUILD ]] || die "no build with groups $WANT_GROUPS (./build.sh list)"
 elif [[ -n $BUILD ]]; then
@@ -112,7 +120,16 @@ DEST=$STAGE_DIR
 [[ $DEST != / && $DEST != "$HERE" ]] || die "--stage $DEST: not a staging directory"
 rm -rf "$DEST"
 mkdir -p "$DEST"
-for f in boot.efi root.img root.verity roothash systemd-boot.efi layout.sfdisk manifest.json; do
+# A combined build (build.sh --combined) has one root per combination.
+COMBOS=$(builds_info "$DIR" combinations | tr ',' '\n' | cut -d: -f1 | tr '\n' ',')
+COMBOS=${COMBOS%,}
+PARTS=(boot.efi systemd-boot.efi layout.sfdisk)
+if [[ -n $COMBOS ]]; then
+	for n in ${COMBOS//,/ }; do PARTS+=("root-$n.img" "root-$n.verity" "roothash-$n" "manifest-$n.json"); done
+else
+	PARTS+=(root.img root.verity roothash manifest.json)
+fi
+for f in "${PARTS[@]}"; do
 	[[ -f $DIR/$f ]] || die "$DIR/$f missing (a build from before the parts layout? rebuild)"
 	ln "$DIR/$f" "$DEST/$f" 2>/dev/null || cp --reflink=auto "$DIR/$f" "$DEST/$f"
 done
@@ -126,6 +143,7 @@ echo >>"$DEST/cmdline"
 	echo "SNAPSHOT=$(builds_info "$DIR" snapshot)"
 	echo "COMMIT=$(builds_info "$DIR" commit)$([[ $(builds_info "$DIR" uncommitted_changes) == yes ]] && echo +uncommitted)"
 	echo "PACKAGES=$(builds_info "$DIR" packages)"
+	[[ -z $COMBOS ]] || echo "COMBINATIONS=$COMBOS"
 } >"$DEST/release"
 (cd "$DEST" && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | sort | xargs sha256sum >SHA256SUMS)
 chmod 0644 "$DEST"/{cmdline,release,SHA256SUMS}

@@ -7,7 +7,8 @@
 #
 #   --keep   keep the temporary directory (printed at the end)
 #   TEST     run only these (default: all): syntax groups keys builds
-#            release server stick upload netroot initrd dnsmasq nginx units
+#            release server stick upload netroot initrd combined dnsmasq nginx
+#            units
 #
 # Needs the build host's tools (README.md, "Build host"): sbsigntools,
 # efitools, sbctl, cryptsetup, zstd, mtools, dosfstools, util-linux, binutils,
@@ -113,7 +114,7 @@ if wanted syntax; then
 		head -1 "$f" | grep -q '^#!/bin/sh' && check "sh -n $f" sh -n "$f" || check "bash -n ${f#"$REPO"/}" bash -n "$f"
 	done < <(cd "$REPO" && find . -path ./mkosi.output -prune -o -path ./mkosi.cache -prune -o -path ./.git -prune -o \
 		-type f \( -name '*.sh' -o -name 'mkosi.postinst' -o -name 'mkosi.finalize' -o -name 'mkosi.postoutput' \
-		-o -name netroot -o -name usb-bootdev -o -name safespace-seal -o -name safespace-netboot -o -name load-docker-images \) -print |
+		-o -name netroot -o -name usb-bootdev -o -name select -o -name safespace-seal -o -name safespace-select -o -name safespace-netboot -o -name load-docker-images \) -print |
 		sed "s|^\.|$REPO|")
 fi
 
@@ -166,7 +167,7 @@ fi
 # --- builds on the build host ----------------------------------------------------------------
 if wanted builds && fixtures; then
 	section builds
-	check "finalize: a build keeps exactly its parts, no disk image, no initrd copy" bash -c '[[ $(LC_ALL=C ls "$1" | tr "\n" " ") == "boot.efi build.json layout.sfdisk manifest.json root.img root.verity roothash systemd-boot.efi " ]]' _ "$B"
+	check "finalize: a build keeps exactly its parts, no disk image, no initrd copy" bash -c '[[ $(LC_ALL=C ls "$1" | tr "\n" " ") == "boot.efi build.json layout.sfdisk manifest.json root.img root.verity roothash systemd-boot.efi systemd-stub.efi " ]]' _ "$B"
 	BS=$CO/build.sh
 	"$BS" list >"$W/list.txt" 2>&1
 	check "list: every build, one group set after the other" bash -c '[[ $(grep -Eo "^[a-z-]+_[0-9-]+" "$1" | tr "\n" "|") == "base-remotedesktop_20990101-0000|base_20990101-0100|" ]]' _ "$W/list.txt"
@@ -352,12 +353,134 @@ if wanted initrd; then
 		zstd -dc "$W/initrd.img" 2>/dev/null | cpio -t 2>/dev/null >"$W/initrd.list" || true
 		IS=$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace
 		for f in usb-bootdev netroot; do
-			missing=$(python3 -I "$REPO/tests/lib/shcmds.py" "$IS/$f" | while IFS= read -r c; do
+			# with select, which both source
+			cat "$IS/select" "$IS/$f" >"$W/initrd.$f"
+			missing=$(python3 -I "$REPO/tests/lib/shcmds.py" "$W/initrd.$f" | while IFS= read -r c; do
 				if [[ $c == /* ]]; then grep -qxF "${c#/}" "$W/initrd.list" || echo "$c"
 				else grep -qE "^(usr/)?s?bin/$c$" "$W/initrd.list" || echo "$c"; fi
 			done | tr '\n' ' ')
-			check "$f calls only programs in the initrd ($(basename "$(dirname "$uki")"))${missing:+: missing $missing}" test -z "$missing"
+			check "$f (+ select) calls only programs in the initrd ($(basename "$(dirname "$uki")"))${missing:+: missing $missing}" test -z "$missing"
 		done
+	fi
+fi
+
+# --- combined: several group sets in one build, selected at boot -------------------------
+# Two fixture builds with the same kernel, composed as build.sh --combined does
+# (lib/compose.sh, real ukify with throwaway keys), released, written to a stick,
+# and the initrd's choice of the root (select, efivars in a directory).
+if wanted combined && fixtures && need ukify openssl; then
+	section combined
+	t_combos() { # CONF EXPECTED
+		(die() { exit 1; }; source "$REPO/lib/groups.sh"; source "$REPO/lib/compose.sh"
+		printf '%s\n' "$1" >"$W/combos.conf"; combos_load "$W/combos.conf" && [[ "${COMBO_NAMES[*]}|${COMBO_GROUPS[*]}" == "$2" ]])
+	}
+	check "combinations.conf of the repository" t_combos "$(cat "$REPO/combinations.conf")" "base docker|base base,docker"
+	refuse "base=base must come first" t_combos $'docker=base,docker\nbase=base' ""
+	refuse "a name twice" t_combos $'base=base\nx=docker\nx=docker' ""
+	refuse "an invalid name" t_combos $'base=base\nX;y=docker' ""
+	refuse "an unknown group" t_combos $'base=base\nx=foo' ""
+
+	CV=20990102-0000 PCO=$W/cparts CCO=$W/ccombined
+	fx_checkout "$PCO" "$REPO"
+	fx_checkout "$CCO" "$REPO"
+	cp "$KD/db/db.pem" "$CCO/mkosi.extra/usr/share/safespace/secureboot/db.pem"
+	CP=$(port)
+	fx_build "$PCO" "$CV" "$KD" base "http://127.0.0.1:$CP/" linux=6.2 vim=9.0 &&
+		fx_build "$PCO" "$CV" "$KD" base,docker "http://127.0.0.1:$CP/" linux=6.2 vim=9.0 docker=28 ||
+		fail "building the combination fixtures"
+	openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=pcr/ -keyout "$W/pcr.key" -out "$W/pcr.crt" 2>/dev/null
+	t_compose() ( # under build.sh's shell options
+		set -Eeuo pipefail
+		die() { echo "DIE: $*" >&2; exit 1; }
+		HERE=$CCO; source "$CCO/lib/groups.sh"; source "$CCO/lib/builds.sh"; source "$CCO/lib/compose.sh"
+		combos_load "$REPO/combinations.conf"
+		KEYS_SB_DIR=$KD KEYS_PCR_KEY=$W/pcr.key KEYS_PCR_CERT=$W/pcr.crt
+		compose_build "$CCO/mkosi.output/combined_$CV" "$PCO/mkosi.output/base_$CV" "$PCO/mkosi.output/base-docker_$CV"
+		builds_write_info "$CCO/mkosi.output/combined_$CV" build="combined_$CV" version="$CV" groups=combined \
+				combinations=base:base,docker:base+docker started=2099-01-02T00:00:00+00:00 finished=2099-01-02T00:00:00+00:00 \
+				snapshot=2099/01/02 mirror=default commit=abc1234 uncommitted_changes=no signer=test builder=test
+	)
+	C=$CCO/mkosi.output/combined_$CV
+	# Not inside check: bash ignores set -e in a condition.
+	t_compose >"$W/compose.log" 2>&1
+	check "compose: one UKI for base and docker (ukify, the image's stub)" test $? -eq 0
+	check "... signed by the db key" sbverify --cert "$KD/db/db.pem" "$C/boot.efi"
+	ccmd=$(objcopy -O binary --only-section=.cmdline "$C/boot.efi" /dev/stdout 2>/dev/null | tr -d '\0')
+	hb=$(cat "$C/roothash-base" 2>/dev/null) hd=$(cat "$C/roothash-docker" 2>/dev/null)
+	check "... its command line names both roots, without roothash=" \
+		bash -c '[[ " $1 " == *" safespace.root.base=$2 safespace.root.docker=$3 "* && " $1 " != *" roothash="* && " $1 " == *" safespace.netroot="* ]]' _ "$ccmd" "$hb" "$hd"
+	check "... with signed expected PCRs (.pcrsig)" bash -c 'objdump -h "$1" | grep -q "\.pcrsig"' _ "$C/boot.efi"
+	check "... the kernel and initrd of base" bash -c 'cmp -s <(objcopy -O binary --only-section=.initrd "$1" /dev/stdout) <(objcopy -O binary --only-section=.initrd "$2" /dev/stdout)' _ "$C/boot.efi" "$PCO/mkosi.output/base_$CV/boot.efi"
+	CS=$W/cstage
+	check "release.sh --groups combined stages and verifies it" "$CCO/release.sh" --groups combined --stage "$CS"
+	check "... release names the combinations" grep -qx COMBINATIONS=base,docker "$CS/release"
+	check "... all parts, no single root" bash -c 'cd "$1" && ls root-base.img root-base.verity roothash-base manifest-base.json root-docker.img root-docker.verity roothash-docker manifest-docker.json >/dev/null && [[ ! -e root.img ]]' _ "$CS"
+	t_verify() (source "$REPO/lib/verify.sh"; verify_release "$1" "$KD/db/db.pem" >/dev/null 2>&1)
+	rm -rf "$W/ctamper" && cp -a "$CS" "$W/ctamper"
+	printf '\xff' | dd of="$W/ctamper/root-docker.img" bs=1 seek=4096 conv=notrunc status=none
+	fx_resum "$W/ctamper"
+	refuse "a changed root-docker.img (sums recomputed) is refused" t_verify "$W/ctamper"
+	rm -rf "$W/ctamper" && cp -a "$CS" "$W/ctamper"
+	sed -i 's/^COMBINATIONS=.*/COMBINATIONS=base/' "$W/ctamper/release"
+	fx_resum "$W/ctamper"
+	refuse "COMBINATIONS= that differs from the signed command line is refused" t_verify "$W/ctamper"
+
+	if need mkfs.fat mmd mcopy sfdisk; then
+		check "burn.sh --image from the combined release" "$CCO/burn.sh" "$CS" --image "$W/cstick.raw"
+		t_cstick() { # IMAGE: every root and hash tree in its partition, named and verified
+			local img=$1 f start size n
+			[[ $(sfdisk -d "$img" | grep -c 'type=') == 5 ]] || { echo "not 5 partitions"; return 1; }
+			for n in base docker; do
+				sfdisk -d "$img" | grep -q "name=\"root-$n\"" || { echo "no root-$n"; return 1; }
+			done
+			while read -r f start size; do
+				dd if="$img" of="$W/cst.$f" bs=512 skip="$start" count="$size" status=none
+			done < <(awk -F', *' '/name="root-/ { for (i = 1; i <= NF; i++) { split($i, kv, "="); k = kv[1]; v = kv[2]; gsub(/[ "]/, "", k); gsub(/[ "]/, "", v); if (k ~ /start$/) s = v; if (k == "size") z = v; if (k == "name") nm = v }
+				f = nm ~ /-verity$/ ? substr(nm, 1, length(nm) - 7) ".verity" : nm ".img"; print f, s, z }' <(sfdisk -d "$img"))
+			for n in base docker; do
+				veritysetup verify "$W/cst.root-$n.img" "$W/cst.root-$n.verity" "$(cat "$CS/roothash-$n")" || { echo "root-$n does not verify"; return 1; }
+			done
+		}
+		check "... both roots on the stick, each verifying against its signed hash" t_cstick "$W/cstick.raw"
+		CSP=$CP
+		serve "$CS" "$CSP"
+		check "burn.sh --image from a server URL (every root streamed, sums checked)" "$CCO/burn.sh" "http://127.0.0.1:$CSP/" --image "$W/cstick2.raw"
+		check "... both roots on it too" t_cstick "$W/cstick2.raw"
+	fi
+
+	# The initrd's choice of the root.
+	SEL=$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/select
+	SG=8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34 EV=$W/efivars
+	H1=$(printf '1%.0s' {1..64}) H2=$(printf '2%.0s' {1..64})
+	CL="ro safespace.root.base=$H1 safespace.root.docker=$H2"
+	t_select() { # CMDLINE ONCE PERSISTENT EXPECTED("name:hash")
+		rm -rf "$EV" && mkdir -p "$EV"
+		[[ -z $2 ]] || printf '\x07\x00\x00\x00%s' "$2" >"$EV/SafespaceSelectOnce-$SG"
+		[[ -z $3 ]] || printf '\x07\x00\x00\x00%s' "$3" >"$EV/SafespaceSelect-$SG"
+		local got
+		got=$(cmdline=$1 SAFESPACE_EFIVARS=$EV sh -c 'msg() { :; }; . "$0"; select_root || exit 1; echo "$SELECT_NAME:$SELECT_HASH"' "$SEL") || return 1
+		[[ $got == "$4" ]] || { echo "got $got"; return 1; }
+	}
+	check "select: nothing set boots base" t_select "$CL" "" "" "base:$H1"
+	check "select: SafespaceSelect=docker" t_select "$CL" "" docker "docker:$H2"
+	check "select: SafespaceSelectOnce wins over SafespaceSelect" t_select "$CL" base docker "base:$H1"
+	check "... and is deleted" test ! -e "$EV/SafespaceSelectOnce-$SG"
+	check "select: safespace.select= on the command line wins" t_select "$CL safespace.select=docker" base "" "docker:$H2"
+	refuse "select: an unknown name stops the boot" t_select "$CL" "" nope ""
+	check "select: a variable that is no name is ignored" t_select "$CL" "" 'x;rm' "base:$H1"
+	check "select: a single build uses roothash=" t_select "ro roothash=$H1" "" docker ":$H1"
+
+	# netroot loads the selected combination's files.
+	if [[ -n ${S:-} && -d ${S:-/nonexistent} ]] && [[ -n ${CSP:-} ]]; then
+		NR=$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/netroot
+		rm -rf "$EV" && mkdir -p "$EV" && printf '\x07\x00\x00\x00docker' >"$EV/SafespaceSelect-$SG"
+		rm -f "$W/veritysetup.calls" "$W/systemctl.calls" && : >"$W/http-$CSP.log"
+		NETROOT_CMDLINE="$ccmd" NETROOT_DIR=$W/cnr SAFESPACE_EFIVARS=$EV PATH="$S:$PATH" sh "$NR" >/dev/null 2>&1 || true
+		check "netroot: SafespaceSelect=docker opens docker's root with its signed hash" grep -q "$hd" "$W/veritysetup.calls"
+		check "... downloads root-docker.img, not base's" bash -c 'grep -q "GET /root-docker.img" "$1" && ! grep -q "GET /root-base.img" "$1"' _ "$W/http-$CSP.log"
+		check "... no reboot" test ! -e "$W/systemctl.calls"
+	else
+		skip "netroot with a combination: needs the netroot and stick sections"
 	fi
 fi
 

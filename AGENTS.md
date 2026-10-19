@@ -79,7 +79,8 @@ the network-boot reference. Arch Linux only, everywhere.
 |---|---|
 | build host (has the keys) | `build.sh` (entry point), `release.sh`, `fetch-images.sh`, `update-snapshot.sh`, `burn.sh`, `diagnose.sh`, `test-vm.sh`, `hwtest-image.sh` |
 | image configuration | `mkosi.conf` (the image, both boot paths), `mkosi.profiles/{remotedesktop,docker}/` (groups), `mkosi.profiles/debug/` (`--debug`), `mkosi.repart/`, `mkosi.extra/`, `mkosi.postinst`, `mkosi.finalize`, `mkosi.postoutput` |
-| initrd | `mkosi.initrd.conf/`: `usb-bootdev` (root from the stick) and `netroot` (root over HTTP), chosen at boot by `LoaderDevicePartUUID` |
+| initrd | `mkosi.initrd.conf/`: `usb-bootdev` (root from the stick) and `netroot` (root over HTTP), chosen at boot by `LoaderDevicePartUUID`; `select` (sourced by both: which root of a combined build) |
+| combinations | `combinations.conf`, `lib/compose.sh` (`build.sh --combined`: one UKI for several roots), `mkosi.extra/usr/local/sbin/safespace-select` |
 | distribution server | `server/` (`setup.sh`, `safespace-netboot`, units, nginx site, `server.conf.example`) |
 | shared shell code | `lib/repos.sh`, `lib/groups.sh`, `lib/keys.sh`, `lib/builds.sh` (the builds in `mkosi.output/<groups>_<version>/`: their parts, list, select, prune), `lib/stick.sh` (a stick assembled from the parts), `lib/verify.sh` (also installed on the servers) |
 | tests | `tests/run.sh` (no root), `tests/vm.sh` (integration in QEMU), `tests/lib/` |
@@ -102,6 +103,8 @@ the network-boot reference. Arch Linux only, everywhere.
 - **One release per server**, fixed file names; the initrd's reaction to a replaced release
   must not turn into a reboot loop.
 - **Groups are the only difference between images.**
+- **A selection never supplies a root hash.** In a combined build the EFI variables /
+  `safespace.select=` only name a combination; its hash comes from the signed command line.
 - **Builds are kept and shipped as parts** (UKI, root, verity, root hash, systemd-boot,
   partition table); no disk image is stored or shipped.
 

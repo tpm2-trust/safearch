@@ -19,6 +19,8 @@
 #   roothash      the release's root hash
 #   root.img      the root partition (erofs, dm-verity data)
 #   root.verity   its dm-verity hash tree
+# For a combined build (several combinations, select next to this script):
+# roothash-<name>, root-<name>.img, root-<name>.verity of the selected one.
 # A server only ever holds the newest release. If no server has this UKI's
 # release any more (another roothash), a newer one was published after the
 # firmware loaded this UKI: reboot, and the firmware loads the new boot.efi.
@@ -46,8 +48,16 @@ args() { printf '%s\n' "$cmdline" | tr ' ' '\n' | sed -n "s/^$1=//p"; }
 
 urls=$(args safespace.netroot)
 [ -n "$urls" ] || { msg "no safespace.netroot= on the kernel command line, nothing to do"; exit 0; }
-roothash=$(args roothash | tail -n 1)
+# Which root: a single build's roothash=, or the selected combination's.
+. "${0%/*}/select"
+select_root || die "no root to boot"
+roothash=$SELECT_HASH
 [ -n "$roothash" ] || die "no roothash= on the kernel command line"
+if [ -n "$SELECT_NAME" ]; then
+	F_IMG=root-$SELECT_NAME.img F_VERITY=root-$SELECT_NAME.verity F_HASH=roothash-$SELECT_NAME
+else
+	F_IMG=root.img F_VERITY=root.verity F_HASH=roothash
+fi
 
 modprobe -a loop dm-verity erofs 2>/dev/null
 
@@ -104,7 +114,7 @@ cleanup() {
 # The release this server holds: 0 = this UKI's, 1 = another one (newer),
 # 2 = unknown (no roothash served, or not reachable).
 served_release() { # base url
-	served=$(curl -fsS --retry 2 --max-time 20 "$1/roothash" 2>/dev/null | tr -d '[:space:]')
+	served=$(curl -fsS --retry 2 --max-time 20 "$1/$F_HASH" 2>/dev/null | tr -d '[:space:]')
 	[ -n "$served" ] || return 2
 	[ "$served" = "$roothash" ] && return 0
 	return 1
@@ -127,13 +137,13 @@ try() { # base url (without trailing slash)
 	# Reserve RAM for both images before downloading: the root image stays in
 	# this tmpfs for as long as the machine runs, because it *is* the root
 	# filesystem (erofs, decompressed on read).
-	isize=$(size_of "$base/root.img")
-	vsize=$(size_of "$base/root.verity")
+	isize=$(size_of "$base/$F_IMG")
+	vsize=$(size_of "$base/$F_VERITY")
 	if [ -n "$isize" ] && [ -n "$vsize" ]; then
 		need_kb=$(((isize + vsize) / 1024 + 262144))
 		avail_kb=$(sed -n 's/^MemAvailable:[[:space:]]*\([0-9][0-9]*\) kB$/\1/p' /proc/meminfo)
 		[ -n "$avail_kb" ] || avail_kb=0
-		msg "root.img $((isize / 1048576)) MiB + root.verity $((vsize / 1048576)) MiB, $((avail_kb / 1024)) MiB RAM free"
+		msg "$F_IMG $((isize / 1048576)) MiB + $F_VERITY $((vsize / 1048576)) MiB, $((avail_kb / 1024)) MiB RAM free"
 		if [ "$avail_kb" -gt 0 ] && [ "$avail_kb" -lt "$need_kb" ]; then
 			msg "not enough RAM: need $((need_kb / 1024)) MiB free, have $((avail_kb / 1024)) MiB"
 			return 1
@@ -148,8 +158,8 @@ try() { # base url (without trailing slash)
 	mount -t tmpfs -o "size=${tmpfs_size:-${tmpfs_size_opt}},mode=0700" netroot "$DIR" ||
 		{ msg "cannot mount the tmpfs for the images"; return 1; }
 
-	get "$base/root.verity" "$DIR/root.verity" || return 1
-	get "$base/root.img" "$DIR/root.img" || return 1
+	get "$base/$F_VERITY" "$DIR/root.verity" || return 1
+	get "$base/$F_IMG" "$DIR/root.img" || return 1
 
 	data=$(losetup -f --show -r "$DIR/root.img") || { msg "losetup for root.img failed"; return 1; }
 	hash=$(losetup -f --show -r "$DIR/root.verity") || { msg "losetup for root.verity failed"; return 1; }
