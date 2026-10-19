@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
 # Build one of the two safespace-arch variants with mkosi.
 #
-#   sudo ./build.sh usb     [--workers N] [--debug] [MKOSI OPTIONS...]
-#   sudo ./build.sh network [--url BASE_URL]... [--workers N] [--debug] [MKOSI OPTIONS...]
+#   sudo ./build.sh usb     [--groups LIST] [--workers N] [--debug] [MKOSI OPTIONS...]
+#   sudo ./build.sh network [--groups LIST] [--url BASE_URL]... [--workers N] [--debug] [MKOSI OPTIONS...]
 #
 #   usb      a bootable USB stick / SD card: ESP with signed systemd-boot and
 #            UKI, erofs root and its dm-verity hash tree on the medium.
 #            Write it with ./burn.sh, check it with ./diagnose.sh.
 #   network  UEFI HTTP (or PXE/TFTP) netboot: the signed UKI plus the root
 #            image and its hash tree as separate files, to be published with
-#            ./netboot-export.sh. See NETBOOT.md.
+#            ./release.sh. See NETBOOT.md.
 #
-# The network variant needs the base URL of the netboot tree on the server.
-# The build appends its own image version to it, e.g.
-#   --url http://10.0.0.1/safespace/  ->  http://10.0.0.1/safespace/20261016-1830/
+# --groups LIST  package groups, comma-separated, case-insensitive (default:
+#              base). base: the base system only (always included);
+#              remotedesktop: XFCE desktop over VNC; docker: Docker with its
+#              data disk. E.g. --groups base,RemoteDesktop,docker.
+#              See lib/groups.sh and mkosi.profiles/<group>/.
+#
+# The network variant needs the base URL of the network releases on the
+# distribution server. The build appends its own image version to it, e.g.
+#   --url http://10.0.0.1/safespace/network/  ->  http://10.0.0.1/safespace/network/20261016-1830/
 # so a UKI always loads the root image it was signed with. Give --url more
 # than once for failover (tried in order), or put it in netboot.conf
 # (NETROOT_URL=, see netboot.conf.example) and leave the option out.
@@ -34,6 +40,7 @@
 #
 # Everything else after the variant is passed to mkosi unchanged, e.g.
 #   sudo ./build.sh usb -f          force a rebuild of unchanged packages
+#   sudo ./build.sh usb --groups base,remotedesktop
 #   sudo ./build.sh network summary show the resolved configuration
 #
 # Building needs root, because the UKI is signed with the sbctl db key in
@@ -60,6 +67,7 @@ esac
 
 URLS=()
 NETROOT=()
+GROUP_LIST=base
 WORKERS=""
 DEBUG=0
 MKOSI_ARGS=()
@@ -67,6 +75,8 @@ while (($#)); do
 	case $1 in
 		--url) URLS+=("${2:?--url needs a base URL}"); shift 2 ;;
 		--url=*) URLS+=("${1#--url=}"); shift ;;
+		--groups) GROUP_LIST=${2:?--groups needs a comma-separated list}; shift 2 ;;
+		--groups=*) GROUP_LIST=${1#--groups=}; shift ;;
 		--workers) WORKERS=${2:?--workers needs a thread count}; shift 2 ;;
 		--workers=*) WORKERS=${1#--workers=}; shift ;;
 		--debug) DEBUG=1; shift ;;
@@ -79,6 +89,11 @@ done
 [[ -z $WORKERS || $WORKERS =~ ^[1-9][0-9]*$ ]] || die "--workers needs a thread count >= 1, got '$WORKERS'"
 
 command -v mkosi >/dev/null || die "mkosi not found (pacman -S mkosi)"
+
+# shellcheck source=lib/groups.sh
+source "$HERE/lib/groups.sh"
+groups_parse "$GROUP_LIST"
+mapfile -t GROUP_PROFILES < <(groups_profiles)
 
 # shellcheck source=lib/repos.sh
 source "$HERE/lib/repos.sh"
@@ -116,7 +131,7 @@ fi
 # into the netroot URL, so it must be fixed here instead of letting mkosi run
 # ./mkosi.version twice.
 VERSION=$("$HERE/mkosi.version")
-PROFILES=(--profile="$VARIANT")
+PROFILES=(--profile="$VARIANT" ${GROUP_PROFILES[@]+"${GROUP_PROFILES[@]}"})
 if ((DEBUG)); then
 	PROFILES+=(--profile=debug)
 	VERSION+=-debug
@@ -142,6 +157,7 @@ if [[ $VARIANT == network ]]; then
 fi
 
 log "Running variant $VARIANT$( ((DEBUG)) && echo ' + debug'), version $VERSION"
+log "package groups: $(IFS=,; echo "${SAFESPACE_GROUPS[*]}")"
 log "packages: $(repos_describe)"
 ((${#NETROOT[@]})) && log "netroot: ${NETROOT[*]}"
 [[ -n $WORKERS ]] && log "erofs compression: $WORKERS threads"
@@ -164,7 +180,7 @@ mkosi "${EXTRA[@]}" ${MKOSI_ARGS[@]+"${MKOSI_ARGS[@]}"} ${APPEND_VERB:+build}
 [[ $VERB == build ]] || exit 0
 log "Outputs in mkosi.output/ for safespace-arch-${VARIANT}_$VERSION"
 if [[ $VARIANT == usb ]]; then
-	log "Next: sudo ./burn.sh /dev/sdX   (then sudo ./diagnose.sh /dev/sdX)"
+	log "Next: sudo ./burn.sh /dev/sdX   (then sudo ./diagnose.sh /dev/sdX), or ./release.sh usb --push ..."
 else
-	log "Next: ./netboot-export.sh      (publishes the UKI and root images, see NETBOOT.md)"
+	log "Next: ./release.sh network --push safespace@<distribution server>   (see README.md, \"Releasing\")"
 fi

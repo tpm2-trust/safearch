@@ -3,8 +3,4 @@
 # - /var is a tmpfs (systemd.volatile=state on the kernel command line),
 # - the ESP is not mounted at all.
 #
-# Docker data disk, mounted at boot if present (any filesystem overlay2
-# supports: ext4, xfs with ftype=1, btrfs). Label it with e.g.
-#   mkfs.ext4 -L safespace-docker /dev/<disk>
-# Docker and containerd only start when /opt/docker is a mount point.
-LABEL=safespace-docker	/opt/docker	auto	nofail,noatime,x-systemd.device-timeout=10s	0 2
+# Group docker: mkosi.postinst appends the data disk entry (/opt/docker).

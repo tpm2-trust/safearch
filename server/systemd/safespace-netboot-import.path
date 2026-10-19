@@ -1,0 +1,10 @@
+# Starts the import as soon as release.sh has handed a release over (its
+# marker in .pending/), and at boot if one is still waiting.
+[Unit]
+Description=Watch the safespace share for new releases
+
+[Path]
+DirectoryNotEmpty=@SHARE@/.pending
+
+[Install]
+WantedBy=multi-user.target

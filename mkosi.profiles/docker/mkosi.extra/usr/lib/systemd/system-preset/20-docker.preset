@@ -1,0 +1,4 @@
+# Group docker. Docker itself is not enabled: it needs the data disk
+# (/opt/docker) and is started by hand once that is mounted
+# (systemctl start docker); the image loader runs whenever docker.service starts.
+enable safespace-docker-images.service

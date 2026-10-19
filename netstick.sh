@@ -11,7 +11,8 @@
 #   (or: sudo ./burn.sh --netstick /dev/sdX)
 #
 #   --tree DIR     netboot tree the version was published into with
-#                  netboot-export.sh (default: mkosi.netboot/)
+#                  release.sh (default: mkosi.release/network/, or a
+#                  distribution server's share/network/)
 #   --version VER  version directory in the tree (default: what "current"
 #                  points at)
 #   --output FILE  image to write (default:
@@ -25,7 +26,7 @@
 #
 # Only published versions are accepted: the UKI's netroot URL points at
 # <base>/<VER>/, so the stick boots only while the server serves that
-# version. The UKI is taken from the tree, i.e. after netboot-export.sh has
+# version. The UKI is taken from the tree, i.e. after release.sh has
 # verified it against its root image. A new release needs a new stick.
 #
 # Needs root: systemd-boot is signed with the Secure Boot db key that mkosi
@@ -39,7 +40,7 @@ usage() { sed -n '2,${/^#/!q;s/^# \?//;p}' "$0"; }
 # shellcheck source=lib/uefi.sh
 source "$HERE/lib/uefi.sh"
 
-TREE=$HERE/mkosi.netboot
+TREE=$HERE/mkosi.release/network
 VERSION="" OUTPUT=""
 while (($#)); do
 	case $1 in
@@ -60,7 +61,7 @@ SDBOOT=/usr/lib/systemd/boot/efi/systemd-bootx64.efi
 
 # --- the published build -------------------------------------------------------
 
-[[ -d $TREE ]] || die "no netboot tree $TREE (publish first: ./netboot-export.sh)"
+[[ -d $TREE ]] || die "no netboot tree $TREE (release first: ./release.sh network)"
 if [[ -z $VERSION ]]; then
 	VERSION=$(readlink "$TREE/current" 2>/dev/null) || die "$TREE/current missing: pass --version"
 fi
@@ -68,7 +69,7 @@ fi
 DIR=$TREE/$VERSION
 UKI=$DIR/boot.efi
 for f in boot.efi roothash root.img root.verity; do
-	[[ -f $DIR/$f ]] || die "$DIR/$f missing: not a version published by netboot-export.sh"
+	[[ -f $DIR/$f ]] || die "$DIR/$f missing: not a release written by release.sh"
 done
 
 CMDLINE=$(uefi_section "$UKI" .cmdline)

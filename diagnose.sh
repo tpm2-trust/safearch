@@ -3,11 +3,21 @@
 # ESP + signed UKI, dm-verity root (verified block by block), nothing writable.
 # A netstick (netstick.sh, ESP only) is recognised by its missing root
 # partitions: then the UKI's netroot URL is checked against the server instead.
-# Usage: sudo ./diagnose.sh /dev/sdX
+# Usage: sudo ./diagnose.sh [--db-cert db.pem] /dev/sdX
+#   --db-cert  the db certificate the signatures must verify against (default:
+#              the build host's exported db.pem, else a distribution server's
+#              /etc/safespace/db.pem); needs sbverify (sbsigntools)
 set -uo pipefail
 
-DISK=${1:?usage: sudo $0 /dev/sdX}
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+DB_CERT=""
+[[ ${1:-} == --db-cert ]] && { DB_CERT=${2:?--db-cert needs a file}; shift 2; }
+DISK=${1:?usage: sudo $0 [--db-cert db.pem] /dev/sdX}
+if [[ -z $DB_CERT ]]; then
+	for f in "$HERE/mkosi.extra/usr/share/safespace/secureboot/db.pem" /etc/safespace/db.pem; do
+		[[ -f $f ]] && DB_CERT=$f && break
+	done
+fi
 [[ $EUID -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
 [[ -b $DISK ]] || { echo "$DISK is not a block device" >&2; exit 1; }
 
@@ -83,7 +93,14 @@ if command -v sbverify >/dev/null; then
 	for f in "$BOOT" "$UKI"; do
 		echo "  ${f#"$TMP/esp/"}:"
 		sbverify --list "$f" 2>&1 | grep -E 'subject|issuer|No signature' | sed 's/^/    /'
+		if [[ -n $DB_CERT ]]; then
+			sbverify --cert "$DB_CERT" "$f" >/dev/null 2>&1 && ok "signature verifies against $DB_CERT" ||
+				bad "NOT signed by the db key in $DB_CERT"
+		fi
 	done
+	[[ -n $DB_CERT ]] || echo "  NOTE no db certificate (--db-cert): signatures listed, not verified"
+else
+	echo "  NOTE sbverify missing (pacman -S sbsigntools): signatures not checked"
 fi
 CMDLINE=$(objcopy -O binary --only-section=.cmdline "$UKI" /dev/stdout 2>/dev/null | tr -d '\0')
 [[ -n $CMDLINE ]] && ok "cmdline: $CMDLINE" || bad "UKI has no .cmdline section"

@@ -3,7 +3,7 @@
 # or (--netstick) a netstick image from netstick.sh: loader-only stick for a
 # published network build.
 # Images of the "network" variant have no ESP and are not written to a medium;
-# they are published with netboot-export.sh (see NETBOOT.md).
+# they are released with release.sh (see README.md, "Releasing").
 #
 # Needs no Secure Boot keys and no package cache: the image is already signed.
 # Takes raw (.raw) or zstd-compressed (.raw.zst) images. Only blocks that
@@ -17,7 +17,10 @@ usage() {
 	cat <<EOF
 Usage: sudo $0 [--netstick] [IMAGE] DEVICE [--yes]
 
-  IMAGE      .raw or .raw.zst to write (default: the newest usb build in mkosi.output/)
+  IMAGE      .raw or .raw.zst to write (default: the newest usb build in mkosi.output/),
+             or a usb release on a distribution server: a local share path
+             (/srv/safespace/share/usb/current/image.raw.zst) or its URL
+             (http://<server>/safespace/usb/current/), checked against its SHA256SUMS
   DEVICE     whole target disk, e.g. /dev/sdb or /dev/mmcblk0
   --netstick default to the newest netstick image (netstick.sh) instead
   --yes      do not ask for confirmation
@@ -55,6 +58,20 @@ case ${#ARGS[@]} in
 esac
 
 [[ $EUID -eq 0 ]] || die "must run as root"
+
+# A usb release from a distribution server: download it next to its SHA256SUMS.
+# Authenticity is checked on the written medium: sudo ./diagnose.sh --db-cert ...
+if [[ $IMAGE =~ ^https?:// ]]; then
+	command -v curl >/dev/null || die "missing 'curl'"
+	[[ $IMAGE == */ ]] && IMAGE+=image.raw.zst
+	DL=$(mktemp -d /var/tmp/safespace-burn.XXXXXX)
+	trap 'rm -rf "$DL"' EXIT
+	log "Downloading $IMAGE"
+	curl -fL --progress-bar -o "$DL/image.raw.zst" "$IMAGE" || die "download failed"
+	curl -fsS -o "$DL/SHA256SUMS" "${IMAGE%/*}/SHA256SUMS" || die "no SHA256SUMS next to $IMAGE"
+	(cd "$DL" && grep ' \*\?image\.raw\.zst$' SHA256SUMS | sha256sum --quiet --strict -c) || die "download does not match SHA256SUMS"
+	IMAGE=$DL/image.raw.zst
+fi
 for cmd in sfdisk partx wipefs blockdev lsblk blkid dd zstd; do
 	command -v "$cmd" >/dev/null || die "missing '$cmd'"
 done
@@ -65,7 +82,7 @@ done
 [[ -n $IMAGE && -e $IMAGE ]] || die "image ${IMAGE:-in mkosi.output/} not found (run: $hint)"
 IMAGE=$(readlink -f "$IMAGE")
 [[ $(basename "$IMAGE") == *-network_* ]] &&
-	die "$(basename "$IMAGE") is a network build (no ESP, nothing to boot from a medium): publish it with ./netboot-export.sh, see NETBOOT.md"
+	die "$(basename "$IMAGE") is a network build (no ESP, nothing to boot from a medium): release it with ./release.sh network, see README.md"
 if [[ $IMAGE == *.zst ]]; then
 	COMPRESSED=1
 	# mkosi compresses as a stream, so the zstd header has no content size.

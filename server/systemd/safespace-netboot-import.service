@@ -1,0 +1,37 @@
+# Verifies new releases (Secure Boot signature against /etc/safespace/db.pem,
+# root image against the signed root hash), switches their channel, prunes.
+# Unprivileged and without network: it only reads and writes the share.
+[Unit]
+Description=Verify and publish new safespace releases
+Documentation=file:///usr/local/bin/safespace-netboot
+
+[Service]
+Type=oneshot
+User=safespace
+Group=safespace
+ExecStart=/usr/local/bin/safespace-netboot import
+UMask=0022
+# Room for unpacking a usb image while it is checked (on disk, not in RAM).
+CacheDirectory=safespace
+ReadWritePaths=@SHARE@ /var/lib/safespace
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service

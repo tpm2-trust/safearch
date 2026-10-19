@@ -1,0 +1,36 @@
+# Distribution server settings: /etc/safespace/server.conf (server/setup.sh
+# installs this file there once, from server/server.conf if you prepared one,
+# else from this example; it never overwrites it). Sourced as bash by
+# safespace-netboot and server/setup.sh. After a change: sudo server/setup.sh
+# (or, for DHCP_* only: sudo systemctl restart safespace-dhcp).
+
+# Where releases are uploaded to and served from (nginx: /safespace/).
+SHARE=/srv/safespace/share
+# Releases kept per variant (network, usb); channels' releases are always kept.
+KEEP=3
+
+# How machines reach this server: the base of the share in the URL. The
+# network build's NETROOT_URL (netboot.conf on the build host) is
+# $SERVER_URL/network/, and the HTTP boot file is
+# $SERVER_URL/network/<channel>/boot.efi.
+SERVER_URL=http://10.0.0.1/safespace
+
+# DHCP answers for network boot (safespace-dhcp.service, dnsmasq):
+#   off    the network's own DHCP server sends the boot options (README,
+#          "Tell the machines what to boot"); the service stays disabled
+#   proxy  answer only the boot question of UEFI PXE clients next to the
+#          LAN's DHCP server, UKI over TFTP (machines without HTTP boot)
+#   dhcp   this server is the DHCP server of the boot network: UEFI HTTP boot
+#          (options 60/67), PXE/TFTP as fallback
+DHCP_MODE=off
+DHCP_INTERFACE=eth0
+# Channel the DHCP answers point at (per-machine exceptions: dnsmasq snippets
+# in /etc/safespace/dnsmasq.d/*.conf, e.g. dhcp-host=<mac>,set:desktop plus
+# dhcp-boot=tag:desktop,...).
+DHCP_CHANNEL=current
+# proxy: the LAN's network address
+DHCP_PROXY_SUBNET=10.0.0.0
+# dhcp: lease range (start,end[,lease time]), router and DNS server to hand out
+DHCP_RANGE=10.0.0.100,10.0.0.199,12h
+DHCP_ROUTER=10.0.0.1
+DHCP_DNS=10.0.0.1

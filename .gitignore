@@ -11,8 +11,8 @@ mkosi.output/
 /*.vnc-password
 /safespace-arch-*
 
-# Netboot tree staged by netboot-export.sh.
-mkosi.netboot/
+# Releases staged by release.sh (a local copy of what is pushed).
+mkosi.release/
 
 # Caches and mkosi's generated keys/tools.
 mkosi.cache/
@@ -27,9 +27,11 @@ mkosi.local.conf
 users.conf
 netboot.conf
 repos.local.conf
+release.conf
+server/server.conf
 
 # Generated into the image tree by fetch-images.sh and secureboot-export.sh.
-mkosi.extra/usr/share/safespace/docker-images/
+mkosi.profiles/docker/mkosi.extra/usr/share/safespace/docker-images/
 mkosi.extra/usr/share/safespace/secureboot/
 
 # Test builds, VM disks, hwtest-image.sh output.

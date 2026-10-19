@@ -1,4 +1,4 @@
-# Helpers for signed EFI binaries. Sourced by netboot-export.sh and netstick.sh.
+# Helpers for signed EFI binaries. Sourced by netstick.sh.
 
 # uefi_signer FILE: print the signer certificate (PEM) of a signed PE/EFI
 # binary; fails if the binary carries no Authenticode signature.

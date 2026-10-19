@@ -1,0 +1,18 @@
+# DHCP answers for network boot, DHCP_MODE= in /etc/safespace/server.conf:
+# proxy (PXE next to the LAN's DHCP server) or dhcp (this server hands out
+# addresses, UEFI HTTP boot + PXE). TFTP serves the share. dnsmasq drops its
+# privileges itself; no DNS (port=0).
+[Unit]
+Description=safespace network boot answers (dnsmasq)
+Wants=network-online.target
+After=network-online.target
+Conflicts=dnsmasq.service
+
+[Service]
+RuntimeDirectory=safespace-dhcp
+ExecStartPre=/usr/local/bin/safespace-netboot dnsmasq-config
+ExecStart=@DNSMASQ@ --keep-in-foreground --conf-file=/run/safespace-dhcp/dnsmasq.conf
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

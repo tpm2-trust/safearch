@@ -15,7 +15,7 @@
 #   starts it, and its initrd then loads the root image over HTTP.
 #   QEMU's user network is the DHCP server here (that is what option
 #   bootfile= sets), a local python HTTP server on 127.0.0.1 serves the netboot
-#   tree (default mkosi.netboot/, written by netboot-export.sh), and the VM
+#   releases (default mkosi.release/network/, written by release.sh), and the VM
 #   reaches the host as 10.0.2.2 -- so the image has to be built for that
 #   address:
 #     sudo ./build.sh network --url http://10.0.2.2:8000/ \
@@ -25,10 +25,10 @@
 #   them afterwards).
 # --tftp: hand the UKI over QEMU's built-in TFTP server instead of HTTP, for
 #   firmware without UEFI HTTP boot. The root image still comes over HTTP.
-# --tree DIR: netboot tree to serve (a tree with current/, or a version
-#   directory).
+# --tree DIR: releases to serve (a directory with current/, e.g. a
+#   distribution server's share/network/, or one release directory).
 # --url BOOT_URL: no local server; UEFI HTTP boot of a published UKI from a
-#   real netboot server, e.g. http://10.0.0.1/safespace/current/boot.efi.
+#   distribution server, e.g. http://10.0.0.1/safespace/network/current/boot.efi.
 #   The VM reaches it through QEMU's NAT and resolves names with the host's
 #   DNS, so a normal build (netboot.conf URL) is tested as published, exactly
 #   as a machine on the LAN would boot it.
@@ -93,10 +93,10 @@ if ((NETBOOT)) && [[ -n $BOOT_URL ]]; then
 	log "UKI from $BOOT_URL, root from $NETROOT_URL"
 elif ((NETBOOT)); then
 	[[ -z $IMAGE ]] || die "--netboot takes no image (it boots the UKI from the netboot tree)"
-	TREE=${TREE:-$HERE/mkosi.netboot}
+	TREE=${TREE:-$HERE/mkosi.release/network}
 	BOOTDIR=$TREE/current
 	[[ -e $BOOTDIR ]] || BOOTDIR=$TREE
-	[[ -f $BOOTDIR/boot.efi ]] || die "no boot.efi in $BOOTDIR (run: ./netboot-export.sh)"
+	[[ -f $BOOTDIR/boot.efi ]] || die "no boot.efi in $BOOTDIR (run: ./release.sh network)"
 	uki=$BOOTDIR/boot.efi
 	cmdline=$(objcopy -O binary --only-section=.cmdline "$uki" /dev/stdout 2>/dev/null | tr -d '\0')
 	NETROOT_URL=$(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace.netroot=//p' | head -1)

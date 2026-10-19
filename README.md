@@ -4,9 +4,11 @@ A Secure-Boot-signed Arch Linux system for USB sticks, SD cards and network boot
 UEFI machines (no legacy BIOS), built with
 [mkosi](https://github.com/systemd/mkosi) (written for mkosi 27). The system is
 **read-only**: nothing is written to the boot medium at runtime. The root is protected by
-dm-verity, `/var` lives in RAM, and only disks mounted at runtime are writable. Docker
-images travel in the image; Docker's storage lives on a data disk at `/opt/docker`.
-An XFCE desktop is available over VNC (through an ssh tunnel).
+dm-verity, `/var` lives in RAM, and only disks mounted at runtime are writable. What goes
+into an image on top of the base system is chosen with **package groups**: an XFCE desktop
+over VNC (`remotedesktop`), Docker with its storage on a data disk (`docker`).
+
+Arch Linux only: the images, the build host and the distribution servers.
 
 Two variants are built from the same configuration, selected with `./build.sh`:
 
@@ -15,162 +17,271 @@ Two variants are built from the same configuration, selected with `./build.sh`:
 | Build | `sudo ./build.sh usb` | `sudo ./build.sh network` |
 | Boots from | a USB stick or SD card (ESP + root + verity on the medium) | UEFI HTTP (or PXE) boot: the firmware itself downloads the signed UKI, nothing is on the machine |
 | Root comes from | the medium, read-only and set read-only at block level | HTTP, into a tmpfs, opened through dm-verity with the signed root hash |
-| Written with | `sudo ./burn.sh /dev/sdX` | `./netboot-export.sh` onto a netboot server |
+| Distributed with | `sudo ./burn.sh /dev/sdX` (here, or from a distribution server) | `./release.sh network` to the distribution servers |
 | USB devices | the initrd authorizes only the path to the boot medium | nothing on USB is authorized at all (the NIC must be PCI/PCIe) |
 | Docs | this file | this file plus **[NETBOOT.md](NETBOOT.md)** |
 
-Everything else is identical: same packages, users, hardening, dm-verity root, volatile
-`/var`, Secure Boot signature and `safespace-seal`.
+Everything else is identical: same package groups, users, hardening, dm-verity root,
+volatile `/var`, Secure Boot signature and `safespace-seal`.
 
 > **Status:** usb variant tested in QEMU (OVMF, stick on emulated USB): boots with and
 > without enforced Secure Boot; dm-verity verified, stick read-only at block level; sealing
 > with `safespace-seal` (append and `--replace`) and booting the sealed VM. Boots on one real
-> machine (Secure Boot in Setup Mode). Network variant tested end to end in QEMU (OVMF,
-> no disk attached): DHCP → UEFI HTTP boot of the signed UKI → root image and hash tree over
-> HTTP → dm-verity against the signed root hash → login prompt. On real hardware: a ThinkPad
-> T450s (no HTTP boot, Intel AMT disabled) boots the same signed UKI over PXE/TFTP end to end;
-> UEFI HTTP boot on real hardware is not tested yet.
+> machine (Secure Boot in Setup Mode). Network variant tested end to end in QEMU and libvirt
+> (OVMF, no disk attached): DHCP → UEFI HTTP boot of the signed UKI → root image and hash
+> tree over HTTP → dm-verity against the signed root hash → login. On real hardware: a
+> ThinkPad T450s (no HTTP boot, Intel AMT disabled) boots the same signed UKI over PXE/TFTP
+> end to end; UEFI HTTP boot on real hardware is not tested yet.
+
+## Two roles: build host and distribution servers
+
+```mermaid
+flowchart LR
+  subgraph B["build host (has the signing keys)"]
+    BS["build.sh VARIANT --groups …"] --> O["mkosi.output/"]
+    O --> R["release.sh VARIANT --channel … --push …"]
+  end
+  R -- "rsync over ssh: upload account,<br/>share only, no overwrite/delete" --> SH
+  subgraph S["distribution server 1..n (no private key)"]
+    SH["/srv/safespace/share/"] -- "safespace-netboot-import.path" --> IM["safespace-netboot-import.service:<br/>verify, switch the channel, prune"]
+    N["nginx: /safespace/"]
+    D["safespace-dhcp.service:<br/>dnsmasq (optional)"]
+  end
+  SH --- N
+  N --> M["machines: UEFI HTTP / PXE boot,<br/>or download a usb image"]
+  D --> M
+```
+
+| | Build host | Distribution server |
+|---|---|---|
+| What it is | the one machine with the Secure Boot keys (`/var/lib/sbctl`) and the PCR signing key | any number of machines next to the clients; they can also be the build host itself |
+| Holds | sources, keys, `mkosi.output/`, `mkosi.release/` (staged releases) | the share (`/srv/safespace/share/`): released versions, channels; the **public** `db.pem` |
+| Runs | `build.sh` (root), `release.sh` (user) | `server/setup.sh` once, then only services: `nginx`, `safespace-netboot-import.path`, optionally `safespace-dhcp` |
+| Network | pushes out over ssh; needs no inbound access | serves HTTP (and DHCP/TFTP); accepts uploads only through the restricted upload account |
+| Part of the repo | everything except `server/` | `server/` (+ `lib/verify.sh`); a checkout is only needed to run `server/setup.sh` |
+
+**What a distribution server trusts:** nothing but the public `db.pem`, pinned once at setup.
+Before a release is served, the import checks the UKI's Secure Boot signature against it
+(`sbverify`), takes the root hash from the signed command line and verifies the root image
+block by block against it (`veritysetup verify`); for usb releases it does the same with the
+partitions cut out of the image. A release that fails is deleted. So a stolen upload key lets
+someone fill the disk or delete nothing (the upload account can neither overwrite nor
+delete), but not publish anything the machines would boot. The clients check the same things
+again themselves (firmware: signature; initrd: dm-verity).
+
+**Channels:** a release goes to a channel (`--channel`, default `current`). Each channel is a
+symlink in the share that points at a version, per variant: `network/current`,
+`network/desktop`, `usb/current`, … A server switches the channel to a release **as soon as it
+has verified it**. Machines boot a channel through their DHCP boot file
+(`…/network/<channel>/boot.efi`), so different kinds of machines can follow different
+channels, e.g. kiosks on `current` with `--groups base` and workstations on `desktop` with
+`--groups base,remotedesktop`.
+
+## Package groups
+
+`--groups LIST` on `build.sh`: comma-separated, case-insensitive, the same for both variants.
+Without it, an image has `base` only.
+
+| Group | What it adds | Where it is defined |
+|---|---|---|
+| `base` (always) | kernel, firmware, microcode, systemd, openssh, sudo, nftables, usbguard, cryptsetup, efitools + openssl (`safespace-seal`), vim, tmux, qemu-guest-agent; users, ssh, hardening, volatile `/var` | `mkosi.conf`, `mkosi.extra/` |
+| `remotedesktop` | XFCE, TigerVNC on `localhost:5901` (through an ssh tunnel), firefox, vlc, gwenview, fonts, pulseaudio; VNC user and password (`safespace.env`) | `mkosi.profiles/remotedesktop/` |
+| `docker` | Docker and containerd with their storage on a data disk at `/opt/docker`, the shipped images (`fetch-images.sh`) and their loader; users get the `docker` group. Docker is not started at boot (see [Docker](#docker)) | `mkosi.profiles/docker/` |
+
+```sh
+sudo ./build.sh network                                    # base only
+sudo ./build.sh network --groups base,RemoteDesktop        # + desktop
+sudo ./build.sh usb --groups base,remotedesktop,docker     # everything
+```
+
+Each group except `base` is a mkosi profile of its own name, with its packages, files
+(`mkosi.extra/`) and service presets; `lib/groups.sh` knows the names and refuses unknown
+ones. The build records the set: `mkosi.output/<image>_<version>.groups`,
+`/usr/lib/safespace/groups` in the image, `GROUPS=` in the release, and
+`safespace-netboot list` on the servers. A new group is a new directory
+`mkosi.profiles/<name>/` plus its name in `GROUPS_KNOWN` in `lib/groups.sh`.
+
+`--debug` is **not** a group and stays separate: it adds diagnostic tools (ethtool,
+dmidecode, pciutils, usbutils, lshw, iperf3, tcpdump, kexec-tools) and marks the version
+`-debug`; no security setting is changed. ⚠️ `kexec-tools` lets root boot an unsigned kernel
+past Secure Boot, because the kernel does not enforce lockdown (see "Known open points"):
+do not hand out debug builds as production images.
 
 ## Quick start
 
 ```sh
-# once: host tools
-sudo pacman -S --needed mkosi systemd-ukify sbctl efitools dosfstools mtools erofs-utils zstd cpio skopeo
-sudo sbctl create-keys        # if you have no Secure Boot keys yet (/var/lib/sbctl)
+# build host, once
+sudo pacman -S --needed mkosi systemd-ukify sbctl efitools sbsigntools dosfstools mtools erofs-utils zstd cpio rsync skopeo
+sudo sbctl create-keys                       # if you have no Secure Boot keys yet (/var/lib/sbctl)
+cp users.conf.example users.conf             # your users and ssh keys
+cp netboot.conf.example netboot.conf         # network variant: NETROOT_URL=http://<server>/safespace/network/
 
-cp users.conf.example users.conf   # add your users and ssh keys
-# optional: safespace.env (VNC), docker-images.txt (images to ship)
-./fetch-images.sh             # downloads the listed images (skip if none)
+# distribution server, once (a checkout of this repo on it; db.pem copied from the build host)
+sudo server/setup.sh --db-cert db.pem --upload-key releaser.pub
 
-# variant usb: a stick or SD card
-sudo ./build.sh usb           # -> mkosi.output/safespace-arch-usb_<date-time>.raw.zst
-sudo ./burn.sh /dev/sdX       # writes the newest usb image to the medium
-sudo ./diagnose.sh /dev/sdX   # optional: verifies root on the medium block by block
+# build host, every release
+sudo ./build.sh network --groups base,remotedesktop
+./release.sh network --push safespace@<server>
+sudo ./build.sh usb --groups base,remotedesktop
+./release.sh usb --push safespace@<server>          # or burn it here: sudo ./burn.sh /dev/sdX
 
-# variant network: UEFI HTTP/PXE boot
-sudo ./build.sh network       # URL from netboot.conf, see the next section
-./netboot-export.sh --rsync arch.boot.internal:/srv/netboot/safespace
-
-# on the machine, once per data disk (any disk except the boot medium):
+# on a machine with the docker group, once per data disk (any disk except the boot medium):
 sudo mkfs.ext4 -L safespace-docker /dev/<datadisk>
 ```
 
-`build.sh` runs mkosi with the profile of the variant; root is needed because the
-signing key in `/var/lib/sbctl/keys/db/` is readable by root only. Build with `build.sh`
-only: before mkosi runs it exports the public Secure Boot keys into the image and creates
-the PCR signing key on the first build; a plain `mkosi build` stops at the key check
-(and without a profile even earlier).
+`build.sh` needs root because the signing key in `/var/lib/sbctl/keys/db/` is readable by
+root only. Build with `build.sh` only: before mkosi runs it exports the public Secure Boot
+keys into the image and creates the PCR signing key on the first build; a plain
+`mkosi build` stops at the key check (and without a profile even earlier).
 
-Not tracked by git, created per user or host: `users.conf`, `netboot.conf`,
-`mkosi.local.conf`, `repos.local.conf`, the exported keys
+Not tracked by git, created per user or host: `users.conf`, `netboot.conf`, `release.conf`,
+`mkosi.local.conf`, `repos.local.conf`, `server/server.conf`, the exported keys
 (`mkosi.extra/usr/share/safespace/secureboot/`), shipped images
-(`mkosi.extra/usr/share/safespace/docker-images/`), caches, outputs and the staged
-netboot tree (`mkosi.netboot/`).
+(`mkosi.profiles/docker/mkosi.extra/usr/share/safespace/docker-images/`), caches, outputs and
+the staged releases (`mkosi.release/`).
 
-## Network boot: build and provide
+## Build host
 
-Everything needed to build the `network` variant and put it in front of the machines, in
-order. This installation uses the name **`arch.boot.internal`** for the netboot server and
-`/srv/netboot/safespace` as the tree; the server itself (nginx, dnsmasq, DHCP options,
-Secure Boot enrollment, troubleshooting) is described in **[NETBOOT.md](NETBOOT.md)**.
-
-| | Value |
-|---|---|
-| netboot server (DNS A record) | `arch.boot.internal` |
-| its IP address (example, replace it everywhere below) | `10.0.0.1` |
-| tree on the server | `/srv/netboot/safespace/<version>/` plus `current -> <version>` |
-| boot file for the DHCP answer | `http://arch.boot.internal/safespace/current/boot.efi` |
-| root image URL signed into the UKI | `http://arch.boot.internal/safespace/<version>/` (from `netboot.conf`) |
-
-### Once, on the build host
+### Once
 
 ```sh
-sudo pacman -S --needed mkosi systemd-ukify sbctl efitools dosfstools mtools erofs-utils zstd cpio skopeo
+sudo pacman -S --needed mkosi systemd-ukify sbctl efitools sbsigntools dosfstools mtools erofs-utils zstd cpio rsync skopeo
 sudo sbctl create-keys                  # if there are no Secure Boot keys yet
 cp users.conf.example users.conf        # your users and ssh keys
-cp netboot.conf.example netboot.conf    # NETROOT_URL=http://arch.boot.internal/safespace/
+cp netboot.conf.example netboot.conf    # NETROOT_URL=http://arch.boot.internal/safespace/network/
+cp release.conf.example release.conf    # RELEASE_TARGETS="safespace@dist1 safespace@dist2" (optional)
+ssh-keygen -t ed25519 -f ~/.ssh/safespace-release -C "safespace release $(hostname)"   # the upload key
 ```
 
-`netboot.conf` is where the name lives; `build.sh` appends the build version to it and signs
-the result into the UKI, which is why **changing the server address means rebuilding** — a
-name keeps that from happening when the server moves. Several URLs can be listed, tried in
-order (name first, address as fallback).
+- **`netboot.conf`** (network variant): the URL the machines load their root image from,
+  `<SERVER_URL>/network/` of the distribution servers. `build.sh` appends the build version
+  and signs the result into the UKI, which is why **changing the server address means
+  rebuilding** — a name (`arch.boot.internal`, see [DNS](#dns-you-have-to-do-this)) keeps
+  that from happening when the server moves. Several URLs are tried in order: a name with an
+  address as fallback, or one URL per distribution server.
+- **The upload key** goes to every distribution server (`--upload-key
+  ~/.ssh/safespace-release.pub` on `server/setup.sh`); add it to `~/.ssh/config` for those
+  hosts (`IdentityFile ~/.ssh/safespace-release`). It reaches nothing but the share.
+- **`db.pem` for the servers:** `mkosi.extra/usr/share/safespace/secureboot/db.pem`, written
+  by the first build. Public; copy it to the servers any way you like.
 
-### Once: ramp up the server
-
-On the machine that `arch.boot.internal` will point at — a dedicated netboot server, or the
-build host itself for a first test. All it does is serve the three files each machine
-downloads, over plain HTTP: the integrity comes from the Secure Boot signature and
-dm-verity, not from the transport. `10.0.0.1` below stands for that machine's address
-(`ip -4 -br addr`).
+### Every release
 
 ```sh
-# 1. web server (Arch; Debian/Ubuntu: apt install nginx-light)
-sudo pacman -S --needed nginx
-
-# 2. the tree the images are published into
-sudo install -d -m 0755 /srv/netboot/safespace
-# so netboot-export.sh --rsync can write without root ssh; use the account you
-# ssh in as from the build host
-sudo chown -R "$USER" /srv/netboot/safespace
-
-# 3. site configuration (Arch ships no conf.d/, create it first)
-sudo install -d -m 0755 /etc/nginx/conf.d
-sudo tee /etc/nginx/conf.d/netboot.conf >/dev/null <<'NGINX'
-server {
-    listen        80 default_server;
-    listen        [::]:80 default_server;
-    server_name   _;
-    root          /srv/netboot;
-
-    autoindex     off;
-    sendfile      on;
-    tcp_nopush    on;
-    server_tokens off;
-
-    location / { limit_except GET HEAD { deny all; } }
-}
-NGINX
-# the main config has to pull conf.d in (Debian uses sites-enabled instead)
-grep -qE '^[[:space:]]*include[[:space:]]+(/etc/nginx/)?conf\.d/\*\.conf;' /etc/nginx/nginx.conf ||
-    sudo sed -i '/^http {/a \    include conf.d/*.conf;' /etc/nginx/nginx.conf
-# Arch's nginx.conf also has a stock "server { listen 80; server_name localhost; }"
-# block. It does no harm (netboot.conf is the default_server, so requests by IP or by
-# arch.boot.internal land there), but it can be deleted.
-
-# 4. start it
-sudo nginx -t && sudo systemctl enable --now nginx
-
-# 5. firewall, only if one is active on this host
-sudo nft add rule inet filter input tcp dport 80 accept   # nftables
-# sudo firewall-cmd --permanent --add-service=http && sudo firewall-cmd --reload
+sudo ./build.sh network --groups base,remotedesktop       # -f to rebuild unchanged packages
+./release.sh network --push safespace@dist1 --push safespace@dist2
+./release.sh network --channel desktop                    # release to another channel (targets from release.conf)
+./release.sh usb                                          # usb image: same, the stick image as the release
 ```
 
-Check it, after the first `./netboot-export.sh --tree`/`--rsync` (see "Every build") has
-published a build:
+`release.sh` bundles the newest build of the variant (`--version` for another one) into
+`mkosi.release/<variant>/<version>/`, checks it exactly as the servers will (signature
+against `db.pem`, root image against the signed root hash), and pushes it: the release
+directory first, then a marker in `.pending/`, which starts the server's import. On the
+server the channel switches as soon as the release is verified; the release's files cannot be
+replaced afterwards (a new build gets a new version anyway). Machines take the new version on
+their next boot; a running machine is unaffected, it has everything in RAM.
+
+| Release | Files |
+|---|---|
+| network | `boot.efi` (signed UKI), `root.img`, `root.verity`, `roothash`, `cmdline` |
+| usb | `image.raw.zst` (the whole stick), `roothash` |
+| both | `release` (VARIANT, VERSION, GROUPS, CHANNEL), `manifest.json` (packages), `SHA256SUMS` |
+
+Without a target (`--push` or `RELEASE_TARGETS=`) it only stages. `mkosi.release/<variant>/`
+also keeps a local channel link, which `test-vm.sh --netboot` and `netstick.sh` use;
+`--prune N` keeps N releases there.
+
+**Try a build on one machine first:** release it to a channel of its own and point only that
+machine at it (a `dhcp-host` entry, see [Channels in DHCP](#channels-in-dhcp)):
 
 ```sh
-curl -I http://arch.boot.internal/safespace/current/boot.efi    # 200 + Content-Length
+sudo ./build.sh network --debug         # --debug: ethtool, tcpdump, ... and "-debug" in the version
+./release.sh network --channel test
 ```
 
-`Content-Length` matters: the initrd uses it to size its tmpfs and to check there is enough
-RAM before downloading. nginx sends it for static files.
+## Distribution server
 
-Without nginx, for a throwaway test from the build host, this serves the staged tree under
-the same path (needs root for port 80, and it stays in the foreground):
+### Once: set it up
+
+On an Arch Linux machine next to the clients (or the build host itself), from a checkout of
+this repository, with `db.pem` and the upload key's `.pub` from the build host:
 
 ```sh
-mkdir -p mkosi.test/docroot
-ln -sfnT "$PWD/mkosi.netboot" mkosi.test/docroot/safespace
-sudo python3 -m http.server 80 --directory mkosi.test/docroot
+cp server/server.conf.example server/server.conf    # optional: prepare the settings first (gitignored)
+sudo server/setup.sh --db-cert db.pem --upload-key safespace-release.pub
 ```
 
-### Once: configure DNS (you have to do this)
+`server/setup.sh` can be run again at any time: it applies changed settings, adds upload
+keys and keeps everything else. It does:
 
-The name is not optional: it is signed into the UKI, and the machines have no other way to
-find the root image. Create an **A record** `arch.boot.internal` → the IP of the server you
-just set up (`10.0.0.1` in the examples), in the DNS server that your DHCP
-hands out to the clients. Examples:
+| What | Where |
+|---|---|
+| packages | nginx, dnsmasq, rsync, python (rrsync), openssh, sbsigntools, cryptsetup, zstd, mtools, util-linux, binutils, openssl |
+| settings | `/etc/safespace/server.conf` (installed once from `server/server.conf` or the example; then edit it there and rerun) |
+| pinned certificate | `/etc/safespace/db.pem`; replacing it needs `--replace-db-cert` |
+| user `safespace` | owns the share and runs the import; its ssh login is the upload account: `command="rrsync -wo -no-del -no-overwrite -munge <share>",restrict` — no shell, no reading, no deleting, no overwriting. `authorized_keys` belongs to root |
+| share | `/srv/safespace/share/` (`SHARE=`) with `network/`, `usb/`, `.pending/` |
+| tool | `/usr/local/bin/safespace-netboot` (+ `/usr/local/lib/safespace-server/verify.sh`) |
+| units | `safespace-netboot-import.path` + `.service`, `safespace-dhcp.service` (enabled when `DHCP_MODE` is not `off`) |
+| nginx | `/etc/nginx/conf.d/safespace.conf`: the share read-only under `http://<server>/safespace/`, hidden files never |
+
+Settings in `/etc/safespace/server.conf`:
+
+| Setting | Meaning |
+|---|---|
+| `SHARE=/srv/safespace/share` | where releases are uploaded to and served from |
+| `KEEP=3` | releases kept per variant; the ones a channel points at are always kept |
+| `SERVER_URL=http://10.0.0.1/safespace` | how machines reach the share; the boot file is `$SERVER_URL/network/<channel>/boot.efi`, the build host's `NETROOT_URL` is `$SERVER_URL/network/` |
+| `DHCP_MODE=off\|proxy\|dhcp`, `DHCP_INTERFACE`, `DHCP_CHANNEL` | network boot answers, see [Tell the machines what to boot](#once-tell-the-machines-what-to-boot-dhcp) |
+| `DHCP_PROXY_SUBNET` (proxy), `DHCP_RANGE`, `DHCP_ROUTER`, `DHCP_DNS` (dhcp) | per mode |
+
+Firewall, if one is active: TCP 22 (uploads) and 80 (HTTP); with `DHCP_MODE` also UDP 67, 69
+and 4011.
+
+### Services
+
+| Unit | What it does |
+|---|---|
+| `nginx.service` | serves `/srv/safespace/share/` as `http://<server>/safespace/`: GET/HEAD only, no directory listing, no hidden files |
+| `safespace-netboot-import.path` | watches `.pending/`; starts the import when an upload is complete (and at boot if one is waiting) |
+| `safespace-netboot-import.service` | runs `safespace-netboot import` as user `safespace`, sandboxed and without network: verify, record it in `/var/lib/safespace/state/`, switch the release's channel, prune to `KEEP` |
+| `safespace-dhcp.service` | dnsmasq for `DHCP_MODE=proxy` or `dhcp` (configuration generated from `server.conf` on every start); TFTP serves the share |
+
+### Every day
+
+```sh
+safespace-netboot list                                     # releases, groups, channels, pending uploads
+journalctl -u safespace-netboot-import -f                  # an upload being verified
+sudo safespace-netboot activate 20261019-0800 --channel desktop   # point a channel at a verified release
+sudo safespace-netboot rollback                            # network/current back to the release before it
+sudo safespace-netboot rollback --usb --channel current
+journalctl -u safespace-dhcp -f                            # a machine asking where to boot from
+curl -I http://10.0.0.1/safespace/network/current/boot.efi # 200 + Content-Length
+```
+
+Only verified releases can be activated. A release that failed the import is deleted from the
+share (the journal says why), so the build host can upload it again. An old version stays
+bootable for as long as it is in the share — that is what makes a rollback work, and why
+`KEEP` should stay small.
+
+### usb images from a distribution server
+
+Released usb images are served under `http://<server>/safespace/usb/<channel>/`. Writing one to
+a stick needs `burn.sh` and `diagnose.sh` from a checkout, but no keys and no build:
+
+```sh
+sudo ./burn.sh http://10.0.0.1/safespace/usb/current/ /dev/sdX      # download, check SHA256SUMS, write
+sudo ./burn.sh /srv/safespace/share/usb/current/image.raw.zst /dev/sdX   # on the server itself
+sudo ./diagnose.sh --db-cert /etc/safespace/db.pem /dev/sdX         # signatures against db.pem, root block by block
+```
+
+### DNS (you have to do this)
+
+If `NETROOT_URL` uses a name, it is not optional: it is signed into the UKI, and the machines
+have no other way to find the root image. Create an **A record** `arch.boot.internal` → the
+distribution server's IP (`10.0.0.1` in the examples), in the DNS server that your DHCP hands
+out to the clients:
 
 | DNS server | What to add |
 |---|---|
@@ -184,7 +295,7 @@ Verify from a machine on the same network as the clients (not from the server it
 
 ```sh
 getent hosts arch.boot.internal          # or: nslookup arch.boot.internal
-curl -I http://arch.boot.internal/safespace/current/boot.efi
+curl -I http://arch.boot.internal/safespace/network/current/boot.efi
 ```
 
 If the name cannot be resolved, `netroot` says `Could not resolve host` on the client's
@@ -194,69 +305,69 @@ console. You can ride that out by listing a second URL with a plain IP address i
 ### Once: tell the machines what to boot (DHCP)
 
 The machines learn what to boot from **DHCP**; that is the only thing that changes in your
-network. There are two ways, both pure UEFI firmware booting the signed UKI directly — no
-iPXE, no boot loader in between:
+network. Both ways are pure UEFI firmware booting the signed UKI directly — no iPXE, no boot
+loader in between:
 
 | | UEFI HTTP boot (the intended path) | UEFI PXE/TFTP (old firmware without HTTP boot) |
 |---|---|---|
 | firmware boot entry | "UEFI HTTPv4 …" / "HTTP Boot" | "UEFI PXEv4 …" / "Start PXE over IPv4" |
 | client asks with | option 60 `HTTPClient:Arch:00016`, option 93 = 16 | option 60 `PXEClient:Arch:00007`, option 93 = 7 or 9 |
-| answer: option 60 | `HTTPClient` | `PXEClient` (dnsmasq: `pxe-service=`) |
-| answer: option 67 | `http://10.0.0.1/safespace/current/boot.efi` (full URL) | `safespace/current/boot.efi` (path under the TFTP root) |
-| answer: next server | — | `10.0.0.1`, which runs TFTP |
-| who can answer | the network's DHCP server | the DHCP server, **or** proxy DHCP next to it (`pxe-proxy.sh`) |
+| answer: option 60 | `HTTPClient` | `PXEClient` |
+| answer: option 67 | `http://10.0.0.1/safespace/network/current/boot.efi` (full URL) | `network/current/boot.efi` (path under the TFTP root) |
+| answer: next server | — | `10.0.0.1`, the distribution server (TFTP) |
+| who can answer | the network's DHCP server | the DHCP server, **or** proxy DHCP next to it |
+| `DHCP_MODE` on the distribution server | `off` (your DHCP server sends it) or `dhcp` (it *is* the DHCP server) | `proxy` (or `dhcp`) |
 | speed for the ~82 MiB UKI | seconds | ~1 min |
 
-**So yes: pure UEFI HTTP boot is options 60 and 67**, and both have to come from the DHCP
-server that hands out the address. The proxy-DHCP trick (`pxe-proxy.sh`) does not work for
-it: dnsmasq in proxy mode only answers clients that announce `PXEClient`. Use the server's
-IP in option 67 rather than the name: the firmware's own resolver is one more thing that can
-fail, and this value can be changed any time without rebuilding the image (the name matters
-for the URL *inside* the UKI).
+**Pure UEFI HTTP boot is options 60 and 67**, and both have to come from the DHCP server that
+hands out the address: dnsmasq in proxy mode only answers clients that announce `PXEClient`.
+Use the server's IP in option 67 rather than the name: the firmware's own resolver is one more
+thing that can fail, and this value can be changed any time without rebuilding the image (the
+name matters for the URL *inside* the UKI).
 
-#### HTTP boot: the network's DHCP server sends 60 and 67
-
-If dnsmasq is your DHCP server, this is the whole change
-([NETBOOT.md §3](NETBOOT.md#3-dhcp-and-the-boot-file) has ISC dhcpd, Kea,
-OPNsense/pfSense and Windows Server, and both paths in one configuration):
+**`DHCP_MODE=off`** (default) — your DHCP server sends the options. With dnsmasq there, this
+is the whole change ([NETBOOT.md §3](NETBOOT.md#3-dhcp-and-the-boot-file) has ISC dhcpd, Kea,
+OPNsense/pfSense and Windows Server):
 
 ```ini
-# /etc/dnsmasq.d/netboot.conf
+# /etc/dnsmasq.d/netboot.conf on your DHCP server
 dhcp-vendorclass=set:httpclient,HTTPClient:Arch:00016
 dhcp-match=set:httpclient,option:client-arch,16
 dhcp-option-force=tag:httpclient,60,HTTPClient
-dhcp-boot=tag:httpclient,http://10.0.0.1/safespace/current/boot.efi
-log-dhcp
+dhcp-boot=tag:httpclient,http://10.0.0.1/safespace/network/current/boot.efi
 ```
+
+Only for clients whose option 60 starts with `HTTPClient` — a PXE client that gets an HTTP URL
+fails with `PXE-E23`.
+
+**`DHCP_MODE=proxy`** — for machines whose firmware only offers PXE (e.g. ThinkPad T450s with
+Intel AMT **disabled**, see [NETBOOT.md](NETBOOT.md#case-found-thinkpad-t450s-bios-jbet73ww)),
+or when the router cannot send boot options at all. The distribution server answers only the
+boot question of UEFI PXE clients; the router keeps handing out addresses. The UKI comes over
+TFTP, the root image over HTTP. Proxy DHCP only reaches machines on the same L2 segment.
+
+**`DHCP_MODE=dhcp`** — the distribution server is the DHCP server of a boot network of its own
+(VLAN): addresses from `DHCP_RANGE`, HTTP boot for clients that ask for it, PXE for the rest.
 
 ```sh
-sudo systemctl restart dnsmasq
-journalctl -u dnsmasq -f        # watch a machine ask and get the URL
+sudo vim /etc/safespace/server.conf          # DHCP_MODE=proxy, DHCP_INTERFACE=..., DHCP_PROXY_SUBNET=...
+sudo server/setup.sh                         # enables and (re)starts safespace-dhcp
+journalctl -u safespace-dhcp -f
 ```
 
-Other DHCP servers: set option 60 = `HTTPClient` and option 67 = the URL, **only** for
-clients whose option 60 starts with `HTTPClient` — a PXE client that gets an HTTP URL fails
-with `PXE-E23`. On the machine: firmware setup → network stack and HTTP boot on, boot menu
-(F12) → the HTTP entry. nginx then logs `boot.efi`, `root.verity`, `root.img`.
+#### Channels in DHCP
 
-#### PXE/TFTP: proxy DHCP from the build host, the router stays untouched
+`DHCP_CHANNEL` is what every machine boots. Exceptions go into
+`/etc/safespace/dnsmasq.d/*.conf` (read by `safespace-dhcp`, kept across reruns), e.g. one
+test machine on channel `test`:
 
-For machines whose firmware only offers PXE (e.g. ThinkPad T450s; with Intel AMT
-**disabled**, see [NETBOOT.md](NETBOOT.md#case-found-thinkpad-t450s-bios-jbet73ww)), or
-when the router cannot send boot options at all. `pxe-proxy.sh` runs dnsmasq in the
-foreground: proxy DHCP (the router keeps handing out addresses) plus TFTP for the UKI from
-`/srv/netboot`. The root image still comes from nginx over HTTP.
-
-```sh
-sudo pacman -S --needed dnsmasq
-# firewall on this host, if one is active: UDP 67, 69 and 4011
-sudo ./pxe-proxy.sh safespace/current/boot.efi          # Ctrl-C stops it
+```ini
+dhcp-host=52:54:00:12:34:56,set:test
+dhcp-boot=tag:test,tag:httpclient,http://10.0.0.1/safespace/network/test/boot.efi
+dhcp-boot=tag:test,tag:efi64,network/test/boot.efi
 ```
 
-Interface and subnet come from the default route (`--interface`, `--subnet` to override),
-the log goes to the terminal and `mkosi.test/dnsmasq.log`. On the machine: boot menu
-(F12) → the PXE / "PCI LAN" entry. Proxy DHCP only reaches machines on the same L2
-segment.
+With `DHCP_MODE=off` the same goes into your own DHCP server's per-host settings.
 
 ### Once: Secure Boot on the machines
 
@@ -266,59 +377,11 @@ Enroll your `db` certificate, or boot a machine once in Setup Mode and run
 the dm-verity protection of the root image works either way, but the command line (and with
 it the root hash) is only trustworthy with Secure Boot on.
 
-### Every build
+## Check it
 
 ```sh
-sudo ./build.sh network                 # -f to rebuild unchanged packages
-
-# the server is another machine: publish locally and copy it over in one step
-./netboot-export.sh --rsync arch.boot.internal:/srv/netboot/safespace
-
-# or, if this build host serves the files itself: publish straight into the tree
-./netboot-export.sh --tree /srv/netboot/safespace
-
-# what the server serves now
-ls -l /srv/netboot/safespace/current/        # on the server: boot.efi root.img root.verity ...
-curl -I http://10.0.0.1/safespace/current/boot.efi
-```
-
-To try a build on one machine before the others get it, publish it without moving
-`current` and point only that boot at it (PXE via `pxe-proxy.sh`; for HTTP boot, put the
-version into option 67 instead of `current`):
-
-```sh
-sudo ./build.sh network --debug         # --debug: ethtool, tcpdump, ... and "-debug" in the version
-V=$(basename "$(ls -t mkosi.output/safespace-arch-network_*.efi | head -1)" .efi); V=${V#safespace-arch-network_}; echo "$V"
-./netboot-export.sh --tree /srv/netboot/safespace --version "$V" --no-current
-sudo ./pxe-proxy.sh "safespace/$V/boot.efi"
-```
-
-Without `--rsync` or `--tree`, `./netboot-export.sh` only stages into `mkosi.netboot/` in
-the project; nothing reaches the server. A staged tree can still be copied later:
-`cp -a mkosi.netboot/. /srv/netboot/safespace/` (or `rsync -a` to the server); `current` is
-a relative symlink and survives the copy.
-
-`build.sh` writes `mkosi.output/safespace-arch-network_<version>.{efi,root.raw.zst,root-verity.raw.zst,roothash}`.
-`netboot-export.sh` turns those into the three files the machines ask for — `boot.efi`,
-`root.img`, `root.verity` — in `<tree>/<version>/`, checks that they belong together (root
-hash from the signed UKI, `veritysetup verify` over the whole image, which key signed it),
-moves `current` to the new version and, with `--rsync`, copies everything to the server. Machines take the new
-version on their next boot; a running machine is unaffected, it has everything in RAM.
-
-Rollback is moving the symlink back, on the server:
-
-```sh
-cd /srv/netboot/safespace && ln -sfn <older-version> .current.new && mv -T .current.new current
-```
-
-Old versions stay bootable while they are there (~2 GiB each); `./netboot-export.sh --prune 3`
-keeps the last three locally.
-
-### Check it
-
-```sh
-curl -I http://arch.boot.internal/safespace/current/boot.efi    # 200 + Content-Length
-./test-vm.sh --netboot --url http://10.0.0.1/safespace/current/boot.efi --ssh 2222   # optional: QEMU
+curl -I http://arch.boot.internal/safespace/network/current/boot.efi    # 200 + Content-Length
+./test-vm.sh --netboot --url http://10.0.0.1/safespace/network/current/boot.efi --ssh 2222   # optional: QEMU
 ```
 
 `test-vm.sh --netboot --url` boots the published build in QEMU by pure UEFI HTTP boot from
@@ -330,7 +393,7 @@ of the host (`sudo ./build.sh network --url http://10.0.2.2:8000/`) — see
 [NETBOOT.md](NETBOOT.md#optional-rehearse-it-in-qemu-first). On a booted machine:
 `journalctl -b -g netroot`, `findmnt /`, `veritysetup status root`, `df -h /run/netroot`.
 
-### A netbooting VM (QEMU, libvirt / virt-manager)
+## A netbooting VM (QEMU, libvirt / virt-manager)
 
 A VM that boots the published build exactly like a machine on the LAN: pure UEFI HTTP boot of
 the signed UKI from the server, no disk, no iPXE. Two forms, both tested: a plain
@@ -352,7 +415,7 @@ Common to both:
   network), which uses the **resolver of the VM host**. A host name in the root URL (the
   `NETROOT_URL` signed into the UKI) only resolves if that host's DNS knows it. If not, use
   the server's IP in `netboot.conf`, or the name plus the IP as fallback
-  (`NETROOT_URL="http://arch.boot.internal/safespace/ http://10.0.0.1/safespace/"`, tried in
+  (`NETROOT_URL="http://arch.boot.internal/safespace/network/ http://10.0.0.1/safespace/network/"`, tried in
   order), and rebuild. Check on the VM host: `getent hosts arch.boot.internal`.
 - **RAM:** at least root.img + 2 GiB (4 GiB).
 - **Guest agent:** the image has `qemu-guest-agent`. It starts by itself when the VM has the
@@ -361,15 +424,14 @@ Common to both:
   `guest-shutdown` (`/etc/qemu/qemu-ga.conf`, `allow-rpcs=`): no `guest-exec`, no file
   access, no password setting, so the VM host gets no command channel into the system.
 
-#### Plain QEMU, headless
+### Plain QEMU, headless
 
-On any host with QEMU and OVMF, no checkout needed. Arch paths; Debian/Ubuntu:
-`/usr/share/OVMF/OVMF_CODE_4M.secboot.fd` and `OVMF_VARS_4M.fd`. Runs in the foreground,
+On any host with QEMU and OVMF (`qemu-desktop edk2-ovmf`), no checkout needed. Runs in the foreground,
 also as root over ssh without a desktop; Ctrl-C stops it.
 
 ```sh
 cp /usr/share/edk2/x64/OVMF_VARS.4m.fd safespace-vm-vars.fd      # once: the VM's NVRAM
-qemu-system-x86_64 -machine q35,smm=on,accel=kvm -cpu host -smp 2 -m 4096 -global driver=cfi.pflash01,property=secure,value=on -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd -drive if=pflash,format=raw,file=safespace-vm-vars.fd -fw_cfg name=opt/org.tianocore/IPv4PXESupport,string=n -fw_cfg name=opt/org.tianocore/IPv6PXESupport,string=n -nic user,model=virtio-net-pci,bootfile=http://10.0.0.1/safespace/current/boot.efi,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-serial -chardev socket,id=qga,path=safespace-vm-qga.sock,server=on,wait=off -device virtserialport,chardev=qga,name=org.qemu.guest_agent.0 -boot order=n -display none -serial file:safespace-vm-serial.log
+qemu-system-x86_64 -machine q35,smm=on,accel=kvm -cpu host -smp 2 -m 4096 -global driver=cfi.pflash01,property=secure,value=on -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd -drive if=pflash,format=raw,file=safespace-vm-vars.fd -fw_cfg name=opt/org.tianocore/IPv4PXESupport,string=n -fw_cfg name=opt/org.tianocore/IPv6PXESupport,string=n -nic user,model=virtio-net-pci,bootfile=http://10.0.0.1/safespace/network/current/boot.efi,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-serial -chardev socket,id=qga,path=safespace-vm-qga.sock,server=on,wait=off -device virtserialport,chardev=qga,name=org.qemu.guest_agent.0 -boot order=n -display none -serial file:safespace-vm-serial.log
 ssh -p 2222 <user>@127.0.0.1                                      # after ~1 min; a user from users.conf
 echo '{"execute":"guest-network-get-interfaces"}' | socat - UNIX-CONNECT:safespace-vm-qga.sock   # the guest agent
 ```
@@ -387,7 +449,7 @@ echo '{"execute":"guest-network-get-interfaces"}' | socat - UNIX-CONNECT:safespa
 
 Without Secure Boot in the VM: `OVMF_CODE.4m.fd`, and drop `smm=on` and the `-global` option.
 
-#### Persistent machine in libvirt (virt-manager)
+### Persistent machine in libvirt (virt-manager)
 
 libvirt's user network has no `bootfile=`, so the boot URL comes from the DHCP server of a
 small libvirt NAT network of its own; other networks and VMs stay untouched. As root on the
@@ -404,7 +466,7 @@ VM host (change `192.168.150.0/24` if it is in use there).
      <ip address='192.168.150.1' netmask='255.255.255.0'>
        <dhcp>
          <range start='192.168.150.100' end='192.168.150.199'/>
-         <bootp file='http://10.0.0.1/safespace/current/boot.efi'/>
+         <bootp file='http://10.0.0.1/safespace/network/current/boot.efi'/>
        </dhcp>
      </ip>
    </network>
@@ -508,9 +570,10 @@ Those paths are closed on the signed command line:
 | extension images (`*.sysext.raw`, `*.confext.raw`) | `systemd.sysext=0`, `systemd.confext=0` and `rd.` variants; the units are also masked in the initrd and on the system |
 
 `diagnose.sh` checks all of this on a burned stick, including that the ESP holds nothing but
-systemd-boot and the UKI. For the network variant, `netboot-export.sh` does the equivalent
-check before publishing (root hash in the UKI vs. the published images, `veritysetup verify`
-over the whole root image, and which key signed the UKI).
+systemd-boot and the UKI (`--db-cert`: signatures against the db certificate). For released
+images, `release.sh` and every distribution server's import do the equivalent before serving
+(signature against `db.pem`, root hash from the signed command line, `veritysetup verify` over
+the whole root image; `lib/verify.sh`).
 
 **Preconditions:** Secure Boot on and a firmware password on every machine. Without Secure Boot,
 any command line (and with it any `roothash=`) can be passed in. The `db` key decides
@@ -566,11 +629,14 @@ volumes, networks. RAM (`/var`) would fill up quickly. So:
   Docker 29's default containerd image store is switched off on purpose, so all images live
   in `data-root` and image IDs can be checked against the shipped archives.
 - `/etc/containerd/config.toml`: containerd's data goes to `/opt/docker/containerd`.
+Only in images with the **`docker` group** (`--groups base,docker`); its files are in
+`mkosi.profiles/docker/`.
+
 - **Docker is not started at boot** (not enabled in the preset). Start it by hand once the
   data disk is mounted: `sudo systemctl start docker`. As a second guard, `docker.service`,
   `docker.socket` and `containerd.service` only start when `/opt/docker` is a mount point
   (`ConditionPathIsMountPoint`), so Docker never runs on the read-only root or in RAM.
-- `/etc/fstab` mounts a disk labelled **`safespace-docker`** at `/opt/docker` if present at boot
+- `/etc/fstab` (the entry is added by `mkosi.postinst` with the docker group) mounts a disk labelled **`safespace-docker`** at `/opt/docker` if present at boot
   (`nofail`, 10 s timeout). The filesystem must support overlay2: ext4, xfs with ftype=1, or
   btrfs.
 - Start Docker: `sudo systemctl start docker` (disk present at boot), or for a disk attached
@@ -581,7 +647,8 @@ volumes, networks. RAM (`/var`) would fill up quickly. So:
 1. List them in `docker-images.txt` as `<local name:tag> <source>`, with the source pinned by
    digest (`docker.io/library/nginx@sha256:…`).
 2. `./fetch-images.sh` downloads them with skopeo as archives into
-   `mkosi.extra/usr/share/safespace/docker-images/`, plus `images.list` with each image ID.
+   `mkosi.profiles/docker/mkosi.extra/usr/share/safespace/docker-images/`, plus `images.list`
+   with each image ID.
 3. The build puts them into the dm-verity protected root, so they're verified like everything
    else.
 4. When Docker starts, `safespace-docker-images.service` loads any image whose expected ID
@@ -689,16 +756,17 @@ stops the build if no variant is selected.
 | Network | `20-wired.network`: DHCP on physical ethernet only (`Kind=!*` skips Docker's veth pairs). The network variant configures the same thing once more in the initrd |
 | sudo | `sudoers.d/10-wheel`: `wheel` without password |
 | USB | `usbguard.service.d/10-early.conf`: usbguard starts before `sysinit.target` |
-| Desktop | `tigervnc/vncserver-config-defaults` (XFCE, 1920x1080), `vncserver-config-mandatory` (`localhost` only) |
-| Docker | `docker/daemon.json` (`data-root=/opt/docker/engine`, overlay2, no containerd image store); `containerd/config.toml` (root in `/opt/docker/containerd`); drop-ins for docker, docker.socket and containerd (`RequiresMountsFor=`/`ConditionPathIsMountPoint=/opt/docker`); `safespace-docker-images.service` + `load-docker-images` |
-| Services | `system-preset/10-safespace.preset`: networkd, resolved, timesyncd, sshd, nftables, usbguard, `vncserver@:1`, var-factory, image loader (Docker is not enabled, see "Docker") |
+| Desktop (group `remotedesktop`, `mkosi.profiles/remotedesktop/mkosi.extra/`) | `tigervnc/vncserver-config-defaults` (XFCE, 1920x1080), `vncserver-config-mandatory` (`localhost` only), `20-remotedesktop.preset` (`vncserver@:1`) |
+| Docker (group `docker`, `mkosi.profiles/docker/mkosi.extra/`) | `docker/daemon.json` (`data-root=/opt/docker/engine`, overlay2, no containerd image store); `containerd/config.toml` (root in `/opt/docker/containerd`); drop-ins for docker, docker.socket and containerd (`RequiresMountsFor=`/`ConditionPathIsMountPoint=/opt/docker`); `safespace-docker-images.service` + `load-docker-images`, `20-docker.preset` (image loader; Docker itself is not enabled) |
+| Services | `system-preset/10-safespace.preset`: networkd, resolved, timesyncd, sshd, nftables, usbguard, var-factory; the groups add their own preset files |
+| Groups | `/usr/lib/safespace/groups`: the package groups of this image (written by `mkosi.postinst`) |
 | VM guest agent | `qemu/qemu-ga.conf`: `allow-rpcs=` reporting queries and `guest-shutdown` only; the agent starts via udev only in a VM with the agent channel |
 | Sealing | `safespace-seal`, plus the keys exported by `secureboot-export.sh` |
 | Locale | `etc/locale.gen` (en_US.UTF-8) |
 
 ### Tools around the build (not in the image)
 
-`build.sh`, `secureboot-export.sh`, `burn.sh`, `diagnose.sh`, `netboot-export.sh`,
+`build.sh`, `release.sh`, `secureboot-export.sh`, `burn.sh`, `diagnose.sh`, `netstick.sh`,
 `test-vm.sh`, `hwtest-image.sh`, `update-snapshot.sh`, `fetch-images.sh`: see
 "What's where".
 
@@ -721,29 +789,30 @@ stops the build if no variant is selected.
 
 | File | Purpose |
 |---|---|
-| `build.sh` | the build entry point: picks the variant (`usb` / `network`), fixes the version, puts the netboot URL on the signed command line, then runs mkosi |
-| `mkosi.conf` | what both variants share: packages, kernel command line, UKI, Secure Boot key, verity, compression, caches |
+| `build.sh` | the build entry point (build host): picks the variant (`usb` / `network`) and the package groups, fixes the version, puts the netboot URL on the signed command line, then runs mkosi |
+| `release.sh`, `release.conf.example` | build host: bundles a build as a release, checks it as the servers do, pushes it to the distribution servers (`RELEASE_TARGETS=` in `release.conf`) |
+| `server/` | distribution server: `setup.sh` (preparation), `safespace-netboot` (import, list, activate, rollback, dnsmasq config), `server.conf.example`, `systemd/` (import path + service, `safespace-dhcp`), `nginx/safespace.conf` |
+| `mkosi.profiles/remotedesktop/`, `mkosi.profiles/docker/` | the package groups: packages, files and presets of each |
+| `mkosi.conf` | what both variants share: the base packages, kernel command line, UKI, Secure Boot key, verity, compression, caches |
 | `repos.conf`, `repos.local.conf.example` | package source: `SNAPSHOT=` (date or `latest`) and `MIRROR=`; per-host override in `repos.local.conf` (gitignored); parsed by `lib/repos.sh` |
 | `mkosi.profiles/usb/` | usb variant: `ImageId`, split artifacts, USB lockdown on the command line, USB/SD drivers, and `mkosi.repart/00-esp.conf` (the ESP) |
 | `mkosi.profiles/network/` | network variant: `ImageId`, `SplitArtifacts=…,partitions`, `root=`/`systemd.verity=no`, ethernet drivers, initrd packages |
 | `mkosi.repart/` | erofs root (verity data) and root-verity, for both variants |
-| `mkosi.extra/` | files in the system: sshd, sudo, networkd, usbguard drop-in, TigerVNC, fstab, Docker and containerd config, guest agent restrictions, service presets, unit masks, volatile `/var`, image loader |
+| `mkosi.extra/` | files of the base system: sshd, sudo, networkd, usbguard drop-in, fstab, guest agent restrictions, service presets, unit masks, volatile `/var` |
 | `mkosi.initrd.conf/` | initrd configuration: unit masks for both, `mkosi.profiles/usb/` with `usb-bootdev`, `mkosi.profiles/network/` with `netroot` and the initrd network config |
-| `mkosi.postinst` | `/home` and `/root` into `/var`, users and ssh keys, usbguard, VNC, sudoers check, mount points |
+| `mkosi.postinst` | `/home` and `/root` into `/var`, users and ssh keys, usbguard, sudoers check, mount points; per group: VNC (remotedesktop), the docker group and data disk mount (docker); records the groups |
 | `mkosi.finalize` | resolv.conf, moves the built `/var` to `/usr/share/factory/var` |
 | `mkosi.postoutput` | UKI size and signature checks, netroot URL check (see above) |
 | `docker-images.txt`, `fetch-images.sh` | images to ship and their downloader |
 | `users.conf.example`, `safespace.env` | users and ssh keys (copy to `users.conf`); groups and VNC settings |
-| `netboot.conf.example` | the netboot base URL for the network variant; copy to `netboot.conf` |
+| `netboot.conf.example` | the network variant's root URL on the distribution servers (`<SERVER_URL>/network/`); copy to `netboot.conf` |
 | `mkosi.local.conf.example` | per-host settings (erofs threads, key paths); copy to `mkosi.local.conf` |
-| `burn.sh`, `diagnose.sh` | write a usb image (or `--netstick` a netstick image) to a medium; read-only check incl. `veritysetup verify` and which build is on it, for a netstick whether the server serves its root |
-| `pxe-proxy.sh` | proxy DHCP + TFTP (dnsmasq) for UEFI PXE clients on an existing LAN, e.g. to test a machine without touching the LAN's DHCP server; logs to `mkosi.test/dnsmasq.log` |
+| `burn.sh`, `diagnose.sh` | write a usb image (from `mkosi.output/`, a share path or a distribution server's URL; or `--netstick` a netstick image) to a medium; read-only check incl. signatures against `db.pem` (`--db-cert`), `veritysetup verify` and which build is on it, for a netstick whether the server serves its root |
 | `netstick.sh` | a loader-only USB stick (signed systemd-boot + the published network UKI) for machines whose firmware cannot network-boot the UKI, e.g. the ThinkPad T450s ([NETBOOT.md](NETBOOT.md#machines-that-cannot-network-boot-the-uki-the-netstick)) |
-| `lib/` | shared shell helpers: `repos.sh` (package source), `uefi.sh` (signer of EFI binaries), `keys.sh` (Secure Boot export and PCR signing key for a build) |
+| `lib/` | shared shell helpers: `repos.sh` (package source), `groups.sh` (package groups), `keys.sh` (Secure Boot export and PCR signing key for a build), `verify.sh` (release checks, used by `release.sh` and the servers), `uefi.sh` (signer of EFI binaries, `netstick.sh`) |
 | `mkosi.profiles/debug/` | `./build.sh <variant> --debug`: ethtool, dmidecode, pciutils, kexec-tools, tcpdump, … on top of a variant; the version gets a `-debug` suffix |
-| `netboot-export.sh` | the publish step for a network build (needed for real machines, not a test tool): verify UKI, root hash and root image against each other, write them as `boot.efi`/`root.img`/`root.verity` in `<tree>/<version>/`, move `current`, optionally rsync to the server, prune old versions |
-| `NETBOOT.md` | the network variant end to end: trust model, a netboot server from scratch (dnsmasq + nginx), Secure Boot enrollment, rebuilding and rollout, QEMU test, troubleshooting |
-| `test-vm.sh` | optional rehearsal in QEMU: boot an image as a USB stick, or `--netboot` a published network build (DHCP + HTTP boot, no disk), optionally with enforced Secure Boot, in Setup Mode or sealed |
+| `NETBOOT.md` | the network variant in depth: trust model, what the clients need, DHCP for other servers, Secure Boot enrollment, QEMU test, old firmware, troubleshooting |
+| `test-vm.sh` | optional rehearsal in QEMU: boot an image as a USB stick, or `--netboot` a released network build (DHCP + HTTP boot, no disk), optionally with enforced Secure Boot, in Setup Mode or sealed |
 | `hwtest-image.sh` | diagnostic stick for machines that reset/hang on the real stick: systemd-boot menu that starts the UKI layer by layer (see the script header) |
 | `secureboot-export.sh` | public Secure Boot keys and signed enrollment updates for `safespace-seal`; run by `build.sh` before every build |
 | `update-snapshot.sh` | moves the pinned package snapshot to the newest day |
@@ -752,7 +821,9 @@ stops the build if no variant is selected.
 
 | Task | Command |
 |---|---|
-| Build | `sudo ./build.sh usb` or `sudo ./build.sh network` (`-f` to rebuild unchanged, `--workers N` erofs threads for this run) |
+| Build | `sudo ./build.sh usb\|network --groups base,…` (`-f` to rebuild unchanged, `--workers N` erofs threads for this run) |
+| Release | `./release.sh network\|usb [--channel NAME] [--push safespace@<server>]` |
+| On a distribution server | `safespace-netboot list`, `sudo safespace-netboot activate VERSION [--channel NAME]`, `sudo safespace-netboot rollback`, `journalctl -u safespace-netboot-import` |
 | Other mirror / newest packages | `SNAPSHOT=`/`MIRROR=` in `repos.local.conf` (["Package source"](#package-source-snapshot-and-mirror)) |
 | Update packages | `./update-snapshot.sh && sudo ./build.sh <variant> -f` |
 | Update shipped images | edit `docker-images.txt`, `./fetch-images.sh`, `sudo ./build.sh <variant> -f` |
@@ -761,10 +832,9 @@ stops the build if no variant is selected.
 | Look inside the image | `sudo mkosi --profile=<variant> shell` |
 | Test in a VM (no root) | `./test-vm.sh` / `./test-vm.sh --secure-boot`, or `./test-vm.sh --netboot` (DHCP + HTTP boot, no disk; needs `qemu-desktop edk2-ovmf`, for Secure Boot `virt-firmware`) |
 | Machine does not boot the stick | `./hwtest-image.sh`, write `mkosi.test/hwtest.img` with `dd`, try the menu entries in order |
-| Burn / check (usb) | `sudo ./burn.sh /dev/sdX`, `sudo ./diagnose.sh /dev/sdX` |
+| Burn / check (usb) | `sudo ./burn.sh [IMAGE\|URL] /dev/sdX`, `sudo ./diagnose.sh [--db-cert db.pem] /dev/sdX` |
 | Debug build with diagnostic tools | `sudo ./build.sh <variant> --debug` |
-| Netstick for a machine that cannot network-boot | `sudo ./netstick.sh --tree /srv/netboot/safespace`, then `dd` (the script prints the command) or `sudo ./burn.sh --netstick /dev/sdX` |
-| Publish / roll out (network) | `./netboot-export.sh --rsync arch.boot.internal:/srv/netboot/safespace`, then boot the machine from the network (["Network boot: build and provide"](#network-boot-build-and-provide)) |
+| Netstick for a machine that cannot network-boot | `sudo ./netstick.sh` (from `mkosi.release/network/current`; `--tree /srv/safespace/share/network` on a server), then `dd` (the script prints the command) or `sudo ./burn.sh --netstick /dev/sdX` |
 | Delete outputs / also caches | `sudo mkosi clean` / `sudo mkosi -ff clean` |
 
 **Build host with many cores:** `cp mkosi.local.conf.example mkosi.local.conf` and set
@@ -869,6 +939,15 @@ sectors and a CD boot header; both are fixed (`-S512`, `ElTorito=no`).
 - **TPM:** old TPMs (e.g. the T450s' Intel PTT) fail the NvPCR units of systemd 262
   (`systemd-pcrnvdone` and friends); ignored, the system boots normally.
 - `fetch-images.sh` is untested.
+- **Distribution server:** `release.sh`, the import (all checks, including the rejection
+  of manipulated, unsigned and foreign-signed releases and of usb images), channels,
+  rollback, the nginx site and the generated dnsmasq configuration are tested without root
+  against a local share. Not yet run as root on a real server: `server/setup.sh` itself, the
+  units with their sandbox, the ssh upload through rrsync, and which `dhcp-boot` line
+  dnsmasq picks for a per-machine channel.
+- Builds from before package groups (`20261018-*`) have `GROUPS=unknown` in their release,
+  and their `NETROOT_URL` lacks `/network/`: they cannot be served from a distribution
+  server. Rebuild.
 - **Still open from the security review:**
   - the UKI is signed with the build host's sbctl `db` key (a separate key for the sticks would
     be cleaner);
