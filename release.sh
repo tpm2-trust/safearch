@@ -149,7 +149,7 @@ chmod 0755 "$DEST"
 # --- check it as a server will ---------------------------------------------------
 
 log "Checking the release (as the distribution servers do)"
-tmp=$(mktemp -d "$HERE/mkosi.release/.verify.XXXXXX")
+tmp=$(mktemp -d -t safespace-verify.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
 verify_release "$DEST" "$VARIANT" "$DB" "$tmp" || die "the release does not pass the checks; nothing pushed"
 log "Staged: $DEST ($(du -sh "$DEST" | cut -f1))"

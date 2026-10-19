@@ -29,7 +29,6 @@ for g in remotedesktop docker; do has_group "$g" && groups+=",$g"; done
 log "package groups: $groups"
 install -d "$BUILDROOT/usr/lib/safespace"
 echo "$groups" >"$BUILDROOT/usr/lib/safespace/groups"
-echo "$groups" >"$OUTPUTDIR/${IMAGE_ID}_${IMAGE_VERSION}.groups"
 
 # --- users from users.conf ("username:ssh-public-key", one key per line) --------
 

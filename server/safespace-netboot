@@ -65,7 +65,7 @@ verify_one() { # VARIANT -> 0 ok, 1 broken
 	fp=$(fingerprint "$variant")
 	version=$(release_get "$SHARE/$variant/release" VERSION 2>/dev/null || true)
 	log "checking $variant ${version:-(no release)}"
-	tmp=$(mktemp -d "${CACHE_DIRECTORY:-${TMPDIR:-/var/tmp}}/verify.XXXXXX")
+	tmp=$(mktemp -d -t safespace-verify.XXXXXX)
 	out=$(verify_release "$SHARE/$variant" "$variant" "$DB_CERT" "$tmp" 2>&1) || rc=1
 	rm -rf "$tmp"
 	printf '%s\n' "$out" | sed 's/^/  /'

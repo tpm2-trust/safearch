@@ -56,7 +56,7 @@ esac
 if [[ $IMAGE =~ ^https?:// ]]; then
 	command -v curl >/dev/null || die "missing 'curl'"
 	[[ $IMAGE == */ ]] && IMAGE+=image.raw.zst
-	DL=$(mktemp -d /var/tmp/safespace-burn.XXXXXX)
+	DL=$(mktemp -d -t safespace-burn.XXXXXX)
 	trap 'rm -rf "$DL"' EXIT
 	log "Downloading $IMAGE"
 	curl -fL --progress-bar -o "$DL/image.raw.zst" "$IMAGE" || die "download failed"

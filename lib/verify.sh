@@ -6,7 +6,7 @@
 #   verify_release DIR VARIANT DB_CERT [TMPDIR]
 #       network: boot.efi root.img root.verity roothash cmdline release SHA256SUMS
 #       usb:     image.raw.zst roothash release SHA256SUMS (TMPDIR: room for the
-#                unpacked image plus a copy of its root partition)
+#                unpacked image, ~2.2 GiB; then for its root partition alone)
 #   release_get FILE KEY        value of KEY=... in a release file (not sourced)
 #   verify_name_version VALUE
 #
@@ -120,11 +120,18 @@ verify_usb() { # DIR DB_CERT ROOTHASH TMPDIR
 	verify_cmdline_roothash "$cmdline" "$roothash" || return
 	vinfo "signed command line: roothash matches"
 	# veritysetup needs the data at offset 0 of a file: cut the partitions out.
-	for p in root verity; do
-		set -- ${!p}
-		dd if="$raw" of="$tmp/$p.img" bs=4M iflag=skip_bytes,count_bytes skip=$(($1 * 512)) count=$(($2 * 512)) status=none || return
-	done
+	# The hash tree from the unpacked image, which then goes; the root
+	# partition straight from the compressed one, so the temp space never
+	# holds both (tmpfs).
+	set -- $verity
+	dd if="$raw" of="$tmp/verity.img" bs=4M iflag=skip_bytes,count_bytes skip=$(($1 * 512)) count=$(($2 * 512)) status=none || return
 	rm -f "$raw"
+	set -- $root
+	# zstd stops on a closed pipe once dd has what it needs: only dd's exit
+	# status counts (a broken stream fails the dm-verity check below anyway).
+	{ zstd -dqc "$dir/image.raw.zst" 2>/dev/null || true; } |
+		dd of="$tmp/root.img" bs=4M iflag=fullblock,skip_bytes,count_bytes skip=$(($1 * 512)) count=$(($2 * 512)) status=none || return
+	[[ $(stat -c %s "$tmp/root.img") == $(($2 * 512)) ]] || vfail "image.raw.zst ends before the root partition does" || return
 	veritysetup verify "$tmp/root.img" "$tmp/verity.img" "$roothash" >&2 ||
 		vfail "the root partition does not match the signed root hash" || return
 	vinfo "root partition matches the signed root hash"

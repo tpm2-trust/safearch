@@ -13,8 +13,8 @@ User=safespace
 Group=safespace
 ExecStart=/usr/local/bin/safespace-netboot verify --changed
 UMask=0022
-# Room for unpacking a usb image while it is checked (on disk, not in RAM).
-CacheDirectory=safespace
+# Temp files (a usb image while it is checked, ~2.2 GiB) go to its private
+# /tmp (tmpfs), gone when the check ends.
 ReadOnlyPaths=@SHARE@
 ReadWritePaths=/var/lib/safespace/state
 ProtectSystem=strict

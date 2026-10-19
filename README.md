@@ -362,7 +362,7 @@ and 4011.
 |---|---|
 | `nginx.service` | serves the share as `http://<server>/safespace/`: GET/HEAD only, no directory listing, no hidden files (rsync's temp directory during an upload) |
 | `safespace-netboot-verify.path` | starts the check when `network/release` or `usb/release` changes (`release.sh` writes it last) |
-| `safespace-netboot-verify.service` | `safespace-netboot verify --changed` as user `safespace`, sandboxed, read-only on the share, without network; records the result in `/var/lib/safespace/state/`; a broken release leaves the unit failed |
+| `safespace-netboot-verify.service` | `safespace-netboot verify --changed` as user `safespace`, sandboxed, read-only on the share, without network; records the result in `/var/lib/safespace/state/`; a broken release leaves the unit failed. Checking a usb image needs ~2.2 GiB in `/tmp` (its private tmpfs, RAM) while it runs |
 | `safespace-dhcp.service` | dnsmasq for `DHCP_MODE=proxy` or `dhcp`, configuration generated from `server.conf` on every start; TFTP serves the share |
 
 ### Every day

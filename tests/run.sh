@@ -98,8 +98,7 @@ fixtures() {
 		DHCP_DNS=10.0.0.1
 	EOF
 	chmod 0644 "$W/server.conf"
-	export SAFESPACE_SERVER_CONF=$W/server.conf CACHE_DIRECTORY=$W/cache
-	mkdir -p "$CACHE_DIRECTORY"
+	export SAFESPACE_SERVER_CONF=$W/server.conf
 }
 NB=$REPO/server/safespace-netboot
 # The share with both releases, for the tests that do not test releasing.
