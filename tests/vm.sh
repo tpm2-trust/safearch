@@ -30,6 +30,8 @@
 # Steps (each boot headless, checked over ssh as tester, then powered off):
 #   (always) release.sh into run-<time>/share, then server/safespace-netboot
 #           verify on it: the checks a distribution server makes
+#   (every boot) root verified, kernel lockdown "integrity", running, no
+#           failed units
 #   stick   usb-bootdev opened the root, netroot did not run,
 #           LoaderDevicePartUUID set, the stick read-only, root verified,
 #           system running without failed units
@@ -241,6 +243,7 @@ echo state=$(systemctl is-system-running)
 echo failed=$(systemctl --failed --no-legend --plain | wc -l)
 echo combination=$(sudo dmesg | sed -n "s/.*\(usb-bootdev\|netroot\): combination \([a-z0-9-]*\) .*/\2/p" | tail -1)
 command -v docker >/dev/null && echo docker=yes || echo docker=no
+echo lockdown=$(sudo cat /sys/kernel/security/lockdown | sed -n "s/.*\[\(.*\)\].*/\1/p")
 echo secure_boot=$(bootctl status 2>/dev/null | sed -n "s/^ *Secure Boot: *//p" | head -1 | tr " " _)
 '
 probe() { vm_ssh "$PROBE" >"$LOGS/$1.probe" 2>&1; }
@@ -257,7 +260,7 @@ expect() {
 	if [[ -z $bad ]]; then result PASS "$name"; else result FAIL "$name" "$bad"; fi
 }
 
-COMMON=(root=/dev/mapper/root,erofs verity=verified state=running failed=0)
+COMMON=(root=/dev/mapper/root,erofs verity=verified state=running failed=0 lockdown=integrity)
 STICK=$RUN/stick.raw
 
 if wants stick || wants seal; then

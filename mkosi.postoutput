@@ -27,8 +27,11 @@ for uki in "$OUTPUTDIR"/*.efi; do
 	((bytes <= limit_mib * 1048576)) || { echo "safespace: ERROR: UKI larger than $limit_mib MiB" >&2; exit 1; }
 	((bytes <= warn_mib * 1048576)) ||
 		echo "safespace: WARNING: UKI larger than $warn_mib MiB: some firmware cannot start a network boot program this large (NETBOOT.md, \"Size of the network UKI\")" >&2
-	# Without a root URL the image boots from sticks only.
 	cmdline=$(objcopy -O binary --only-section=.cmdline "$uki" /dev/stdout 2>/dev/null | tr -d '\0')
+	# Kernel lockdown is part of the security model (mkosi.conf, SECURITY.md).
+	[[ " $cmdline " == *" lockdown=integrity "* ]] ||
+		{ echo "safespace: ERROR: the UKI's command line lacks lockdown=integrity" >&2; exit 1; }
+	# Without a root URL the image boots from sticks only.
 	if [[ $cmdline == *safespace.netroot=* ]]; then
 		echo "safespace: netroot URL(s): $(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace.netroot=//p' | tr '\n' ' ')"
 	else

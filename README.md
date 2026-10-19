@@ -207,9 +207,10 @@ ones. The build records the set: the build's directory name and `build.json`,
 
 `--debug` is **not** a group and stays separate: it adds diagnostic tools (ethtool,
 dmidecode, pciutils, usbutils, lshw, iperf3, tcpdump, kexec-tools) and marks the version
-`-debug`; no security setting is changed. ⚠️ `kexec-tools` lets root boot an unsigned kernel
-past Secure Boot, because the kernel does not enforce lockdown (see "Known open points"):
-do not release debug builds to production servers.
+`-debug`; no security setting is changed. Under the kernel lockdown (`lockdown=integrity`,
+[SECURITY.md](SECURITY.md)) `kexec-tools` can only start signed kernels and `lshw` loses its
+`/dev/mem` fallback (less detail); `dmidecode` reads `/sys/firmware/dmi` and is unaffected.
+Debug builds are still not meant for production servers.
 
 ## Combinations: the whole stack in one build
 
@@ -921,6 +922,7 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 | `systemd.credentials_boot_policy=strict` | no null-key credentials from the ESP |
 | `systemd.sysext=0`, `systemd.confext=0`, `rd.systemd.sysext=0`, `rd.systemd.confext=0` | no extension images over `/usr` and `/etc` |
 | `systemd.firstboot=off` | no first-boot questions |
+| `lockdown=integrity` | kernel lockdown: no unsigned kexec or modules, no `/dev/mem`, MSR writes, `iopl`, hibernation; the Arch kernel does not enable it under Secure Boot by itself. `mkosi.postoutput` refuses a UKI without it ([SECURITY.md](SECURITY.md)) |
 | `root=/dev/mapper/root`, `rootfstype=erofs`, `ro`, `systemd.verity=no`, `rd.systemd.verity=no` | the initrd opens the verity device itself under that name, on either path (`usb-bootdev` or `netroot`, both with `--panic-on-corruption`), so systemd's verity generator stays out of it |
 | `safespace.netroot=<url>/` | where `netroot` fetches `roothash`, `root.verity` and `root.img` (from `NETROOT_URL`); signed, so it cannot be redirected. Without it the build boots from sticks only |
 
@@ -1018,6 +1020,7 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 | `burn.sh`, `diagnose.sh` | write a stick from a build (the newest in `mkosi.output/`), a release directory, a share or a distribution server's URL; read-only check incl. signatures against `db.pem` (`--db-cert`), `veritysetup verify` and which build is on it |
 | `lib/` | shared shell helpers: `repos.sh` (package source), `groups.sh` (package groups), `keys.sh` (Secure Boot keys: which set, export into the image, PCR signing key), `builds.sh` (the builds in `mkosi.output/`: their parts, list, show, diff, select, prune), `stick.sh` (a usb stick assembled from the parts: `burn.sh`, `test-vm.sh`), `verify.sh` (release checks, used by `release.sh` and the servers) |
 | `mkosi.profiles/debug/` | `./build.sh --debug`: ethtool, dmidecode, pciutils, kexec-tools, tcpdump, …; the version gets a `-debug` suffix |
+| `SECURITY.md` | the hardening of the standard installation, each measure with where it is configured |
 | `NETBOOT.md` | network boot in depth: trust model, what the clients need, DHCP for other servers, Secure Boot enrollment, QEMU test, old firmware, troubleshooting |
 | `test-vm.sh` | optional rehearsal in QEMU: boot an image as a USB stick, or `--netboot` a released network build (DHCP + HTTP boot, no disk), optionally with enforced Secure Boot, in Setup Mode or sealed |
 | `hwtest-image.sh` | diagnostic stick for machines that reset/hang on the real stick: systemd-boot menu that starts the UKI layer by layer (see the script header) |
@@ -1172,8 +1175,8 @@ sectors and a CD boot header; both are fixed (`-S512`, `ElTorito=no`).
     (`SAFESPACE_SBCTL_CONFIG`) is the cleaner choice;
   - the build runs as root from a folder a normal user can write to;
   - old signed images stay bootable wherever someone has a copy (a server only serves the
-    newest, but an old usb stick or a copied UKI still boots on a sealed machine);
-  - no kernel lockdown parameters.
+    newest, but an old usb stick or a copied UKI still boots on a sealed machine; builds
+    from before `lockdown=integrity` boot without the lockdown).
 - The data disk is unverified. Shipped images are reloaded when their ID doesn't match, but
   Docker doesn't re-check layer contents that are already on the disk.
 - USB keyboards are blocked even at boot, and SD readers on USB with a vendor-specific interface

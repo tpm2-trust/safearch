@@ -761,3 +761,26 @@ with `--groups LIST` (also what the combined build runs internally). `--combined
 ## Open questions
 
 - (answered: `--combined` goes away.)
+
+---
+# PLAN: kernel lockdown (integrity) and SECURITY.md
+
+## Goal
+
+The signed command line enables `lockdown=integrity` (today not active: the Arch kernel
+defaults to `LOCK_DOWN_KERNEL_FORCE_NONE`). The build refuses an image without it, the
+integration test checks it in every boot. SECURITY.md lists the hardening of the standard
+installation, from the repository's actual configuration.
+
+## Steps
+
+- [x] 1. `mkosi.conf`: `lockdown=integrity` in `KernelCommandLine=`.
+- [x] 2. `mkosi.postoutput`: refuse a UKI whose signed command line lacks it.
+- [x] 3. `tests/vm.sh`: probe `/sys/kernel/security/lockdown`, expect `integrity` in every boot.
+- [x] 4. README: lockdown, `--debug` (kexec-tools / lshw affected), known open point resolved.
+- [x] 5. SECURITY.md: the applied hardening (each item with where it is configured).
+- [x] 6. `tests/run.sh`, then `tests/vm.sh`: all PASS, lockdown=integrity in all 9 boots (combined_20261019-1505).
+
+## Breaks
+
+- Debug builds: `kexec` of arbitrary kernels, `lshw`'s `/dev/mem` fallback.

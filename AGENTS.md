@@ -71,7 +71,7 @@ safespace-arch: a read-only, Secure-Boot-signed Arch Linux image built with
 mkosi 27: one build boots from a USB stick / SD card and over the network, package
 groups decide what is in it. README.md is
 the user manual (read "Two roles" and "Deploy from scratch" first), NETBOOT.md
-the network-boot reference. Arch Linux only, everywhere.
+the network-boot reference, SECURITY.md the applied hardening. Arch Linux only, everywhere.
 
 ### Map
 
@@ -96,6 +96,7 @@ the network-boot reference. Arch Linux only, everywhere.
 - **A distribution server trusts only the pinned public `db.pem`** and never
   alters what it serves: it reports, the build host replaces. The upload account
   is confined by rrsync (write-only, no delete, share only).
+- **`lockdown=integrity` on the signed command line** (`mkosi.postoutput` enforces it).
 - **Root only through dm-verity** with the root hash from the signed command
   line; nothing on the boot medium is ever written; `/var` is RAM.
 - **One build serves both boot paths** (stick and network), chosen by the initrd at boot;
@@ -128,5 +129,6 @@ the network-boot reference. Arch Linux only, everywhere.
   helpers; validate every input that ends up in a path, a URL or a config file;
   comments say why, not what.
 - Docs: every user-visible change goes into README.md (and NETBOOT.md if it
-  concerns network boot) in the same change; keep the anchors working.
+  concerns network boot, SECURITY.md if it changes a security measure) in the same
+  change; keep the anchors working.
 - PLAN.md holds the current plan; finished plans stay in git history.
