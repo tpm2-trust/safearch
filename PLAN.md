@@ -784,3 +784,9 @@ installation, from the repository's actual configuration.
 ## Breaks
 
 - Debug builds: `kexec` of arbitrary kernels, `lshw`'s `/dev/mem` fallback.
+
+---
+# PLAN: TPM2 binding of a machine to its assigned variant
+
+Proposal written up in [PLAN-TPM2-BINDING.md](PLAN-TPM2-BINDING.md) (design, security
+analysis, steps, open questions). Not started; waits for the open questions there.
