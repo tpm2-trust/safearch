@@ -355,6 +355,11 @@ Common to both:
   (`NETROOT_URL="http://arch.boot.internal/safespace/ http://10.0.0.1/safespace/"`, tried in
   order), and rebuild. Check on the VM host: `getent hosts arch.boot.internal`.
 - **RAM:** at least root.img + 2 GiB (4 GiB).
+- **Guest agent:** the image has `qemu-guest-agent`. It starts by itself when the VM has the
+  agent channel (virtio port `org.qemu.guest_agent.0`) and reports IP addresses, OS, host
+  name, users and filesystems to the VM host. It only answers those queries and
+  `guest-shutdown` (`/etc/qemu/qemu-ga.conf`, `allow-rpcs=`): no `guest-exec`, no file
+  access, no password setting, so the VM host gets no command channel into the system.
 
 #### Plain QEMU, headless
 
@@ -364,8 +369,9 @@ also as root over ssh without a desktop; Ctrl-C stops it.
 
 ```sh
 cp /usr/share/edk2/x64/OVMF_VARS.4m.fd safespace-vm-vars.fd      # once: the VM's NVRAM
-qemu-system-x86_64 -machine q35,smm=on,accel=kvm -cpu host -smp 2 -m 4096 -global driver=cfi.pflash01,property=secure,value=on -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd -drive if=pflash,format=raw,file=safespace-vm-vars.fd -fw_cfg name=opt/org.tianocore/IPv4PXESupport,string=n -fw_cfg name=opt/org.tianocore/IPv6PXESupport,string=n -nic user,model=virtio-net-pci,bootfile=http://10.0.0.1/safespace/current/boot.efi,hostfwd=tcp:127.0.0.1:2222-:22 -boot order=n -display none -serial file:safespace-vm-serial.log
+qemu-system-x86_64 -machine q35,smm=on,accel=kvm -cpu host -smp 2 -m 4096 -global driver=cfi.pflash01,property=secure,value=on -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/x64/OVMF_CODE.secboot.4m.fd -drive if=pflash,format=raw,file=safespace-vm-vars.fd -fw_cfg name=opt/org.tianocore/IPv4PXESupport,string=n -fw_cfg name=opt/org.tianocore/IPv6PXESupport,string=n -nic user,model=virtio-net-pci,bootfile=http://10.0.0.1/safespace/current/boot.efi,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-serial -chardev socket,id=qga,path=safespace-vm-qga.sock,server=on,wait=off -device virtserialport,chardev=qga,name=org.qemu.guest_agent.0 -boot order=n -display none -serial file:safespace-vm-serial.log
 ssh -p 2222 <user>@127.0.0.1                                      # after ~1 min; a user from users.conf
+echo '{"execute":"guest-network-get-interfaces"}' | socat - UNIX-CONNECT:safespace-vm-qga.sock   # the guest agent
 ```
 
 | Part | Why |
@@ -376,6 +382,7 @@ ssh -p 2222 <user>@127.0.0.1                                      # after ~1 min
 | `-fw_cfg name=opt/org.tianocore/IPv4PXESupport,string=n` (and IPv6) | no PXE boot entries: HTTP boot right away |
 | `-nic user,…,bootfile=` | QEMU's user network is the DHCP server, `bootfile=` is its option 67 (the server's IP, so the firmware needs no DNS) |
 | `hostfwd=tcp:127.0.0.1:2222-:22` | ssh into the VM from this host only (`tcp::2222-:22` opens it to the network) |
+| `-device virtio-serial`, `-chardev socket,…`, `virtserialport,…name=org.qemu.guest_agent.0` | the guest agent's channel; on the VM host it is the socket `safespace-vm-qga.sock` |
 | `-display none`, `-serial file:…` | no window; `safespace-vm-serial.log` shows the firmware's netboot (`Start HTTP Boot over IPv4`, `Downloading...100%`). The kernel console is not on the serial port (no `console=ttyS0` in the UKI), so the system is reached over ssh |
 
 Without Secure Boot in the VM: `OVMF_CODE.4m.fd`, and drop `smm=on` and the `-global` option.
@@ -429,12 +436,15 @@ VM host (change `192.168.150.0/24` if it is in use there).
    virsh destroy safespace-netboot; virsh start safespace-netboot --reset-nvram
    ```
 
-The VM appears in virt-manager as `safespace-netboot`, with its console there. Its address,
-for ssh from the VM host:
+The VM appears in virt-manager as `safespace-netboot`, with its console there. `virt-install`
+adds the guest agent channel by itself, so virt-manager shows the VM's IP addresses
+(Details → NIC). Its address, for ssh from the VM host:
 
 ```sh
-virsh net-dhcp-leases safespace-netboot
+virsh domifaddr safespace-netboot --source agent     # or: virsh net-dhcp-leases safespace-netboot
 ssh <user>@192.168.150.1xx
+virsh qemu-agent-command safespace-netboot '{"execute":"guest-get-osinfo"}'   # answers
+virsh qemu-agent-command safespace-netboot '{"execute":"guest-exec","arguments":{"path":"/bin/true"}}'   # refused: command disabled
 ```
 
 It boots what `current` points to; to pin a version, put it into `<bootp file=…>`
@@ -556,13 +566,15 @@ volumes, networks. RAM (`/var`) would fill up quickly. So:
   Docker 29's default containerd image store is switched off on purpose, so all images live
   in `data-root` and image IDs can be checked against the shipped archives.
 - `/etc/containerd/config.toml`: containerd's data goes to `/opt/docker/containerd`.
-- `docker.service`, `docker.socket` and `containerd.service` only start when `/opt/docker`
-  is a mount point (`ConditionPathIsMountPoint`). Without the disk, Docker stays off
-  instead of failing on the read-only root or filling RAM.
+- **Docker is not started at boot** (not enabled in the preset). Start it by hand once the
+  data disk is mounted: `sudo systemctl start docker`. As a second guard, `docker.service`,
+  `docker.socket` and `containerd.service` only start when `/opt/docker` is a mount point
+  (`ConditionPathIsMountPoint`), so Docker never runs on the read-only root or in RAM.
 - `/etc/fstab` mounts a disk labelled **`safespace-docker`** at `/opt/docker` if present at boot
   (`nofail`, 10 s timeout). The filesystem must support overlay2: ext4, xfs with ftype=1, or
   btrfs.
-- Attached later: `sudo mount /dev/<datadisk> /opt/docker && sudo systemctl start docker`.
+- Start Docker: `sudo systemctl start docker` (disk present at boot), or for a disk attached
+  later `sudo mount /dev/<datadisk> /opt/docker && sudo systemctl start docker`.
 
 **Images on the stick:**
 
@@ -679,7 +691,8 @@ stops the build if no variant is selected.
 | USB | `usbguard.service.d/10-early.conf`: usbguard starts before `sysinit.target` |
 | Desktop | `tigervnc/vncserver-config-defaults` (XFCE, 1920x1080), `vncserver-config-mandatory` (`localhost` only) |
 | Docker | `docker/daemon.json` (`data-root=/opt/docker/engine`, overlay2, no containerd image store); `containerd/config.toml` (root in `/opt/docker/containerd`); drop-ins for docker, docker.socket and containerd (`RequiresMountsFor=`/`ConditionPathIsMountPoint=/opt/docker`); `safespace-docker-images.service` + `load-docker-images` |
-| Services | `system-preset/10-safespace.preset`: networkd, resolved, timesyncd, sshd, nftables, docker, usbguard, `vncserver@:1`, var-factory, image loader |
+| Services | `system-preset/10-safespace.preset`: networkd, resolved, timesyncd, sshd, nftables, usbguard, `vncserver@:1`, var-factory, image loader (Docker is not enabled, see "Docker") |
+| VM guest agent | `qemu/qemu-ga.conf`: `allow-rpcs=` reporting queries and `guest-shutdown` only; the agent starts via udev only in a VM with the agent channel |
 | Sealing | `safespace-seal`, plus the keys exported by `secureboot-export.sh` |
 | Locale | `etc/locale.gen` (en_US.UTF-8) |
 
@@ -714,7 +727,7 @@ stops the build if no variant is selected.
 | `mkosi.profiles/usb/` | usb variant: `ImageId`, split artifacts, USB lockdown on the command line, USB/SD drivers, and `mkosi.repart/00-esp.conf` (the ESP) |
 | `mkosi.profiles/network/` | network variant: `ImageId`, `SplitArtifacts=…,partitions`, `root=`/`systemd.verity=no`, ethernet drivers, initrd packages |
 | `mkosi.repart/` | erofs root (verity data) and root-verity, for both variants |
-| `mkosi.extra/` | files in the system: sshd, sudo, networkd, usbguard drop-in, TigerVNC, fstab, Docker and containerd config, service presets, unit masks, volatile `/var`, image loader |
+| `mkosi.extra/` | files in the system: sshd, sudo, networkd, usbguard drop-in, TigerVNC, fstab, Docker and containerd config, guest agent restrictions, service presets, unit masks, volatile `/var`, image loader |
 | `mkosi.initrd.conf/` | initrd configuration: unit masks for both, `mkosi.profiles/usb/` with `usb-bootdev`, `mkosi.profiles/network/` with `netroot` and the initrd network config |
 | `mkosi.postinst` | `/home` and `/root` into `/var`, users and ssh keys, usbguard, VNC, sudoers check, mount points |
 | `mkosi.finalize` | resolv.conf, moves the built `/var` to `/usr/share/factory/var` |
@@ -802,48 +815,21 @@ with the expected layout if it is not there.
 
 ## Troubleshooting: the machine resets instead of booting
 
-**Case found so far** (one real machine, Secure Boot in Setup Mode): right after selecting the
-stick, the machine reset without any output. The same image booted in QEMU, and an Arch ISO
-booted from the same port.
-
-How it was narrowed down:
-
-1. **Is the right image on the stick?** `diagnose.sh` shows the build on the stick (root hash vs.
-   `mkosi.output/*.roothash`). The first attempt had an older build burned, with 4K FAT
-   sectors and a CD boot header; both are fixed in the build now (`-S512`, `ElTorito=no`).
-2. **Diagnostic stick.** `./hwtest-image.sh` builds a stick with a systemd-boot menu that starts
-   the same UKI layer by layer: the full UKI, the UKI without microcode, systemd-stub with the
-   kernel only, the kernel without stub, the kernel with initrd, with and without microcode.
-   **All entries booted**, including the unmodified UKI.
-3. **Compare the sticks.** Both FAT filesystems were identical apart from the label
-   (FAT32, 512-byte sectors, same geometry). The only difference left: on the real stick, the
-   firmware's boot manager started the 90 MiB UKI directly as `\EFI\BOOT\BOOTX64.EFI`; on
-   the diagnostic stick, systemd-boot (130 KiB) was `BOOTX64.EFI` and loaded the UKI.
-
-**Finding:** this firmware resets when its boot manager starts a 90 MiB UKI as
-`BOOTX64.EFI`, but loads the same file fine when systemd-boot asks for it. Hence
-`Bootloader=systemd-boot`: a small signed systemd-boot as `BOOTX64.EFI`, the UKI in
-`\EFI\Linux\`, no `loader.conf` (boots the only UKI immediately). With that, the stick boots
-on that machine.
+**Case found** (usb variant, one machine): the firmware reset without output when its boot
+manager started the 90 MiB UKI directly as `\EFI\BOOT\BOOTX64.EFI`, but loaded the same
+file when systemd-boot asked for it. Hence `Bootloader=systemd-boot` (a small signed
+`BOOTX64.EFI`, the UKI in `\EFI\Linux\`, no `loader.conf`). Older builds also had 4K FAT
+sectors and a CD boot header; both are fixed (`-S512`, `ElTorito=no`).
 
 **If another machine doesn't boot:**
 
 1. `sudo ./diagnose.sh /dev/sdX`: right build, 512-byte FAT, no ISO9660 header,
    systemd-boot as `BOOTX64.EFI`.
-2. Note when it fails (immediately without output, after kernel messages, after 30-90 s),
-   the Secure Boot state, and whether other live sticks boot.
-3. `./hwtest-image.sh`, then write the image (the script prints the `dd` command), try entries
-   1-6 and note which ones fail. Entries 3-6 print kernel messages from the start, so a crash
-   shows how far it got. The test files are unsigned: Secure Boot must be off or in Setup Mode.
-
-| Result | Points to |
-|---|---|
-| no menu at all | firmware can't start anything from this layout (partition table, FAT) |
-| 4 fails | kernel |
-| 4 boots, 3 fails | systemd-stub |
-| 5 boots, 6 fails / 2 boots, 1 fails | microcode |
-| 3 and 4 boot, 1/2/5/6 fail | initrd size or content |
-| all boot, real stick doesn't | how the firmware starts the real ESP's `BOOTX64.EFI` (the case above) |
+2. Note when it fails (immediately, after kernel messages, after 30-90 s), the Secure Boot
+   state, and whether other live sticks boot.
+3. `./hwtest-image.sh`: a stick with a menu that starts the UKI layer by layer; the script
+   header says which result points to which layer. The test files are unsigned: Secure Boot
+   off or in Setup Mode.
 
 ## USB lockdown
 
@@ -873,19 +859,16 @@ on that machine.
 
 ## Known open points
 
-- **Tested on one real machine only** (usb variant). Firmware differs (FAT handling, UKI
-  loading, option ROMs when sealing with `--replace`); `hwtest-image.sh` helps to find out why
-  a machine doesn't boot.
-- **The network variant has not run on real hardware yet.** Open points specific to it:
-  UEFI HTTP boot has to be available (PXE/TFTP is a slow fallback); the ~110 MiB UKI may hit
-  firmware limits; the root image (~2 GiB) is downloaded into RAM on every boot, so the
-  machines need the RAM and the server the bandwidth; the server address is part of the signed
-  command line, so moving it means rebuilding; and a machine cannot boot at all while the
-  server is down. See [NETBOOT.md](NETBOOT.md), "Known limits".
+- **Real hardware so far:** the usb variant on one machine; the network variant on a ThinkPad
+  T450s over PXE (Intel AMT off). UEFI HTTP boot is tested in QEMU/libvirt only. Firmware
+  differs (FAT handling, UKI size for network boot, option ROMs when sealing with
+  `--replace`); `hwtest-image.sh` helps to find out why a machine doesn't boot.
+- **Network variant limits:** the root image (~2 GiB) is downloaded into RAM on every boot;
+  the server address is part of the signed command line (moving it means rebuilding); no
+  boot while the server is down. See [NETBOOT.md](NETBOOT.md), "Known limits".
+- **TPM:** old TPMs (e.g. the T450s' Intel PTT) fail the NvPCR units of systemd 262
+  (`systemd-pcrnvdone` and friends); ignored, the system boots normally.
 - `fetch-images.sh` is untested.
-- Without a data disk, the console shows "Dependency failed" for docker.socket,
-  docker.service, containerd and the image loader. That's expected: they hard-require the
-  `/opt/docker` mount, which fails after 10 s without the disk. No unit ends up failed.
 - **Still open from the security review:**
   - the UKI is signed with the build host's sbctl `db` key (a separate key for the sticks would
     be cleaner);

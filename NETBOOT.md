@@ -92,8 +92,7 @@ Nothing is installed on the machine itself, and the machine needs no local file.
   and checks it against `db`, no extra loader in between. PXE/TFTP is only the
   alternative for older machines whose firmware has no HTTP boot (e.g. the ThinkPad
   T450s, [Case found](#case-found-thinkpad-t450s-bios-jbet73ww)); it starts the same
-  signed UKI directly. iPXE is not part of either path (it was only used to diagnose
-  the T450s).
+  signed UKI directly. No iPXE in either path.
 - **A PCI/PCIe NIC.** USB NICs do not work: the kernel authorizes no USB device
   (`usbcore.authorized_default=0`), and unlike the usb variant there is no initrd step
   that authorizes anything.
@@ -718,58 +717,18 @@ This is the path for old machines without UEFI HTTP boot; machines with HTTP boo
 that (the intended path, also without iPXE). The netstick stays the fallback for a
 machine where AMT has to stay on.
 
-What follows is how it was found. The firmware offers only PXE (no HTTP boot entry; "UEFI Network Stack" on, the LAN boot
-entry prints `Start PXE over IPv4` / `Station IP address …`). With proxy DHCP and TFTP
-(see [Quick one-off test](#quick-one-off-test-on-an-existing-lan)) every file arrives
-completely, but **nothing except iPXE ever runs**:
-
-| Loaded by | Image | Result |
-|---|---|---|
-| firmware PXE | the UKI (112 MiB) | downloaded once completely, then nothing; another time the firmware stopped after the size probe (`tsize`) and went back to the boot menu |
-| firmware PXE | systemd-boot (160 KiB), systemd-stub + kernel (17 MiB) | reboot |
-| firmware PXE | EFI shell | nothing |
-| firmware PXE | iPXE `snponly.efi` | **runs**, network works |
-| iPXE | the UKI, a rebuilt UKI with `efi=debug earlyprintk=efi`, systemd-stub + kernel, the bare kernel (with and without initrd), systemd-boot, the EFI shell (also starting the UKI as a file from iPXE's virtual filesystem), a second iPXE | hang, not a single kernel or EFI-stub message |
-| USB stick | systemd-boot → UKI | **boots** |
-
-So it is not the images (same PE flags, alignment and sizes boot from the stick) but the
-state the firmware's network boot leaves behind. With **AMT enabled**, the I218-LM is
-shared with the Intel ME, and the firmware's AMT drivers (MEBx, IDE-R, Serial-over-LAN)
-run their own callbacks on that NIC. Traced inside iPXE (debug builds with
-markers around `LoadImage`/`StartImage`):
-
-1. iPXE's default `ipxe.efi` and `snponly.efi` hang right after `autoexec.ipxe… not found`,
-   when iPXE takes the NIC over. Visible with `DEBUG=efi_driver`: the last line is
-   `EFIDRV … using driver "NIIONLY"` (iPXE prefers the NII/UNDI interface). With NII
-   disabled it uses `SNPONLY`; then it hangs when it publishes its own SNP device and HII
-   form back to the firmware. With those disabled too, iPXE's network works: DHCP, ping,
-   the 112 MiB UKI over HTTP in about a second.
-2. `LoadImage()` of any downloaded image returns fine. `StartImage()` is never reached:
-   iPXE hangs in `efi_snp_release()`, which lowers the TPL back to `TPL_APPLICATION`.
-   Lowering the TPL lets the firmware's pending event callbacks run, and one of them does
-   not return. **Every** TPL drop hangs at that point (also `DisconnectController()`,
-   which iPXE calls at the external TPL).
-3. Starting the image without lowering the TPL reaches `StartImage()`, but the image does
-   not run (the UEFI spec requires `StartImage()` below `TPL_CALLBACK`).
-4. Leaving the firmware's network stack bound (MNP instead of SNP, or SNP opened shared
-   instead of `BY_DRIVER|EXCLUSIVE`) leaves iPXE without a working network.
-
-With AMT enabled, the firmware's own network stack, once the PXE boot has used it and the
-NIC has been taken over, cannot survive a TPL drop, and loading the next image needs one.
-The iPXE patches tried (NII, HII and the SNP provider off, markers in `efi_image.c`) are
-not kept in this repository: they did not lead to a working boot, disabling AMT did.
-
-Then, read from the running system (netstick, `--debug` build, Lenovo WMI settings via
-`think-lmi`): BIOS 1.37 is the last release, the NIC is an Intel I218-LM (vPro/AMT) with
-the ME active, `AMTControl=Enable`. With AMT disabled, the firmware's own PXE starts
-systemd-boot and Linux images of 17, 48 and 80 MiB; the 112 MiB UKI is downloaded
-completely but not started (or the firmware gives up after the size probe), and a
-UKI-sized test image (padding instead of an initrd) behaves the same: a size limit, not
-the UKI's content.
+**What it looked like with AMT enabled:** the firmware offers only PXE (no HTTP boot
+entry). Every file arrives completely (dnsmasq logs `sent …`), yet nothing the firmware
+loaded over the network ever ran: the UKI, systemd-boot, systemd-stub + kernel and the EFI
+shell all rebooted, hung or went back to the boot menu, while the same UKI booted from a
+USB stick. The NIC (Intel I218-LM, vPro) is shared with the Intel ME, and the firmware's
+AMT drivers leave its network stack in a state where the next image cannot be started.
+Disabling AMT fixed it; what remained was the size limit above (a padded test image of
+the same size behaved the same, so it is the size, not the UKI's content).
 
 How to recognise the case on another machine: the files are delivered completely
-(dnsmasq logs `sent …`, nginx `200` with the full size), yet the machine reboots, returns
-to the boot menu or hangs without a single kernel message, also for small images.
+(dnsmasq `sent …`, nginx `200` with the full size), yet the machine reboots, returns to
+the boot menu or hangs without a single kernel message, also for small images.
 
 ## Size of the network UKI
 
@@ -830,9 +789,8 @@ real system loads them from the root image.
 | proxy DHCP (dnsmasq) logs nothing when the client boots | the broadcasts do not reach dnsmasq: another L2 segment (e.g. the build host is a VM behind NAT), or a firewall in between. Proxy DHCP needs UDP 67 and 4011, TFTP UDP 69 (with `--tftp-single-port` nothing else) |
 | dnsmasq: `error 8 User aborted the transfer` | harmless if a `sent …` follows: UEFI PXE asks for the file size first (`tsize`) and aborts on purpose. Without a second request the firmware refused the file (too large for it) |
 | the client fetches the old boot file after a change | dnsmasq still runs with the previous command line (shell history); restart it with the new one |
-| iPXE runs a different script than expected | iPXE (EFI) loads `autoexec.ipxe` from the TFTP server **before** its embedded script; remove a stale one. Arch's `ipxe` package also ships `ipxe-arch.efi`, which boots Arch Linux's own netboot: use `ipxe.efi`/`snponly.efi` |
 | a UKI over PXE: downloaded completely, then back to PXE or stuck after `NBP file …` | too large for this firmware's network boot (T450s: 82 MiB works, 112 MiB fails): check the size `mkosi.postoutput` prints, keep the network UKI below the limit ([Size of the network UKI](#size-of-the-network-uki)) |
-| on a machine with Intel AMT (vPro, e.g. Intel I218-LM/I219-LM): only iPXE runs over PXE, everything else reboots or hangs | disable Intel AMT in the BIOS ([Case found](#case-found-thinkpad-t450s-bios-jbet73ww)) |
+| on a machine with Intel AMT (vPro, e.g. Intel I218-LM/I219-LM): nothing loaded over PXE runs, it reboots or hangs | disable Intel AMT in the BIOS ([Case found](#case-found-thinkpad-t450s-bios-jbet73ww)) |
 | files arrive completely, then reboot / hang / back to the boot menu, even for small images | the firmware cannot start a network-loaded image (ThinkPad T450s): use a [netstick](#machines-that-cannot-network-boot-the-uki-the-netstick) |
 | a VM (OVMF) shows `Start PXE over IPv4` before HTTP boot | OVMF tries its PXE entries first; switch them off with fw_cfg `opt/org.tianocore/IPv4PXESupport=n` / `IPv6PXESupport=n` ([README, "A netbooting VM"](README.md#a-netbooting-vm-qemu-libvirt--virt-manager)) |
 | a VM: `netroot: download … failed`, `Could not resolve host` | the VM's virtual network resolves through the VM host's resolver, which does not know the name in `NETROOT_URL`: put the IP (or the IP as a second URL) into `netboot.conf` and rebuild |
@@ -857,9 +815,9 @@ real system loads them from the root image.
   sticks: whoever can reach the server can boot an old build, which is why only the
   ones you still want should be there).
 - Real hardware: a ThinkPad T450s (no HTTP boot) network-boots over PXE/TFTP only with
-  Intel AMT disabled and a UKI that is not much larger than the current 82 MiB (see [Case found](#case-found-thinkpad-t450s-bios-jbet73ww)); with
-  AMT on it needs a netstick. In QEMU (OVMF) the whole chain was tested end to end:
-  DHCP → UEFI HTTP boot of the signed UKI → DHCP in the initrd → `root.verity` and
-  `root.img` over HTTP → `veritysetup open` against the signed root hash → the real
-  safespace root mounted → login prompt, with no disk attached to the VM. Real firmware
-  differs in how it offers HTTP boot and how large a boot file it accepts.
+  Intel AMT disabled and a UKI that is not much larger than the current 82 MiB (see
+  [Case found](#case-found-thinkpad-t450s-bios-jbet73ww)); with AMT on it needs a
+  netstick. UEFI HTTP boot is tested end to end in QEMU and libvirt (OVMF, no disk):
+  DHCP → signed UKI over HTTP → DHCP in the initrd → `root.verity` and `root.img` over
+  HTTP → dm-verity against the signed root hash → login. Real firmware differs in how it
+  offers HTTP boot and how large a boot file it accepts.

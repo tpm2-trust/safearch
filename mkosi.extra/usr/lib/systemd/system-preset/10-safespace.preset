@@ -5,13 +5,14 @@ enable systemd-resolved.service
 enable systemd-timesyncd.service
 enable sshd.service
 enable nftables.service
-enable docker.service
 enable usbguard.service
 # XFCE desktop on VNC display :1 (keep in sync with VNC_DISPLAY in safespace.env)
 enable vncserver@.service :1
 # systemd-sysext/confext are masked in /etc/systemd/system (and switched off
 # on the kernel command line): extension images must never be overlaid onto
 # the verified /usr and /etc.
-# Volatile /var from the factory copy, Docker image loader.
+# Volatile /var from the factory copy, Docker image loader. Docker itself is
+# not enabled: it needs the data disk (/opt/docker) and is started by hand
+# once that is mounted; the loader runs whenever docker.service starts.
 enable safespace-var-factory.service
 enable safespace-docker-images.service

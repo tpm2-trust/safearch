@@ -41,6 +41,8 @@
 #   are kept in mkosi.test/sealed-vars.fd.
 # --sealed: boot again with mkosi.test/sealed-vars.fd (after safespace-seal).
 # --ssh PORT: forward localhost:PORT to the VM's sshd.
+# Guest agent: the VM gets the qemu-ga channel, its socket is mkosi.test/qga.sock
+#   (echo '{"execute":"guest-network-get-interfaces"}' | socat - UNIX-CONNECT:mkosi.test/qga.sock).
 # Console: the QEMU window. A reset ends QEMU (-no-reboot) instead of looping.
 # No root needed (user must be able to open /dev/kvm).
 # Extra QEMU options via $QEMU_EXTRA, e.g. QEMU_EXTRA='-display none'.
@@ -228,6 +230,8 @@ qemu-system-x86_64 -machine "$machine" "${extra[@]}" -cpu host -smp 2 -m "$MEM" 
 	-drive if=pflash,format=raw,file="$vars" \
 	"${boot[@]}" \
 	-nic "$nic" \
+	-device virtio-serial -chardev socket,id=qga,path="$WORK/qga.sock",server=on,wait=off \
+	-device virtserialport,chardev=qga,name=org.qemu.guest_agent.0 \
 	-serial file:"$WORK/serial.log" \
 	-no-reboot ${QEMU_EXTRA:-} && rc=0 || rc=$?
 log "QEMU exited ($rc). Firmware/serial output: $WORK/serial.log"
