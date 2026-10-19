@@ -64,8 +64,10 @@ flowchart LR
 | Network | pushes out over ssh; needs no inbound access | serves HTTP (and DHCP/TFTP); accepts uploads only through the restricted upload account |
 
 **One release per server.** A distribution server serves the newest release of each variant
-under fixed names (`network/boot.efi`, `network/root.img`, `network/root.verity`,
-`usb/image.raw.zst`, …). `release.sh` replaces it with `rsync --delay-updates`: the new files
+under fixed names — the same parts for both variants: `boot.efi` (the signed UKI),
+`root.img`, `root.verity`, `roothash`, and for usb also `systemd-boot.efi` and the stick's
+partition table `layout.sfdisk`. No disk image is stored or shipped anywhere: `burn.sh`
+assembles a stick from the parts. `release.sh` replaces a release with `rsync --delay-updates`: the new files
 are collected in a temp directory and renamed in one go at the end, and a download already
 running finishes on the old file. There are no versions, channels or links to maintain on the
 server; all machines of a server boot the same image, and **package groups are the only
@@ -75,8 +77,9 @@ difference between images** (besides usb/network).
 `safespace-netboot verify` checks the release against the public `db.pem`, which was pinned
 when the server was set up: the UKI's Secure Boot signature (`sbverify`), the root hash
 taken from the signed command line, and the root image block by block against it
-(`veritysetup verify`). For usb images it checks the partitions cut out of the image the
-same way. It reports (journal, `safespace-netboot status`, a failed unit) and never changes
+(`veritysetup verify`); for usb also the signature of `systemd-boot.efi` and that the
+partition table names root and verity by the root hash. All of it on the served files as they
+are, no unpacking, no temp space. It reports (journal, `safespace-netboot status`, a failed unit) and never changes
 anything. The machines check the same things again themselves (firmware: signature;
 initrd: dm-verity), so a stolen upload key can keep machines from booting, but cannot make
 them boot anything else.
@@ -257,11 +260,21 @@ mkosi.output/
 │   │   ├── build.json                 variant, groups, start/end, snapshot + mirror, commit
 │   │   │                              (+ uncommitted changes?), signing certificate, packages, sizes
 │   │   ├── released.log               one line per push: time, target
-│   │   └── safespace-arch-network_20261019-0930.{efi,root.raw.zst,root-verity.raw.zst,roothash,manifest,vnc-password}
+│   │   ├── boot.efi                   the signed UKI
+│   │   ├── root.img, root.verity      the root partition and its dm-verity hash tree
+│   │   ├── roothash, manifest.json    the root hash, the packages
+│   │   └── vnc-password               (remotedesktop) the generated VNC password, 0600
 │   └── base_20261019-1012/
 └── usb/
-    └── base-remotedesktop_20261019-1100/
+    └── base-remotedesktop_20261019-1100/   the same, plus systemd-boot.efi and layout.sfdisk
 ```
+
+**The same parts for both variants.** mkosi builds a disk image as usual; right after the
+build, `build.sh` keeps only the parts (`builds_finalize` in `lib/builds.sh`), under short
+names, uncompressed (the root is erofs, compressed already). For usb it first takes the
+signed systemd-boot and the partition table out of the image (`sfdisk -d`: partition types,
+UUIDs derived from the root hash, sizes). Then the disk image and mkosi's separate initrd
+copy are deleted. A network build is ~2.1 GB, a usb build ~2.2 GB.
 
 The directory name is **the build**: `list`, `release.sh --build`, the release and the
 servers' `status` show it. The image version inside stays the timestamp; a second build of
@@ -306,9 +319,8 @@ unaffected, it has everything in RAM.
 
 | Release | Files |
 |---|---|
-| network | `boot.efi` (signed UKI), `root.img`, `root.verity`, `roothash`, `cmdline` |
-| usb | `image.raw.zst` (the whole stick), `roothash` |
-| both | `release` (VARIANT, VERSION, BUILD, GROUPS, BUILT, SNAPSHOT, COMMIT, PACKAGES), `manifest.json` (packages), `SHA256SUMS` |
+| both | the build's parts as hardlinks (nothing copied or unpacked): `boot.efi`, `root.img`, `root.verity`, `roothash`, `manifest.json`; plus `cmdline` (the UKI's signed command line, readable), `release` (VARIANT, VERSION, BUILD, GROUPS, BUILT, SNAPSHOT, COMMIT, PACKAGES), `SHA256SUMS` |
+| usb | + `systemd-boot.efi`, `layout.sfdisk` |
 
 **Going back** is releasing an older build again: `./release.sh network --build <build>`
 (`./build.sh list` shows them, with their last release).
@@ -362,7 +374,7 @@ and 4011.
 |---|---|
 | `nginx.service` | serves the share as `http://<server>/safespace/`: GET/HEAD only, no directory listing, no hidden files (rsync's temp directory during an upload) |
 | `safespace-netboot-verify.path` | starts the check when `network/release` or `usb/release` changes (`release.sh` writes it last) |
-| `safespace-netboot-verify.service` | `safespace-netboot verify --changed` as user `safespace`, sandboxed, read-only on the share, without network; records the result in `/var/lib/safespace/state/`; a broken release leaves the unit failed. Checking a usb image needs ~2.2 GiB in `/tmp` (its private tmpfs, RAM) while it runs |
+| `safespace-netboot-verify.service` | `safespace-netboot verify --changed` as user `safespace`, sandboxed, read-only on the share, without network; records the result in `/var/lib/safespace/state/`; a broken release leaves the unit failed |
 | `safespace-dhcp.service` | dnsmasq for `DHCP_MODE=proxy` or `dhcp`, configuration generated from `server.conf` on every start; TFTP serves the share |
 
 ### Every day
@@ -378,16 +390,23 @@ journalctl -u safespace-dhcp -f              # a machine asking where to boot fr
 A broken release is reported, not repaired: the machines refuse it on their own, and the fix
 is a new release from the build host.
 
-### usb images from a distribution server
+### usb sticks from a distribution server
 
-The released usb image is served as `http://<server>/safespace/usb/image.raw.zst`. Writing it
-to a stick needs `burn.sh` and `diagnose.sh` from a checkout, no keys and no build:
+The usb release is served as its parts under `http://<server>/safespace/usb/`. Writing a
+stick needs `burn.sh` and `diagnose.sh` from a checkout, no keys and no build:
 
 ```sh
-sudo ./burn.sh http://10.0.0.1/safespace/usb/ /dev/sdX                 # download, check SHA256SUMS, write
-sudo ./burn.sh /srv/safespace/share/usb/image.raw.zst /dev/sdX          # on the server itself
-sudo ./diagnose.sh --db-cert /etc/safespace/db.pem /dev/sdX            # signatures against db.pem, root block by block
+sudo ./burn.sh http://10.0.0.1/safespace/usb/ /dev/sdX          # root streamed onto the stick, checked against SHA256SUMS
+sudo ./burn.sh /srv/safespace/share/usb /dev/sdX                 # on the server itself
+sudo ./diagnose.sh --db-cert /etc/safespace/db.pem /dev/sdX     # signatures against db.pem, root block by block
+./burn.sh http://10.0.0.1/safespace/usb/ --image stick.raw       # a stick image file instead (no root)
 ```
+
+`burn.sh` writes the partition table from `layout.sfdisk`, creates the ESP (FAT32, 512-byte
+sectors) with `systemd-boot.efi` as `\EFI\BOOT\BOOTX64.EFI` and `boot.efi` in `\EFI\Linux\`,
+then the hash tree and the root partition (`lib/stick.sh`). From a URL, the root partition
+goes from the server onto the stick in one stream; if its checksum does not match, the stick
+is wiped again.
 
 ### DNS
 
@@ -770,8 +789,8 @@ stops the build if no variant is selected.
 | `SecureBoot=yes`, `SecureBootKey`/`Certificate` from `/var/lib/sbctl`, `SecureBootSignTool=systemd-sbsign`, `SecureBootAutoEnroll=no` | systemd-boot and the UKI are signed with the sbctl `db` key; no systemd-boot auto-enrollment files on the ESP (`safespace-seal` does enrollment) |
 | `SignExpectedPcr=yes`, `SignExpectedPcrKey`/`Certificate` in `/var/lib/safespace/pcr-signing/` | the UKI carries signed expected PCR 11 values and the PCR public key (`.pcrsig`, `.pcrpkey`): systemd's NvPCRs can be set up, and TPM secrets can be bound to "a UKI signed by this host". Own key, created by `build.sh` on the first build (root-only, never in the image) |
 | `Verity=hash` | dm-verity root; the root hash is on the signed kernel command line, no signature partition needed |
-| `SplitArtifacts=uki,roothash` (+`partitions` for network), `ManifestFormat=json` | UKI, root hash and package list next to the image; the network variant also writes the root and verity partitions as separate files to publish |
-| `CompressOutput=zstd`, `CompressLevel=10` | image as `.raw.zst`, only as large as its content |
+| `SplitArtifacts=uki,roothash,partitions`, `ManifestFormat=json` | both variants: the UKI, the root hash, the root and verity partitions as separate files, and the package list; `build.sh` keeps only these (plus systemd-boot and the partition table for usb) and deletes the disk image |
+| `CompressOutput=no` | the parts are kept and shipped as they are (the root is erofs, compressed already) |
 | `OutputDirectory=mkosi.output` | outputs out of the project root |
 | `--snapshot=`/`--mirror=` from `repos.conf` | set by `build.sh`, not in `mkosi.conf`: pinned Arch Linux Archive day or `latest`, default or own mirror (see ["Package source"](#package-source-snapshot-and-mirror)) |
 | `Incremental=yes`, `CacheDirectory=`, `PackageCacheDirectory=` | two cache levels: downloaded packages and the installed system |
@@ -892,7 +911,7 @@ stops the build if no variant is selected.
 | `netboot.conf.example` | the network variant's root URL on the distribution servers (`<SERVER_URL>/network/`); copy to `netboot.conf` |
 | `mkosi.local.conf.example` | per-host settings (erofs threads, key paths); copy to `mkosi.local.conf` |
 | `burn.sh`, `diagnose.sh` | write a usb image (the newest in `mkosi.output/usb/`, any file, a share path or a distribution server's URL) to a medium; read-only check incl. signatures against `db.pem` (`--db-cert`), `veritysetup verify` and which build is on it |
-| `lib/` | shared shell helpers: `repos.sh` (package source), `groups.sh` (package groups), `keys.sh` (Secure Boot keys: which set, export into the image, PCR signing key), `builds.sh` (the builds in `mkosi.output/`: list, show, diff, select, prune), `verify.sh` (release checks, used by `release.sh` and the servers) |
+| `lib/` | shared shell helpers: `repos.sh` (package source), `groups.sh` (package groups), `keys.sh` (Secure Boot keys: which set, export into the image, PCR signing key), `builds.sh` (the builds in `mkosi.output/`: their parts, list, show, diff, select, prune), `stick.sh` (a usb stick assembled from the parts: `burn.sh`, `test-vm.sh`), `verify.sh` (release checks, used by `release.sh` and the servers) |
 | `mkosi.profiles/debug/` | `./build.sh <variant> --debug`: ethtool, dmidecode, pciutils, kexec-tools, tcpdump, … on top of a variant; the version gets a `-debug` suffix |
 | `NETBOOT.md` | the network variant in depth: trust model, what the clients need, DHCP for other servers, Secure Boot enrollment, QEMU test, old firmware, troubleshooting |
 | `test-vm.sh` | optional rehearsal in QEMU: boot an image as a USB stick, or `--netboot` a released network build (DHCP + HTTP boot, no disk), optionally with enforced Secure Boot, in Setup Mode or sealed |
@@ -926,7 +945,7 @@ stops the build if no variant is selected.
 `--workers=` to `nproc`, or pass `sudo ./build.sh <variant> --workers N` for one run
 (`--workers` is a `build.sh` option, mkosi itself has none). Most of the build time goes into compressing the erofs root, which
 uses 4 threads by default (`--workers=0` means single-threaded, not "all"). zstd for the
-image and the initrd already uses all cores. The host needs the same tools as listed under
+initrd already uses all cores. The host needs the same tools as listed under
 Quick start, plus the sbctl `db` key and certificate at the paths in `mkosi.conf` (or point
 `SecureBootKey=`/`SecureBootCertificate=` elsewhere in `mkosi.local.conf`).
 

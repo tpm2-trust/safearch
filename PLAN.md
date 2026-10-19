@@ -400,3 +400,104 @@ Results: `tests/run.sh` 90 pass (builds: list order, show, diff, choosing by
 with the last released build kept and leftovers removed); upload test by hand: 8 pass.
 Not testable without root: a real build writing `build.json` and handing the directory to
 the sudo user, `purge-cache`.
+
+---
+
+# PLAN: one split format for both variants, nothing shipped twice
+
+## Goal
+
+usb and network builds produce, keep and ship the same kind of artifacts: the signed UKI,
+the root image and its hash tree. No whole disk image is stored or shipped anywhere; a usb
+stick is assembled from those parts when it is written. Ship as little as possible, but
+everything needed.
+
+## Today
+
+| | network build | usb build |
+|---|---|---|
+| on the build host | UKI, root + verity (split, zstd), **and the whole disk image** (`.raw.zst`, ~1.8 GB, unused), initrd copy | only the whole disk image (`.raw.zst`) + UKI |
+| release | boot.efi, root.img, root.verity (unpacked, ~2 GB) | image.raw.zst (~1.9 GB) |
+| server check | signature, root hash, `veritysetup verify` | unpack the image to /tmp, cut out partitions, the same checks |
+| `burn.sh` | — | writes the image (download to /tmp first) |
+
+## Design
+
+**The same set of files for both variants**, in the build directory and in the release:
+
+| File | network | usb | |
+|---|---|---|---|
+| `boot.efi` | ✓ | ✓ | the signed UKI (the usb one has USB/SD drivers, the network one the netroot initrd) |
+| `root.img`, `root.verity`, `roothash` | ✓ | ✓ | erofs root, its dm-verity hash tree, the root hash (also on the UKI's signed command line) |
+| `systemd-boot.efi` | — | ✓ | the signed systemd-boot (becomes `\EFI\BOOT\BOOTX64.EFI` on the stick) |
+| `layout.sfdisk` | — | ✓ | the stick's partition table as systemd-repart made it (`sfdisk -d`: types, UUIDs derived from the root hash, sizes, attributes; a few hundred bytes) |
+| `release`, `manifest.json`, `SHA256SUMS`, `cmdline` | ✓ | ✓ | as today |
+
+- **Uncompressed, everywhere:** the root is erofs and already compressed (zstd saves ~9%).
+  Storing the files as they are shipped means `release.sh` stages them as hardlinks, not
+  copies, and nothing is unpacked anywhere.
+- **The build (`mkosi.postoutput`):**
+  - usb: take `layout.sfdisk` and the signed systemd-boot from the image mkosi built.
+  - Then delete what is never used: the whole disk image, the split ESP, mkosi's separate
+    initrd copy.
+  - Both variants: `CompressOutput=no`, `SplitArtifacts=uki,roothash,partitions`.
+  - Rename to the short names above (the build directory already says what it is).
+- **Writing a stick (`burn.sh`, new `lib/stick.sh`):**
+  1. partition table from `layout.sfdisk`
+  2. ESP: `mkfs.vfat -S 512`, then `systemd-boot.efi` as `BOOTX64.EFI` and `boot.efi` in
+     `\EFI\Linux\`, the same as repart lays it out today
+  3. root and verity written into their partitions
+
+  From a distribution server it streams the files straight onto the stick and checks
+  `SHA256SUMS` while writing: no temp file at all. `test-vm.sh` uses the same function to
+  build a stick image for QEMU (no root needed).
+- **The server check** becomes one code path for both variants: signatures (`boot.efi`, for
+  usb also `systemd-boot.efi`), root hash on the signed command line, `veritysetup verify`
+  directly on the served files. For usb it also checks that `layout.sfdisk` fits:
+  partition UUIDs = root hash halves, types, and that root and verity fit into their
+  partitions. No unpacking, no temp space.
+- **Sizes per build:** network ~2.1 GB instead of ~3.6 GB (no disk image, no initrd copy,
+  root uncompressed +~0.2 GB); usb ~2.2 GB instead of ~1.9 GB (uncompressed root), and the
+  server serves the same files for usb as for network.
+
+```mermaid
+flowchart LR
+  M["mkosi build"] --> P["mkosi.postoutput:<br/>keep boot.efi, root.img, root.verity, roothash<br/>(usb: + systemd-boot.efi, layout.sfdisk)<br/>delete the disk image"]
+  P --> R["release.sh: hardlinks + SHA256SUMS, push"]
+  R --> S["server: same files for both variants,<br/>same check"]
+  S --> N["network: firmware loads boot.efi,<br/>initrd loads root.img/root.verity"]
+  S --> U["usb: burn.sh assembles the stick<br/>from the parts (streamed)"]
+  P --> U
+```
+
+## Steps
+
+- [x] 1. mkosi config: `CompressOutput=no`, the same `SplitArtifacts` for both variants;
+      `mkosi.postoutput`: extract layout + systemd-boot (usb), short names, delete the rest.
+- [x] 2. `lib/stick.sh`: assemble a stick (device or image file) from the parts; `burn.sh`
+      (local build, share path, URL streamed with checksum check), `test-vm.sh`.
+- [x] 3. `lib/verify.sh`: one path for both variants, layout check for usb; `release.sh`
+      stages hardlinks; server and nginx unchanged apart from the file names.
+- [x] 4. `diagnose.sh`: compare the stick with the build's parts (UUIDs, signatures, root
+      block by block as today).
+- [x] 5. Tests: fixtures build the parts instead of a whole image; a stick assembled from
+      them boots the same layout (sfdisk dump equal to `layout.sfdisk`, ESP content,
+      `veritysetup verify` on the written partitions); usb release check; streaming burn
+      into an image file.
+- [x] 6. README/NETBOOT/AGENTS: what a build holds, what a release ships, how a stick is
+      written.
+- [ ] 7. Yours (root): a usb build, `burn.sh` onto a stick, boot it (QEMU via `test-vm.sh`
+      and one real machine), `diagnose.sh`.
+
+## Decisions
+
+1. Uncompressed: yes.
+2. One build for both variants: measured the drivers (compressed): USB host + storage
+   ~0.36 MiB, SD/MMC + card readers ~0.74 MiB, ethernet + PHY ~3.1 MiB. Dropping SD would
+   save 0.7 MiB of an 82 MiB UKI — not "far less", so SD stays; size is no obstacle to a
+   combined initrd either. Not implemented: waits for the user's decision (see the reply).
+
+Results: `tests/run.sh` 103 pass (finalize keeps exactly the parts; usb checks incl.
+foreign systemd-boot and wrong/too small partitions; sticks from a build, a share and a URL
+equal the build: table, ESP content, signed files, FAT sector size, root block by block; a
+manipulated streamed root is refused and nothing stays behind); upload by hand 8 pass.

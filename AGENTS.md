@@ -80,7 +80,7 @@ the network-boot reference. Arch Linux only, everywhere.
 | image configuration | `mkosi.conf` (base), `mkosi.profiles/{usb,network}/` (variants), `mkosi.profiles/{remotedesktop,docker}/` (groups), `mkosi.profiles/debug/` (`--debug`), `mkosi.repart/`, `mkosi.extra/`, `mkosi.postinst`, `mkosi.finalize`, `mkosi.postoutput` |
 | initrd | `mkosi.initrd.conf/` (common), `…/mkosi.profiles/network/…/netroot` (root over HTTP), `…/mkosi.profiles/usb/…/usb-bootdev` |
 | distribution server | `server/` (`setup.sh`, `safespace-netboot`, units, nginx site, `server.conf.example`) |
-| shared shell code | `lib/repos.sh`, `lib/groups.sh`, `lib/keys.sh`, `lib/builds.sh` (the builds in `mkosi.output/<variant>/<groups>_<version>/`: list, select, prune), `lib/verify.sh` (also installed on the servers) |
+| shared shell code | `lib/repos.sh`, `lib/groups.sh`, `lib/keys.sh`, `lib/builds.sh` (the builds in `mkosi.output/<variant>/<groups>_<version>/`: their parts, list, select, prune), `lib/stick.sh` (a usb stick assembled from the parts), `lib/verify.sh` (also installed on the servers) |
 | tests | `tests/run.sh`, `tests/lib/` |
 | per-host files (gitignored, templates `*.example`) | `users.conf`, `netboot.conf`, `release.conf`, `mkosi.local.conf`, `repos.local.conf`, `server/server.conf` |
 
@@ -99,6 +99,8 @@ the network-boot reference. Arch Linux only, everywhere.
 - **One release per server and variant**, fixed file names; the initrd's
   reaction to a replaced release must not turn into a reboot loop.
 - **Groups are the only difference between images** besides the variant.
+- **Both variants are kept and shipped as the same parts** (UKI, root, verity, root hash;
+  usb also systemd-boot and the partition table); no disk image is stored or shipped.
 
 ### Working on it
 

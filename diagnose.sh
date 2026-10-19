@@ -115,7 +115,7 @@ if [[ -z $ROOTHASH ]]; then
 else
 	ok "roothash=$ROOTHASH"
 	# The build on this host with that root hash, if any.
-	build=$(grep -lx "$ROOTHASH" "$HERE"/mkosi.output/usb/*/*.roothash 2>/dev/null | head -1)
+	build=$(grep -lx "$ROOTHASH" "$HERE"/mkosi.output/usb/*/roothash 2>/dev/null | head -1)
 	if [[ -n $build ]]; then
 		ok "build: usb/$(basename "$(dirname "$build")") (./build.sh show for its packages)"
 	else

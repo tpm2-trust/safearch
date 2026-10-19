@@ -18,7 +18,7 @@
 # Settings: /etc/safespace/server.conf (SAFESPACE_SERVER_CONF= overrides).
 # The share (served by nginx under /safespace/), one release per variant:
 #   network/  boot.efi root.img root.verity roothash cmdline release ...
-#   usb/      image.raw.zst roothash release ...
+#   usb/      the same + systemd-boot.efi layout.sfdisk
 # Results of the checks: $STATE/<variant> (outside the share).
 set -Eeuo pipefail
 
@@ -61,13 +61,11 @@ fi
 fingerprint() { cat "$SHARE/$1/release" "$SHARE/$1/SHA256SUMS" 2>/dev/null | sha256sum | cut -d' ' -f1; }
 
 verify_one() { # VARIANT -> 0 ok, 1 broken
-	local variant=$1 tmp fp version out rc=0
+	local variant=$1 fp version out rc=0
 	fp=$(fingerprint "$variant")
 	version=$(release_get "$SHARE/$variant/release" VERSION 2>/dev/null || true)
 	log "checking $variant ${version:-(no release)}"
-	tmp=$(mktemp -d -t safespace-verify.XXXXXX)
-	out=$(verify_release "$SHARE/$variant" "$variant" "$DB_CERT" "$tmp" 2>&1) || rc=1
-	rm -rf "$tmp"
+	out=$(verify_release "$SHARE/$variant" "$variant" "$DB_CERT" 2>&1) || rc=1
 	printf '%s\n' "$out" | sed 's/^/  /'
 	{
 		echo "VERSION=${version:-}"

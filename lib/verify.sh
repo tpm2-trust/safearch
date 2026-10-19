@@ -1,20 +1,21 @@
 # Checks of a release directory, shared by release.sh (build host, before it
-# pushes) and server/safespace-netboot (distribution server, before it serves).
-# Sourced; needs bash, sbverify, objcopy, veritysetup, sha256sum, zstd, sfdisk,
-# mtools, dd. No root, no python.
+# pushes) and server/safespace-netboot (distribution server, which reports).
+# Sourced; needs bash, sbverify, objcopy, veritysetup, sha256sum, openssl.
+# No root, no temp space: everything is checked on the files as they are.
 #
-#   verify_release DIR VARIANT DB_CERT [TMPDIR]
-#       network: boot.efi root.img root.verity roothash cmdline release SHA256SUMS
-#       usb:     image.raw.zst roothash release SHA256SUMS (TMPDIR: room for the
-#                unpacked image, ~2.2 GiB; then for its root partition alone)
+#   verify_release DIR VARIANT DB_CERT
+#       both: boot.efi root.img root.verity roothash cmdline release SHA256SUMS
+#       usb:  + systemd-boot.efi layout.sfdisk
 #   release_get FILE KEY        value of KEY=... in a release file (not sourced)
 #   verify_name_version VALUE
 #
 # What is trusted: only DB_CERT, the public Secure Boot db certificate. The
-# UKI must carry a valid signature from it; the root hash is taken from the
-# UKI's signed command line, and the root image must match it block by block.
-# So a release that passes was built and signed by the holder of the db key,
-# whatever path it took to get here. SHA256SUMS only catches broken transfers.
+# UKI (and for usb systemd-boot) must carry a valid signature from it; the
+# root hash is taken from the UKI's signed command line, and the root image
+# must match it block by block. For usb the partition table must name the
+# partitions by that root hash, as the initrd finds them. So a release that
+# passes was built and signed by the holder of the db key, whatever path it
+# took to get here. SHA256SUMS only catches broken transfers.
 # On failure: a message on stderr and return 1.
 
 vfail() { printf '%s\n' "$*" >&2; return 1; }
@@ -53,87 +54,71 @@ verify_cmdline_roothash() { # CMDLINE ROOTHASH
 		vfail "the UKI's signed command line does not carry roothash=$2"
 }
 
-verify_release() { # DIR VARIANT DB_CERT [TMPDIR]
-	local dir=$1 variant=$2 cert=$3 tmp=${4:-} f version
+verify_release() { # DIR VARIANT DB_CERT
+	local dir=$1 variant=$2 cert=$3 f version roothash cmdline url urls=0
+	local files=(boot.efi root.img root.verity roothash cmdline release SHA256SUMS)
 	[[ -f $cert ]] || vfail "no db certificate $cert" || return
 	[[ -d $dir ]] || vfail "no release directory $dir" || return
 	case $variant in
-		network) for f in boot.efi root.img root.verity roothash cmdline release SHA256SUMS; do
-			[[ -f $dir/$f && ! -L $dir/$f ]] || vfail "$f missing" || return
-		done ;;
-		usb) for f in image.raw.zst roothash release SHA256SUMS; do
-			[[ -f $dir/$f && ! -L $dir/$f ]] || vfail "$f missing" || return
-		done ;;
+		network) ;;
+		usb) files+=(systemd-boot.efi layout.sfdisk) ;;
 		*) vfail "unknown variant '$variant'"; return ;;
 	esac
+	for f in "${files[@]}"; do
+		[[ -f $dir/$f && ! -L $dir/$f ]] || vfail "$f missing" || return
+	done
 	verify_sums "$dir" || return
 	vinfo "SHA256SUMS ok"
 	[[ $(release_get "$dir/release" VARIANT) == "$variant" ]] ||
 		vfail "release says VARIANT=$(release_get "$dir/release" VARIANT), expected $variant" || return
 	version=$(release_get "$dir/release" VERSION)
 	verify_name_version "$version" || vfail "release has an invalid VERSION='$version'" || return
-	vinfo "release $version (groups $(release_get "$dir/release" GROUPS))"
-	local roothash
+	vinfo "release $(release_get "$dir/release" BUILD) (groups $(release_get "$dir/release" GROUPS))"
 	roothash=$(tr -d '[:space:]' <"$dir/roothash")
 	[[ $roothash =~ ^[0-9a-f]{64}$ ]] || vfail "roothash is not a sha256 root hash" || return
-	"verify_$variant" "$dir" "$cert" "$roothash" "$tmp"
-}
 
-verify_network() { # DIR DB_CERT ROOTHASH
-	local dir=$1 cert=$2 roothash=$3 cmdline url urls=0
 	verify_signature "$dir/boot.efi" "$cert" || return
-	vinfo "boot.efi signed by the db key"
+	if [[ $variant == usb ]]; then
+		verify_signature "$dir/systemd-boot.efi" "$cert" || return
+		vinfo "boot.efi and systemd-boot.efi signed by the db key"
+	else
+		vinfo "boot.efi signed by the db key"
+	fi
 	cmdline=$(uki_cmdline "$dir/boot.efi")
 	verify_cmdline_roothash "$cmdline" "$roothash" || return
-	for url in $(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace\.netroot=//p'); do
-		urls=$((urls + 1))
-		vinfo "netroot URL: $url"
-	done
-	((urls)) || vfail "no safespace.netroot= in the UKI: not a network build" || return
+	if [[ $variant == network ]]; then
+		for url in $(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace\.netroot=//p'); do
+			urls=$((urls + 1))
+			vinfo "netroot URL: $url"
+		done
+		((urls)) || vfail "no safespace.netroot= in the UKI: not a network build" || return
+	else
+		verify_layout "$dir" "$roothash" || return
+	fi
 	vinfo "signed command line: roothash matches"
 	veritysetup verify "$dir/root.img" "$dir/root.verity" "$roothash" >&2 ||
 		vfail "root.img does not match the signed root hash" || return
 	vinfo "root.img matches the signed root hash"
 }
 
-verify_usb() { # DIR DB_CERT ROOTHASH TMPDIR
-	local dir=$1 cert=$2 roothash=$3 tmp=$4 raw esp root verity uki cmdline
-	[[ -n $tmp && -d $tmp ]] || vfail "verify_usb needs a temporary directory" || return
-	raw=$tmp/image.raw
-	zstd -dqf "$dir/image.raw.zst" -o "$raw" || vfail "image.raw.zst does not decompress" || return
-	# start and size (512-byte sectors) of a partition by GPT type
-	part() { sfdisk -d "$raw" 2>/dev/null | awk -F'[=,]' -v t="$1" 'toupper($0) ~ "TYPE=" t { gsub(/ /, ""); print $2, $4; exit }'; }
-	esp=$(part C12A7328-F81F-11D2-BA4B-00A0C93EC93B)
-	root=$(part 4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709)
-	verity=$(part 2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5)
-	[[ -n $esp && -n $root && -n $verity ]] || vfail "image has not the ESP + root + root-verity layout" || return
-	local off=$((${esp% *} * 512))
-	mcopy -n -i "$raw@@$off" ::/EFI/BOOT/BOOTX64.EFI "$tmp/BOOTX64.EFI" 2>/dev/null ||
-		vfail "no \\EFI\\BOOT\\BOOTX64.EFI on the ESP" || return
-	mapfile -t uki < <(mdir -b -i "$raw@@$off" ::/EFI/Linux/ 2>/dev/null | grep -i '\.efi$')
-	((${#uki[@]} == 1)) || vfail "expected exactly one UKI in \\EFI\\Linux, found ${#uki[@]}" || return
-	mcopy -n -i "$raw@@$off" "${uki[0]}" "$tmp/uki.efi" || return
-	verify_signature "$tmp/BOOTX64.EFI" "$cert" || return
-	verify_signature "$tmp/uki.efi" "$cert" || return
-	vinfo "systemd-boot and the UKI signed by the db key"
-	cmdline=$(uki_cmdline "$tmp/uki.efi")
-	verify_cmdline_roothash "$cmdline" "$roothash" || return
-	vinfo "signed command line: roothash matches"
-	# veritysetup needs the data at offset 0 of a file: cut the partitions out.
-	# The hash tree from the unpacked image, which then goes; the root
-	# partition straight from the compressed one, so the temp space never
-	# holds both (tmpfs).
-	set -- $verity
-	dd if="$raw" of="$tmp/verity.img" bs=4M iflag=skip_bytes,count_bytes skip=$(($1 * 512)) count=$(($2 * 512)) status=none || return
-	rm -f "$raw"
-	set -- $root
-	# zstd stops on a closed pipe once dd has what it needs: only dd's exit
-	# status counts (a broken stream fails the dm-verity check below anyway).
-	{ zstd -dqc "$dir/image.raw.zst" 2>/dev/null || true; } |
-		dd of="$tmp/root.img" bs=4M iflag=fullblock,skip_bytes,count_bytes skip=$(($1 * 512)) count=$(($2 * 512)) status=none || return
-	[[ $(stat -c %s "$tmp/root.img") == $(($2 * 512)) ]] || vfail "image.raw.zst ends before the root partition does" || return
-	veritysetup verify "$tmp/root.img" "$tmp/verity.img" "$roothash" >&2 ||
-		vfail "the root partition does not match the signed root hash" || return
-	vinfo "root partition matches the signed root hash"
-	rm -f "$tmp/root.img" "$tmp/verity.img" "$tmp/BOOTX64.EFI" "$tmp/uki.efi"
+# The stick's partition table: an ESP, and root and verity partitions with
+# the UUIDs the initrd looks for (the two halves of the root hash, as
+# systemd-repart derives them), large enough for the files.
+verify_layout() { # DIR ROOTHASH
+	local l=$1/layout.sfdisk h=$2 t want size
+	uuid_of() { sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12}).*/\1-\2-\3-\4-\5/' <<<"$1"; }
+	field() { awk -v t="$1" -v k="$2" 'toupper($0) ~ "TYPE=" t {
+		n = split($0, a, ","); for (i = 1; i <= n; i++) { split(a[i], kv, "="); gsub(/ /, "", kv[1]); gsub(/[ "]/, "", kv[2]); if (kv[1] == k) print kv[2] } exit }' "$l"; }
+	[[ $(grep -c 'type=' "$l") == 3 ]] || vfail "layout.sfdisk: not exactly 3 partitions" || return
+	[[ -n $(field C12A7328-F81F-11D2-BA4B-00A0C93EC93B start) ]] || vfail "layout.sfdisk: no ESP" || return
+	for t in "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709:${h:0:32}:root.img" "2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5:${h:32}:root.verity"; do
+		IFS=: read -r type half file <<<"$t"
+		want=$(uuid_of "$half")
+		[[ $(field "$type" uuid | tr A-F a-f) == "$want" ]] ||
+			vfail "layout.sfdisk: the $file partition is not $want (from the root hash)" || return
+		size=$(field "$type" size)
+		[[ $size =~ ^[0-9]+$ ]] && (($(stat -c %s "$1/$file") <= size * 512)) ||
+			vfail "layout.sfdisk: $file does not fit its partition" || return
+	done
+	vinfo "layout.sfdisk: ESP, root and verity partitions named by the root hash"
 }

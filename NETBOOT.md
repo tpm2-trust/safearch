@@ -129,7 +129,7 @@ in the share of a distribution server (`/srv/safespace/share/`, served as
 │   ├── roothash       the release's root hash (the initrd compares it first)
 │   └── cmdline, release, manifest.json, SHA256SUMS
 └── usb/
-    └── image.raw.zst, roothash, release, manifest.json, SHA256SUMS
+    └── the same parts + systemd-boot.efi, layout.sfdisk (burn.sh assembles a stick)
 ```
 
 `release.sh` refuses to release artifacts that do not belong together: it checks the UKI's

@@ -17,11 +17,13 @@
 #                   --push: RELEASE_TARGETS= from release.conf (gitignored,
 #                   see release.conf.example); none at all = stage only.
 #
-# The bundle, mkosi.release/<variant>/ (the newest release only):
-#   network  boot.efi (signed UKI), root.img, root.verity, roothash, cmdline
-#   usb      image.raw.zst (the whole stick image), roothash
-#   both     release (VARIANT, VERSION, BUILD, GROUPS, BUILT, SNAPSHOT, COMMIT,
-#            PACKAGES), manifest.json, SHA256SUMS
+# The bundle, mkosi.release/<variant>/ (the newest release only), the build's
+# parts as hardlinks (nothing is copied or unpacked) plus the release files:
+#   both     boot.efi (signed UKI), root.img, root.verity, roothash,
+#            manifest.json; cmdline (the UKI's signed command line, readable),
+#            release (VARIANT, VERSION, BUILD, GROUPS, BUILT, SNAPSHOT, COMMIT,
+#            PACKAGES), SHA256SUMS
+#   usb      + systemd-boot.efi, layout.sfdisk (burn.sh assembles the stick)
 # It is checked here exactly as a server checks it (lib/verify.sh): Secure
 # Boot signature against the exported db.pem, root image against the signed
 # root hash. test-vm.sh --netboot serves mkosi.release/network/.
@@ -65,12 +67,11 @@ if ((${#TARGETS[@]} == 0)) && [[ -f $HERE/release.conf ]]; then
 	targets=$(sed -n 's/^RELEASE_TARGETS=//p' "$HERE/release.conf" | tail -1 | tr -d '"'"'")
 	read -ra TARGETS <<<"$targets"
 fi
-for cmd in sbverify objcopy veritysetup sha256sum zstd sfdisk mcopy openssl; do
-	command -v "$cmd" >/dev/null || die "missing '$cmd' (pacman -S sbsigntools binutils cryptsetup zstd util-linux mtools openssl)"
+for cmd in sbverify objcopy veritysetup sha256sum openssl; do
+	command -v "$cmd" >/dev/null || die "missing '$cmd' (pacman -S sbsigntools binutils cryptsetup openssl)"
 done
 ((${#TARGETS[@]} == 0)) || command -v rsync >/dev/null || die "missing 'rsync' (pacman -S rsync)"
 
-ID=safespace-arch-$VARIANT
 DB=$HERE/mkosi.extra/usr/share/safespace/secureboot/db.pem
 [[ -f $DB ]] || die "no $DB: build with ./build.sh first (it exports the public keys)"
 
@@ -93,8 +94,6 @@ DIR=$(builds_dir "$VARIANT" "$BUILD")
 VERSION=$(builds_info "$DIR" version)
 GROUPS_SET=$(builds_info "$DIR" groups)
 verify_name_version "$VERSION" || die "invalid version '$VERSION' in $DIR/build.json"
-BASE=$DIR/${ID}_$VERSION
-[[ -f $BASE.roothash ]] || die "no $BASE.roothash"
 log "Release $VARIANT/$BUILD"
 log "  groups $GROUPS_SET, built $(builds_info "$DIR" finished), snapshot $(builds_info "$DIR" snapshot), commit $(builds_info "$DIR" commit)$([[ $(builds_info "$DIR" uncommitted_changes) == yes ]] && echo ' + uncommitted changes'), $(builds_info "$DIR" packages) packages"
 # Newer builds of other group sets that were never released: maybe the one meant.
@@ -108,30 +107,14 @@ done < <(builds_all "$VARIANT")
 DEST=$HERE/mkosi.release/$VARIANT
 rm -rf "$DEST"
 mkdir -p "$DEST"
-unpack() { # SRC-BASE (without .raw[.zst]) DEST-FILE
-	if [[ -f $1.raw.zst ]]; then
-		zstd -dqf "$1.raw.zst" -o "$2"
-	elif [[ -f $1.raw ]]; then
-		cp --reflink=auto "$1.raw" "$2"
-	else
-		die "missing $1.raw[.zst] (built without SplitArtifacts=partitions?)"
-	fi
-}
-if [[ $VARIANT == network ]]; then
-	[[ -f $BASE.efi ]] || die "no UKI $BASE.efi"
-	install -m 0644 "$BASE.efi" "$DEST/boot.efi"
-	log "  unpacking root.img and root.verity"
-	unpack "$BASE.root" "$DEST/root.img"
-	unpack "$BASE.root-verity" "$DEST/root.verity"
-	uki_cmdline "$DEST/boot.efi" >"$DEST/cmdline"
-	echo >>"$DEST/cmdline"
-else
-	[[ -f $BASE.raw.zst ]] || die "no $BASE.raw.zst"
-	cp --reflink=auto "$BASE.raw.zst" "$DEST/image.raw.zst"
-fi
-tr -d '[:space:]' <"$BASE.roothash" >"$DEST/roothash"
-echo >>"$DEST/roothash"
-[[ -f $BASE.manifest ]] && cp "$BASE.manifest" "$DEST/manifest.json"
+PARTS=(boot.efi root.img root.verity roothash manifest.json)
+[[ $VARIANT == usb ]] && PARTS+=(systemd-boot.efi layout.sfdisk)
+for f in "${PARTS[@]}"; do
+	[[ -f $DIR/$f ]] || die "$DIR/$f missing (a build from before the parts layout? rebuild)"
+	ln "$DIR/$f" "$DEST/$f" 2>/dev/null || cp --reflink=auto "$DIR/$f" "$DEST/$f"
+done
+uki_cmdline "$DEST/boot.efi" >"$DEST/cmdline"
+echo >>"$DEST/cmdline"
 {
 	echo "VARIANT=$VARIANT"
 	echo "VERSION=$VERSION"
@@ -143,15 +126,13 @@ echo >>"$DEST/roothash"
 	echo "PACKAGES=$(builds_info "$DIR" packages)"
 } >"$DEST/release"
 (cd "$DEST" && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | sort | xargs sha256sum >SHA256SUMS)
-chmod 0644 "$DEST"/*
+chmod 0644 "$DEST"/{cmdline,release,SHA256SUMS}
 chmod 0755 "$DEST"
 
 # --- check it as a server will ---------------------------------------------------
 
 log "Checking the release (as the distribution servers do)"
-tmp=$(mktemp -d -t safespace-verify.XXXXXX)
-trap 'rm -rf "$tmp"' EXIT
-verify_release "$DEST" "$VARIANT" "$DB" "$tmp" || die "the release does not pass the checks; nothing pushed"
+verify_release "$DEST" "$VARIANT" "$DB" || die "the release does not pass the checks; nothing pushed"
 log "Staged: $DEST ($(du -sh "$DEST" | cut -f1))"
 
 # --- push ------------------------------------------------------------------------

@@ -7,7 +7,7 @@
 #
 #   --keep   keep the temporary directory (printed at the end)
 #   TEST     run only these (default: all): syntax groups keys builds
-#            release server usb upload netroot dnsmasq nginx units
+#            release server usb stick upload netroot dnsmasq nginx units
 #
 # Needs the build host's tools (README.md, "Build host"): sbsigntools,
 # efitools, sbctl, cryptsetup, zstd, mtools, dosfstools, util-linux, binutils,
@@ -78,11 +78,11 @@ fixtures() {
 	NETPORT=$(port)
 	# Two network builds of different group sets (the older one with the
 	# desktop), one usb build.
-	fx_network_build "$CO" 20990101-0000 "http://127.0.0.1:$NETPORT/network/" "$KD" base,remotedesktop \
-		linux=6.1 vim=9.0 xfce4=4.18
-	fx_network_build "$CO" 20990101-0100 "http://127.0.0.1:$NETPORT/network/" "$KD" base \
-		linux=6.2 vim=9.0 openssh=9.9
-	fx_usb_build "$CO" 20990101-0000 "$KD" base
+	fx_build "$CO" network 20990101-0000 "$KD" base,remotedesktop "http://127.0.0.1:$NETPORT/network/" \
+		linux=6.1 vim=9.0 xfce4=4.18 || { fail "building the network fixture"; return 1; }
+	fx_build "$CO" network 20990101-0100 "$KD" base "http://127.0.0.1:$NETPORT/network/" \
+		linux=6.2 vim=9.0 openssh=9.9 || { fail "building the network fixture"; return 1; }
+	fx_build "$CO" usb 20990101-0000 "$KD" base "" linux=1 || { fail "building the usb fixture"; return 1; }
 	SHARE=$W/share STATE=$W/state
 	mkdir -p "$SHARE/network" "$SHARE/usb" "$STATE"
 	cat >"$W/server.conf" <<-EOF
@@ -168,6 +168,11 @@ fi
 # --- builds on the build host ----------------------------------------------------------------
 if wanted builds && fixtures; then
 	section builds
+	parts() { [[ $(LC_ALL=C ls "$1" | tr "\n" " ") == "$2" ]]; }
+	check "finalize: a network build keeps only its parts" parts "$CO/mkosi.output/network/base_20990101-0100" \
+		"boot.efi build.json manifest.json root.img root.verity roothash "
+	check "finalize: a usb build also systemd-boot and the partition table, no disk image" parts "$CO/mkosi.output/usb/base_20990101-0000" \
+		"boot.efi build.json layout.sfdisk manifest.json root.img root.verity roothash systemd-boot.efi "
 	BS=$CO/build.sh
 	"$BS" list >"$W/list.txt" 2>&1
 	check "list: every build, one group set after the other" bash -c '[[ $(grep -Eo "(network|usb) +[a-z-]+_[0-9-]+" "$1" | tr -s " " | tr "\n" "|") == "network base-remotedesktop_20990101-0000|network base_20990101-0100|usb base_20990101-0000|" ]]' _ "$W/list.txt"
@@ -241,13 +246,50 @@ if wanted usb && shared; then
 	section usb
 	check "verify: the served usb release is ok" "$NB" verify usb
 	cp -a "$SHARE/usb" "$W/usb.good"
-	zstd -dqf "$SHARE/usb/image.raw.zst" -o "$W/usb.raw"
-	printf '\xff' | dd of="$W/usb.raw" bs=1 seek=$((18432 * 512 + 4096)) conv=notrunc status=none
-	zstd -qf "$W/usb.raw" -o "$SHARE/usb/image.raw.zst"
-	fx_resum "$SHARE/usb"
-	refuse "verify detects a manipulated root partition in the image" "$NB" verify usb
-	rm -rf "$SHARE/usb" "$W/usb.raw"
+	tamper_usb() { # NAME COMMAND
+		rm -rf "$SHARE/usb"
+		cp -a "$W/usb.good" "$SHARE/usb"
+		bash -c "$2; source '$REPO/tests/lib/fixtures.sh'; fx_resum \$1" _ "$SHARE/usb"
+		refuse "verify detects: $1" "$NB" verify usb
+	}
+	tamper_usb "a manipulated root image" 'printf "\xff" | dd of=$1/root.img bs=1 seek=4096 conv=notrunc status=none'
+	tamper_usb "systemd-boot signed by another key" 'sbattach --remove $1/systemd-boot.efi >/dev/null; sbsign --key '"$W"'/keys/keys/KEK/KEK.key --cert '"$W"'/keys/keys/KEK/KEK.pem --output $1/systemd-boot.efi $1/systemd-boot.efi >/dev/null 2>&1'
+	tamper_usb "a partition table with another root partition UUID" 'sed -i "/4F68BCE3/s/uuid=[0-9A-F-]*/uuid=11111111-2222-3333-4444-555555555555/" $1/layout.sfdisk'
+	tamper_usb "a partition too small for the root image" 'sed -i "/4F68BCE3/s/size= *[0-9]*/size=8/" $1/layout.sfdisk'
+	rm -rf "$SHARE/usb"
 	cp -a "$W/usb.good" "$SHARE/usb"
+fi
+
+# --- writing a stick (burn.sh --image, lib/stick.sh) -----------------------------------------
+if wanted stick && shared && need mkfs.fat mmd mcopy sfdisk; then
+	section stick
+	U=$CO/mkosi.output/usb/base_20990101-0000
+	cut_part() { # IMAGE TYPE OUT: a partition of a stick image into a file
+		set -- "$1" "$(awk -F'[=,]' -v t="$2" 'toupper($0) ~ "TYPE=" t { gsub(/ /, ""); print $2, $4; exit }' "$U/layout.sfdisk")" "$3"
+		dd if="$1" of="$3" bs=512 skip="${2% *}" count="${2#* }" status=none
+	}
+	stick_ok() { # IMAGE: the written stick is the build
+		local img=$1
+		[[ $(sfdisk -d "$img" | sed -e '/^device:/d' -e 's|^[^ ]* : ||') == "$(cat "$U/layout.sfdisk")" ]] || { echo "partition table differs"; return 1; }
+		[[ $(mdir -b -/ -i "$img@@$((2048 * 512))" ::/ | sort | tr '\n' ' ') == "::/EFI/ ::/EFI/BOOT/ ::/EFI/BOOT/BOOTX64.EFI ::/EFI/Linux/ ::/EFI/Linux/safespace-arch-usb.efi " ]] || { echo "ESP content differs"; return 1; }
+		mcopy -n -i "$img@@$((2048 * 512))" ::/EFI/BOOT/BOOTX64.EFI "$W/st.boot" && cmp -s "$W/st.boot" "$U/systemd-boot.efi" || { echo "BOOTX64.EFI differs"; return 1; }
+		mcopy -n -i "$img@@$((2048 * 512))" ::/EFI/Linux/safespace-arch-usb.efi "$W/st.uki" && cmp -s "$W/st.uki" "$U/boot.efi" || { echo "UKI differs"; return 1; }
+		[[ $(od -An -tu2 -j$((2048 * 512 + 11)) -N2 "$img" | tr -d ' ') == 512 ]] || { echo "FAT sector size is not 512"; return 1; }
+		cut_part "$img" 4F68BCE3 "$W/st.root" && cut_part "$img" 2C7357ED "$W/st.verity" &&
+			veritysetup verify "$W/st.root" "$W/st.verity" "$(cat "$U/roothash")" || { echo "root does not verify"; return 1; }
+	}
+	check "burn.sh --image from a build" "$CO/burn.sh" base_20990101-0000 --image "$W/stick1.raw"
+	check "... is the build: table, ESP, signed files, root block by block" stick_ok "$W/stick1.raw"
+	check "burn.sh --image from a share directory (SHA256SUMS checked)" "$CO/burn.sh" "$SHARE/usb" --image "$W/stick2.raw"
+	SP=$(port)
+	serve "$W/share" "$SP"
+	check "burn.sh --image from a server URL (root streamed)" "$CO/burn.sh" "http://127.0.0.1:$SP/usb/" --image "$W/stick3.raw"
+	check "... is the build too" stick_ok "$W/stick3.raw"
+	cp "$SHARE/usb/root.img" "$W/root.good"
+	printf '\xff' | dd of="$SHARE/usb/root.img" bs=1 seek=4096 conv=notrunc status=none
+	refuse "a root.img that does not match SHA256SUMS is refused while streaming" "$CO/burn.sh" "http://127.0.0.1:$SP/usb/" --image "$W/stick4.raw"
+	check "... and nothing is left behind" test ! -e "$W/stick4.raw"
+	cp "$W/root.good" "$SHARE/usb/root.img"
 fi
 
 # --- upload through rrsync ------------------------------------------------------------------
@@ -346,7 +388,7 @@ if wanted nginx && shared && need nginx curl; then
 		sleep 0.3
 		code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 		check "boot.efi is served with Content-Length" bash -c 'curl -sI "$1" | grep -qi "^content-length: [1-9]"' _ "http://127.0.0.1:$P/safespace/network/boot.efi"
-		check "usb image is served" test "$(code -I "http://127.0.0.1:$P/safespace/usb/image.raw.zst")" = 200
+		check "usb parts are served" test "$(code -I "http://127.0.0.1:$P/safespace/usb/layout.sfdisk")" = 200
 		check "hidden files are refused" test "$(code "http://127.0.0.1:$P/safespace/network/.hidden")" = 403
 		check "no directory listing" test "$(code "http://127.0.0.1:$P/safespace/network/")" = 403
 		check "nothing outside /safespace/" test "$(code "http://127.0.0.1:$P/etc/passwd")" = 404

@@ -1,170 +1,166 @@
 #!/usr/bin/env bash
-# Write a "usb" image to a USB stick / SD card: built here (mkosi.output/usb/), or
-# a usb release from a distribution server (share path or URL).
-# Images of the "network" variant have no ESP and are not written to a medium;
-# they are released with release.sh (see README.md, "Releasing").
+# Write a usb build onto a USB stick / SD card, assembled from its parts
+# (lib/stick.sh): the partition table the build recorded, an ESP with the
+# signed systemd-boot and UKI, the dm-verity hash tree and the root partition.
+# Needs no keys and no build: the parts are signed already.
 #
-# Needs no Secure Boot keys and no package cache: the image is already signed.
-# Takes raw (.raw) or zstd-compressed (.raw.zst) images. Only blocks that
-# contain data are written. Nothing is grown: the stick is read-only at
-# runtime, so the rest of it simply stays unused.
+#   sudo ./burn.sh [SOURCE] DEVICE [--yes]
+#   ./burn.sh [SOURCE] --image FILE        a stick image file instead (no root)
+#
+#   SOURCE  where the parts come from (default: the newest usb build here):
+#           - a build, as ./build.sh list shows it (base-remotedesktop_20261019-0930)
+#           - a directory with the parts: a build directory, mkosi.release/usb,
+#             or a distribution server's share (/srv/safespace/share/usb)
+#           - a distribution server's URL, e.g. http://10.0.0.1/safespace/usb/:
+#             the root partition is streamed straight onto the stick, and
+#             every file is checked against the release's SHA256SUMS
+#   DEVICE  the whole stick, e.g. /dev/sdb or /dev/mmcblk0
+#   --yes   do not ask before overwriting DEVICE
+#
+# Images of the network variant have no ESP and are not written to a medium;
+# they are released with release.sh. Check a written stick with diagnose.sh
+# (signatures against db.pem, root block by block).
 set -Eeuo pipefail
-
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
-
-usage() {
-	cat <<EOF
-Usage: sudo $0 [IMAGE] DEVICE [--yes]
-
-  IMAGE      .raw or .raw.zst to write (default: the newest usb build in mkosi.output/usb/),
-             or a usb release on a distribution server: a local share path
-             (/srv/safespace/share/usb/image.raw.zst) or its URL
-             (http://<server>/safespace/usb/), checked against its SHA256SUMS
-  DEVICE     whole target disk, e.g. /dev/sdb or /dev/mmcblk0
-  --yes      do not ask for confirmation
-EOF
-}
-
 log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
+usage() { sed -n '2,${/^#/!q;s/^# \?//;p}' "$0"; }
+release_get() { sed -n "s/^$2=//p" "$1" | head -1; }
+# shellcheck source=lib/stick.sh
+source "$HERE/lib/stick.sh"
+# shellcheck source=lib/builds.sh
+source "$HERE/lib/builds.sh"
 
-CONFIRM=1
-ARGS=()
+CONFIRM=1 IMAGE_OUT="" ARGS=()
 while (($#)); do
 	case $1 in
 		--yes) CONFIRM=0; shift ;;
-		-h|--help) usage; exit 0 ;;
+		--image) IMAGE_OUT=${2:?--image needs a file}; shift 2 ;;
+		-h | --help) usage; exit 0 ;;
 		-*) usage >&2; exit 1 ;;
 		*) ARGS+=("$1"); shift ;;
 	esac
 done
-case ${#ARGS[@]} in
-	1)
-		pick=(! -name '*-network_*')
-		IMAGE=$(find "$HERE/mkosi.output/usb" -mindepth 2 -maxdepth 2 -type f \( -name '*.raw.zst' -o -name '*.raw' \) \
-			"${pick[@]}" -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR == 1 { print $2 }' || true)
-		DEVICE=${ARGS[0]}
-		;;
-	2) IMAGE=${ARGS[0]}; DEVICE=${ARGS[1]} ;;
-	*) usage >&2; exit 1 ;;
-esac
+if [[ -n $IMAGE_OUT ]]; then
+	((${#ARGS[@]} <= 1)) || { usage >&2; exit 1; }
+	SOURCE=${ARGS[0]:-} DEVICE=""
+else
+	case ${#ARGS[@]} in
+		1) SOURCE="" DEVICE=${ARGS[0]} ;;
+		2) SOURCE=${ARGS[0]} DEVICE=${ARGS[1]} ;;
+		*) usage >&2; exit 1 ;;
+	esac
+	[[ $EUID -eq 0 ]] || die "writing a device needs root (or --image FILE)"
+fi
+for cmd in sfdisk mkfs.fat mmd mcopy dd sha256sum; do
+	command -v "$cmd" >/dev/null || die "missing '$cmd' (pacman -S util-linux dosfstools mtools coreutils)"
+done
 
-[[ $EUID -eq 0 ]] || die "must run as root"
+# --- where the parts come from ---------------------------------------------------
 
-# A usb release from a distribution server: download it next to its SHA256SUMS.
-# Authenticity is checked on the written medium: sudo ./diagnose.sh --db-cert ...
-if [[ $IMAGE =~ ^https?:// ]]; then
+TMP=$(mktemp -d -t safespace-burn.XXXXXX)
+trap 'rm -rf "$TMP"' EXIT
+ROOT_URL="" ROOT_SUM=""
+if [[ $SOURCE =~ ^https?:// ]]; then
 	command -v curl >/dev/null || die "missing 'curl'"
-	[[ $IMAGE == */ ]] && IMAGE+=image.raw.zst
-	DL=$(mktemp -d -t safespace-burn.XXXXXX)
-	trap 'rm -rf "$DL"' EXIT
-	log "Downloading $IMAGE"
-	curl -fL --progress-bar -o "$DL/image.raw.zst" "$IMAGE" || die "download failed"
-	curl -fsS -o "$DL/SHA256SUMS" "${IMAGE%/*}/SHA256SUMS" || die "no SHA256SUMS next to $IMAGE"
-	(cd "$DL" && grep ' \*\?image\.raw\.zst$' SHA256SUMS | sha256sum --quiet --strict -c) || die "download does not match SHA256SUMS"
-	IMAGE=$DL/image.raw.zst
-fi
-for cmd in sfdisk partx wipefs blockdev lsblk blkid dd zstd; do
-	command -v "$cmd" >/dev/null || die "missing '$cmd'"
-done
-
-# --- checks --------------------------------------------------------------------
-
-hint="sudo ./build.sh usb"
-[[ -n $IMAGE && -e $IMAGE ]] || die "image ${IMAGE:-in mkosi.output/} not found (run: $hint)"
-IMAGE=$(readlink -f "$IMAGE")
-[[ $(basename "$IMAGE") == *-network_* ]] &&
-	die "$(basename "$IMAGE") is a network build (no ESP, nothing to boot from a medium): release it with ./release.sh network, see README.md"
-if [[ $IMAGE == *.zst ]]; then
-	COMPRESSED=1
-	# mkosi compresses as a stream, so the zstd header has no content size.
-	# Take it from the primary GPT header instead (LBA 1, 512-byte sectors):
-	# offset 32 holds the LBA of the backup header, the image's last sector.
-	# zstd is cut off by head on purpose, so pipefail must not count that.
-	hdr=$(set +o pipefail; zstd -dc "$IMAGE" 2>/dev/null | head -c 1024 | tail -c 512 | od -An -v -tx1 | tr -d ' \n' || true)
-	[[ ${hdr:0:16} == 4546492050415254 ]] || die "$IMAGE does not contain a GPT disk image (512-byte sectors)"
-	le=${hdr:64:16}
-	backup_lba=$((16#${le:14:2}${le:12:2}${le:10:2}${le:8:2}${le:6:2}${le:4:2}${le:2:2}${le:0:2}))
-	IMAGE_BYTES=$(((backup_lba + 1) * 512))
-	log "Checking $IMAGE for corruption"
-	zstd -tq "$IMAGE" || die "$IMAGE is damaged (zstd -t failed)"
+	base=${SOURCE%/}
+	log "Fetching the usb release from $base/"
+	for f in SHA256SUMS release roothash layout.sfdisk systemd-boot.efi boot.efi root.verity; do
+		curl -fsS -o "$TMP/$f" "$base/$f" || die "cannot fetch $base/$f (not a usb release?)"
+	done
+	(cd "$TMP" && grep -E ' \*?(release|roothash|layout\.sfdisk|systemd-boot\.efi|boot\.efi|root\.verity)$' SHA256SUMS |
+		sha256sum --quiet --strict -c) || die "the release's files do not match its SHA256SUMS"
+	ROOT_URL=$base/root.img
+	ROOT_SUM=$(awk '$2 == "root.img" || $2 == "*root.img" { print $1 }' "$TMP/SHA256SUMS")
+	[[ $ROOT_SUM =~ ^[0-9a-f]{64}$ ]] || die "no root.img in SHA256SUMS"
+	SRC=$TMP
+elif [[ -d $SOURCE ]]; then
+	SRC=$(readlink -f "$SOURCE")
+elif [[ -n $SOURCE ]]; then
+	SRC=$(builds_dir usb "$(builds_find "usb/${SOURCE#usb/}" | cut -d/ -f2)")
 else
-	COMPRESSED=0
-	IMAGE_BYTES=$(stat -c %s "$IMAGE")
-	[[ -z $(losetup -j "$IMAGE") ]] || die "$IMAGE is attached to a loop device (build still running?)"
-	sfdisk -d "$IMAGE" 2>/dev/null | grep -q '^label: gpt' || die "$IMAGE has no GPT partition table"
+	b=$(builds_newest usb)
+	[[ -n $b ]] || die "no usb build here (sudo ./build.sh usb, or give a SOURCE)"
+	SRC=$(builds_dir usb "$b")
 fi
-
-[[ -b $DEVICE ]] || die "$DEVICE is not a block device"
-[[ $(lsblk -dno TYPE "$DEVICE") == disk ]] || die "$DEVICE is not a whole disk"
-if lsblk -nro MOUNTPOINTS "$DEVICE" | grep -q .; then
-	lsblk -o NAME,MOUNTPOINTS "$DEVICE" >&2
-	die "$DEVICE has mounted partitions"
+[[ -f $SRC/layout.sfdisk ]] || die "$SRC has no layout.sfdisk: not a usb build or release"
+if [[ -z $ROOT_URL && -f $SRC/SHA256SUMS ]]; then
+	log "Checking $SRC against its SHA256SUMS"
+	(cd "$SRC" && sha256sum --quiet --strict -c SHA256SUMS) || die "$SRC does not match its SHA256SUMS"
 fi
-if lsblk -nro TYPE "$DEVICE" | grep -qvE '^(disk|part)$'; then
-	die "$DEVICE is in use (LUKS, LVM or RAID on top of it)"
-fi
-DEVICE_BYTES=$(blockdev --getsize64 "$DEVICE")
-((DEVICE_BYTES >= IMAGE_BYTES)) ||
-	die "$DEVICE ($((DEVICE_BYTES >> 20)) MiB) is smaller than the image ($((IMAGE_BYTES >> 20)) MiB)"
-
-log "Image:  $IMAGE ($((IMAGE_BYTES >> 20)) MiB, $(du -m "$IMAGE" | cut -f1) MiB on disk)"
-MANIFEST=${IMAGE%.raw*}.manifest
-[[ -f $MANIFEST ]] && log "        $(grep -c '"name"' "$MANIFEST") packages (manifest), built $(date -r "$IMAGE" '+%F %R')"
-log "Target: $DEVICE"
-lsblk -o NAME,SIZE,MODEL,TRAN,RM "$DEVICE"
-if ((CONFIRM)); then
-	read -rp "ALL DATA on $DEVICE will be destroyed. Type YES to continue: " answer
-	[[ $answer == YES ]] || die "aborted"
-fi
-
-partitions() {
-	lsblk -lnpo NAME,TYPE "$DEVICE" | awk '$2 == "part" { print $1 }'
-}
-
-# --- write ---------------------------------------------------------------------
-
-# Zero blocks of the image are skipped (conv=sparse), so whatever was on the
-# device stays there. Remove every old filesystem/RAID/LUKS signature first, so
-# nothing stale can be detected in the gaps later.
-log "Wiping old signatures on $DEVICE"
-while read -r part; do
-	wipefs -aq "$part"
-done < <(partitions)
-wipefs -aq "$DEVICE"
-
-log "Writing image (only blocks with data)"
-if ((COMPRESSED)); then
-	# fullblock: zero detection needs whole 4 MiB blocks, pipes deliver less.
-	zstd -dc "$IMAGE" | dd of="$DEVICE" bs=4M iflag=fullblock conv=sparse,fsync oflag=direct status=progress
+if [[ -f $SRC/build.json ]]; then
+	what="build $(builds_info "$SRC" build), groups $(builds_info "$SRC" groups), built $(builds_info "$SRC" finished)"
+elif [[ -f $SRC/release ]]; then
+	what="release $(release_get "$SRC/release" BUILD), groups $(release_get "$SRC/release" GROUPS), built $(release_get "$SRC/release" BUILT)"
 else
-	dd if="$IMAGE" of="$DEVICE" bs=4M conv=sparse,fsync oflag=direct status=progress
+	what=$SRC
+fi
+BYTES=$(stick_bytes "$SRC")
+log "Source: $what"
+log "        ${SOURCE:-$SRC} ($((BYTES >> 20)) MiB on the stick)"
+
+# --- target ------------------------------------------------------------------------
+
+if [[ -n $IMAGE_OUT ]]; then
+	TARGET=$IMAGE_OUT
+	[[ ! -b $TARGET ]] || die "--image is for files; for a device give it as DEVICE"
+else
+	TARGET=$DEVICE
+	[[ -b $DEVICE ]] || die "$DEVICE is not a block device"
+	[[ $(lsblk -dno TYPE "$DEVICE") == disk ]] || die "$DEVICE is not a whole disk"
+	if lsblk -nro MOUNTPOINTS "$DEVICE" | grep -q .; then
+		lsblk -o NAME,MOUNTPOINTS "$DEVICE" >&2
+		die "$DEVICE has mounted partitions"
+	fi
+	if lsblk -nro TYPE "$DEVICE" | grep -qvE '^(disk|part)$'; then
+		die "$DEVICE is in use (LUKS, LVM or RAID on top of it)"
+	fi
+	DEVICE_BYTES=$(blockdev --getsize64 "$DEVICE")
+	((DEVICE_BYTES >= BYTES)) || die "$DEVICE ($((DEVICE_BYTES >> 20)) MiB) is smaller than the stick needs ($((BYTES >> 20)) MiB)"
+	log "Target: $DEVICE"
+	lsblk -o NAME,SIZE,MODEL,TRAN,RM "$DEVICE"
+	if ((CONFIRM)); then
+		read -rp "ALL DATA on $DEVICE will be destroyed. Type YES to continue: " answer
+		[[ $answer == YES ]] || die "aborted"
+	fi
+	# Remove every old filesystem/RAID/LUKS signature, so nothing stale can be
+	# detected in the parts of the stick that are not written.
+	log "Wiping old signatures on $DEVICE"
+	lsblk -lnpo NAME,TYPE "$DEVICE" | awk '$2 == "part" { print $1 }' | while read -r p; do wipefs -aq "$p"; done
+	wipefs -aq "$DEVICE"
 fi
 
-# The image's backup GPT sits at the image's end, not at the device's end.
-# Move it, otherwise firmware and tools report a damaged partition table.
-log "Relocating backup GPT to the end of $DEVICE"
-sfdisk --quiet --relocate gpt-bak-std "$DEVICE"
+# --- write -------------------------------------------------------------------------
 
-blockdev --rereadpt "$DEVICE"
-udevadm settle
-
-NPARTS=$(partx -g -o NR "$DEVICE" | wc -l)
-for _ in {1..10}; do
-	mapfile -t PARTS < <(partitions)
-	((${#PARTS[@]} == NPARTS)) && break
-	sleep 1
-done
-# ESP, root, root-verity.
-((NPARTS >= 1 && ${#PARTS[@]} == NPARTS)) || die "partitions on $DEVICE did not show up after writing"
-
-# --- finish --------------------------------------------------------------------
-
-sync
-blockdev --flushbufs "$DEVICE"
-if lsblk -nro MOUNTPOINTS "$DEVICE" | grep -q .; then
-	lsblk -o NAME,MOUNTPOINTS "$DEVICE" >&2
-	die "$DEVICE still has mounted partitions, do not unplug it"
+log "Writing the partition table, the ESP, root.verity and root.img"
+if [[ -n $ROOT_URL ]]; then
+	# The root partition goes from the server onto the stick in one stream;
+	# its checksum is taken on the way (fifo -> sha256sum) and compared after.
+	mkfifo "$TMP/root.fifo"
+	sha256sum <"$TMP/root.fifo" | cut -d' ' -f1 >"$TMP/root.sha" &
+	sum_pid=$!
+	ok=1
+	curl -fsS "$ROOT_URL" | tee "$TMP/root.fifo" | stick_write "$TARGET" "$SRC" - || ok=0
+	wait "$sum_pid" || true
+	if ((!ok)) || [[ $(cat "$TMP/root.sha" 2>/dev/null) != "$ROOT_SUM" ]]; then
+		if [[ -b $TARGET ]]; then wipefs -aq "$TARGET"; else rm -f "$TARGET"; fi
+		die "the download of root.img failed or does not match SHA256SUMS: $TARGET $([[ -b $TARGET ]] && echo 'was wiped again' || echo 'was removed')"
+	fi
+else
+	stick_write "$TARGET" "$SRC"
 fi
-lsblk -o NAME,SIZE,FSTYPE,LABEL,PARTLABEL "$DEVICE"
-log "Done. $DEVICE can be unplugged."
+
+if [[ -b $TARGET ]]; then
+	blockdev --rereadpt "$TARGET"
+	udevadm settle
+	for _ in {1..10}; do
+		(($(lsblk -lnpo TYPE "$TARGET" | grep -c part) == 3)) && break
+		sleep 1
+	done
+	(($(lsblk -lnpo TYPE "$TARGET" | grep -c part) == 3)) || die "the partitions on $TARGET did not show up after writing"
+	blockdev --flushbufs "$TARGET"
+	lsblk -o NAME,SIZE,FSTYPE,LABEL,PARTLABEL "$TARGET"
+	log "Done. $TARGET can be unplugged (check it with: sudo ./diagnose.sh $TARGET)."
+else
+	log "Done: $TARGET ($((BYTES >> 20)) MiB)"
+fi

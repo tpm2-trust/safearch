@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Boot an image in QEMU as a USB stick (xHCI + usb-storage, like real hardware),
-# with OVMF. The image is opened with snapshot=on: nothing is written to it.
+# Boot a usb build in QEMU as a USB stick (xHCI + usb-storage, like real
+# hardware), with OVMF. The stick image is assembled from the build's parts
+# (lib/stick.sh, as burn.sh writes a stick) and opened with snapshot=on.
 #
-#   ./test-vm.sh [IMAGE] [--secure-boot | --setup-mode | --sealed] [--ssh PORT]
+#   ./test-vm.sh [SOURCE] [--secure-boot | --setup-mode | --sealed] [--ssh PORT]
+#     SOURCE: a usb build (./build.sh list), a directory with the parts, or a
+#     stick image file (.raw); default: the newest usb build
 #   ./test-vm.sh --netboot [--tree DIR] [--tftp] [--secure-boot | ...] [--ssh PORT]
 #   ./test-vm.sh --netboot --url BOOT_URL [--secure-boot | ...] [--ssh PORT]
 #
@@ -131,24 +134,27 @@ elif ((NETBOOT)); then
 	sleep 0.3
 	kill -0 "$HTTP_PID" 2>/dev/null || { cat "$WORK/http.log" >&2; die "the HTTP server did not start (port $port in use?)"; }
 else
-	if [[ -z $IMAGE ]]; then
-		IMAGE=$(find "$HERE/mkosi.output/usb" -mindepth 2 -maxdepth 2 -type f \( -name '*.raw.zst' -o -name '*.raw' \) \
-			! -name '*-network_*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR == 1 { print $2 }' || true)
-	fi
 	MEM=${MEM:-2048}
-	[[ -n $IMAGE && -f $IMAGE ]] || die "no image found (run: sudo ./build.sh usb)"
-	[[ $(basename "$IMAGE") == *-network_* ]] &&
-		die "$(basename "$IMAGE") is a network build: test it with ./test-vm.sh --netboot"
-
-	# Decompress once per image (QEMU needs a raw file).
-	RAW=$IMAGE
-	if [[ $IMAGE == *.zst ]]; then
-		RAW=$WORK/$(basename "${IMAGE%.zst}")
-		if [[ ! -f $RAW || $IMAGE -nt $RAW ]]; then
-			rm -f "$WORK"/*.raw
-			log "Decompressing $(basename "$IMAGE")"
-			zstd -dqf "$IMAGE" -o "$RAW"
+	if [[ -f $IMAGE ]]; then
+		RAW=$IMAGE
+	else
+		# shellcheck source=lib/stick.sh
+		source "$HERE/lib/stick.sh"
+		# shellcheck source=lib/builds.sh
+		source "$HERE/lib/builds.sh"
+		if [[ -d $IMAGE ]]; then
+			SRC=$IMAGE
+		elif [[ -n $IMAGE ]]; then
+			SRC=$(builds_dir usb "$(builds_find "usb/${IMAGE#usb/}" | cut -d/ -f2)")
+		else
+			b=$(builds_newest usb)
+			[[ -n $b ]] || die "no usb build (run: sudo ./build.sh usb)"
+			SRC=$(builds_dir usb "$b")
 		fi
+		[[ -f $SRC/layout.sfdisk ]] || die "$SRC is not a usb build (network builds: ./test-vm.sh --netboot)"
+		RAW=$WORK/stick.raw
+		log "Assembling the stick image from $SRC"
+		stick_write "$RAW" "$SRC"
 	fi
 fi
 

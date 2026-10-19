@@ -184,7 +184,7 @@ esac
 if [[ $VERB == build ]]; then
 	# Host tools that mkosi (without a tools tree) runs from the host.
 	missing=()
-	for tool in cpio curl ukify sbctl mkfs.erofs mkfs.vfat mcopy zstd systemd-repart openssl cert-to-efi-sig-list sign-efi-sig-list; do
+	for tool in cpio curl ukify sbctl mkfs.erofs mkfs.vfat mcopy sfdisk zstd systemd-repart openssl cert-to-efi-sig-list sign-efi-sig-list; do
 		command -v "$tool" >/dev/null || missing+=("$tool")
 	done
 	[[ -x /usr/lib/systemd/systemd-measure ]] || command -v systemd-measure >/dev/null || missing+=(systemd-measure)
@@ -256,6 +256,9 @@ mkosi "${EXTRA[@]}" ${MKOSI_ARGS[@]+"${MKOSI_ARGS[@]}"} ${APPEND_VERB:+build}
 { set +x; } 2>/dev/null
 
 [[ $VERB == build ]] || exit 0
+
+# Keep the parts, under short names; the whole disk image goes (lib/builds.sh).
+builds_finalize "$OUTDIR" "$VARIANT" "$VERSION"
 
 # What was built, from what (build.json marks the build as complete).
 git=(git -c safe.directory="$HERE" -C "$HERE")
