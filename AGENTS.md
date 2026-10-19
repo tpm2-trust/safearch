@@ -82,7 +82,7 @@ the network-boot reference. Arch Linux only, everywhere.
 | initrd | `mkosi.initrd.conf/`: `usb-bootdev` (root from the stick) and `netroot` (root over HTTP), chosen at boot by `LoaderDevicePartUUID` |
 | distribution server | `server/` (`setup.sh`, `safespace-netboot`, units, nginx site, `server.conf.example`) |
 | shared shell code | `lib/repos.sh`, `lib/groups.sh`, `lib/keys.sh`, `lib/builds.sh` (the builds in `mkosi.output/<groups>_<version>/`: their parts, list, select, prune), `lib/stick.sh` (a stick assembled from the parts), `lib/verify.sh` (also installed on the servers) |
-| tests | `tests/run.sh`, `tests/lib/` |
+| tests | `tests/run.sh` (no root), `tests/vm.sh` (integration in QEMU), `tests/lib/` |
 | per-host files (gitignored, templates `*.example`) | `users.conf`, `netboot.conf`, `release.conf`, `mkosi.local.conf`, `repos.local.conf`, `server/server.conf` |
 
 ### Invariants — a change that breaks one of these needs the user's explicit OK
@@ -110,6 +110,12 @@ the network-boot reference. Arch Linux only, everywhere.
 - Run `tests/run.sh` after every change (no root, ~15 s). Add a test for new
   behaviour there: fixtures with throwaway keys are in `tests/lib/fixtures.sh`.
   A SKIP is not a pass: say which tool was missing.
+- After a change to the image, the initrd, the build, the release or the server, run the
+  integration test `tests/vm.sh` (test build with a throwaway user, release into its own
+  share, server check, QEMU boots from a stick and over the network, sealing, Secure Boot;
+  ~15 min). It needs the build host's sudo rule for `build.sh`; if a prerequisite is
+  missing it says which: hand that to the user instead of working around it. Never release
+  a test build (`mkosi.test/vm/builds/`) to a real server: it carries the test key.
 - Not testable without root or hardware — say so and hand it to the user with
   the exact commands: a real `build.sh` run, `server/setup.sh`, the units under
   systemd, booting in QEMU (`test-vm.sh`) or on a machine, YubiKey keys.

@@ -6,12 +6,16 @@
 # sticks from it.
 #
 #   ./release.sh [--build BUILD | --groups LIST] [--push TARGET]...
+#                [--builds DIR] [--stage DIR]
 #
 #   --build BUILD   the build to release, as ./build.sh list shows it
 #                   (e.g. base-remotedesktop_20261019-0930). Releasing an older
 #                   build again is how a release is rolled back.
 #   --groups LIST   the newest build with exactly this group set
 #   (neither)       the newest build, whatever its groups
+#   --builds DIR    where the builds are (default: mkosi.output; tests/vm.sh
+#                   keeps its test builds apart)
+#   --stage DIR     where the release is staged (default: mkosi.release)
 #   --push TARGET   distribution server to push to, repeatable. TARGET is the
 #                   upload account, e.g. safespace@dist1.example.org (its ssh
 #                   key only reaches the share, see server/setup.sh), or a
@@ -52,12 +56,14 @@ source "$HERE/lib/groups.sh"
 case ${1:-} in
 	network | usb) die "there are no variants any more: one release serves sticks and the network ($0 [--build ...])" ;;
 esac
-BUILD="" WANT_GROUPS="" TARGETS=()
+BUILD="" WANT_GROUPS="" TARGETS=() STAGE_DIR=$HERE/mkosi.release
 while (($#)); do
 	case $1 in
 		--build) BUILD=${2:?--build needs a build (./build.sh list)}; shift 2 ;;
 		--groups) WANT_GROUPS=${2:?--groups needs a comma-separated list}; shift 2 ;;
 		--push) TARGETS+=("${2:?--push needs a target}"); shift 2 ;;
+		--builds) BUILDS_ROOT=$(readlink -f "${2:?--builds needs a directory}"); shift 2 ;;
+		--stage) STAGE_DIR=$(readlink -f "${2:?--stage needs a directory}"); shift 2 ;;
 		-h | --help) usage; exit 0 ;;
 		*) usage >&2; die "unknown option $1" ;;
 	esac
@@ -102,7 +108,8 @@ done < <(builds_all)
 
 # --- bundle --------------------------------------------------------------------
 
-DEST=$HERE/mkosi.release
+DEST=$STAGE_DIR
+[[ $DEST != / && $DEST != "$HERE" ]] || die "--stage $DEST: not a staging directory"
 rm -rf "$DEST"
 mkdir -p "$DEST"
 for f in boot.efi root.img root.verity roothash systemd-boot.efi layout.sfdisk manifest.json; do

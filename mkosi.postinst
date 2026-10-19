@@ -20,7 +20,9 @@ echo "$groups" >"$BUILDROOT/usr/lib/safespace/groups"
 
 # --- users from users.conf ("username:ssh-public-key", one key per line) --------
 
-[[ -f $SRCDIR/users.conf ]] || die "users.conf missing: cp users.conf.example users.conf and add your ssh keys"
+# build.sh --users picks another file (tests/vm.sh: a throwaway test user).
+USERS_CONF=$SRCDIR/${SAFESPACE_USERS_CONF:-users.conf}
+[[ -f $USERS_CONF ]] || die "${SAFESPACE_USERS_CONF:-users.conf} missing: cp users.conf.example users.conf and add your ssh keys"
 declare -A KEYS=()
 USERS=()
 while IFS= read -r line; do
@@ -31,7 +33,7 @@ while IFS= read -r line; do
 	[[ $key =~ ^(ssh-|ecdsa-|sk-) ]] || die "users.conf: '$user' has no valid ssh public key"
 	[[ -v KEYS[$user] ]] || USERS+=("$user")
 	KEYS[$user]+="$key"$'\n'
-done <"$SRCDIR/users.conf"
+done <"$USERS_CONF"
 ((${#USERS[@]})) || die "users.conf defines no users"
 
 # Root (and with it /etc and /home) is read-only (dm-verity), so home

@@ -32,9 +32,10 @@ network boot (trust model, other DHCP servers, firmware, troubleshooting);
 > `safespace-seal` (append and `--replace`) and booting the sealed VM. Boots on one real
 > machine (Secure Boot in Setup Mode). Network boot tested end to end in QEMU and libvirt
 > (OVMF, no disk attached) and on a ThinkPad T450s over PXE/TFTP (Intel AMT disabled); UEFI
-> HTTP boot on real hardware is not tested yet. These tests ran with the separate usb and
-> network builds of before; the single build that serves both is not booted yet (see "Known
-> open points"). Everything that runs without root is covered by `tests/run.sh`.
+> HTTP boot on real hardware is not tested yet. The single build that serves both paths is
+> booted in QEMU both ways (stick, UEFI HTTP from a distribution server), sealed with
+> `safespace-seal` and with enforced Secure Boot; not yet on real hardware (see "Known open
+> points"). Everything that runs without root is covered by `tests/run.sh`.
 
 ## Two roles: build host and distribution servers
 
@@ -505,6 +506,57 @@ VM's view of the host (`sudo ./build.sh --url http://10.0.2.2:8000/`) — see
 [NETBOOT.md](NETBOOT.md#optional-rehearse-it-in-qemu-first). On a booted machine:
 `journalctl -b -g 'netroot|usb-bootdev'`, `findmnt /`, `veritysetup status root`.
 
+## Integration test
+
+`tests/vm.sh` runs the whole chain unattended, without a window, and **self-contained**: it
+builds a test image with a throwaway user, releases it into a share of its own, checks it as
+a distribution server does, boots it in QEMU from a stick and over the network, seals it,
+boots with enforced Secure Boot, and checks each boot over ssh. It touches no real user, key,
+build or server. Exit 0 only if every step passed.
+
+```sh
+tests/vm.sh                          # build --groups base, release, all steps
+tests/vm.sh --no-build stick net     # the last test build, two steps only
+tests/vm.sh --groups base,docker     # another group set
+```
+
+| Step | What | Checked |
+|---|---|---|
+| `release`, `server-verify` (always) | `release.sh` into the test's share, then `server/safespace-netboot verify` on it | the checks a distribution server makes |
+| `stick` | a stick assembled from the release (`lib/stick.sh`, as `burn.sh` writes it) | `usb-bootdev` opened the root, `netroot` did not run, `LoaderDevicePartUUID` set, the stick read-only, root `verified`, `running`, no failed units |
+| `net` | UEFI HTTP boot of the share | `netroot` opened the root, no `usb-bootdev`, no `LoaderDevicePartUUID`, `verified`, `running` |
+| `seal` | Setup Mode → `safespace-seal` → the sealed firmware | Secure Boot `enabled (user)`, `verified`, `running` |
+| `net-sb` | network boot with enforced Secure Boot | Secure Boot enabled, `verified`, `running` |
+
+**Kept apart from everything real**, in `mkosi.test/vm/` (gitignored): the test user
+`tester` and its key (created on the first run), the test builds (`build.sh --users
+mkosi.test/vm/users.conf --output-root mkosi.test/vm/builds`; the newest per group set is
+kept; `./build.sh list` and `./release.sh` never see them, so a build with the test key
+cannot reach a real server by accident), and one directory per run with the share and the
+logs. The test build loads its root from `http://10.0.2.2:8790/` (QEMU's view of the build
+host), where `test-vm.sh --netboot` serves the share.
+
+**Prerequisites**, all checked before anything starts (the script lists what is missing and
+exits with 2):
+
+- `qemu-desktop`, `edk2-ovmf`, `virt-firmware`, `openssh`, `curl`, `rsync`, `binutils`,
+  `sbsigntools`, `cryptsetup`, `dosfstools`, `mtools`, `util-linux`, `python`; read/write
+  access to `/dev/kvm`
+- the public keys of a real build (`build.sh` writes them on every build)
+- `sudo` for `build.sh` (not with `--no-build`): asked once at the start, or for unattended
+  runs (cron, CI) a rule without password:
+  ```
+  <user> ALL=(root) NOPASSWD: /path/to/safearch/build.sh
+  ```
+  ⚠️ That is root for whoever can write the checkout: `build.sh` runs the repository's
+  scripts as root. Only on a build host where that is acceptable.
+- TCP port 8790 free on `127.0.0.1`, 4 GiB RAM available, 6 GiB free in `mkosi.test/`
+
+Logs: `mkosi.test/vm/run-<time>/` (the build and release logs, the server check, each boot's
+`test-vm.sh` output and serial log, what the checks saw). Not covered: real hardware, the
+real distribution server (its setup and services), and the reboot when a release is replaced
+while a machine boots.
+
 ## A netbooting VM (QEMU, libvirt / virt-manager)
 
 A VM that boots the published build exactly like a machine on the LAN: pure UEFI HTTP boot of
@@ -918,7 +970,7 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 | `NETBOOT.md` | network boot in depth: trust model, what the clients need, DHCP for other servers, Secure Boot enrollment, QEMU test, old firmware, troubleshooting |
 | `test-vm.sh` | optional rehearsal in QEMU: boot an image as a USB stick, or `--netboot` a released network build (DHCP + HTTP boot, no disk), optionally with enforced Secure Boot, in Setup Mode or sealed |
 | `hwtest-image.sh` | diagnostic stick for machines that reset/hang on the real stick: systemd-boot menu that starts the UKI layer by layer (see the script header) |
-| `tests/` | `run.sh`: the test suite without root (fixtures with throwaway keys in `tests/lib/`); run it after every change |
+| `tests/` | `run.sh`: the test suite without root (fixtures with throwaway keys in `tests/lib/`), run it after every change; `vm.sh`: the integration test (build, release, boots in QEMU, checks over ssh) |
 | `AGENTS.md` | how to work on this repository: map, invariants, conventions, what needs root or hardware |
 | `update-snapshot.sh` | moves the pinned package snapshot to the newest day |
 
@@ -926,7 +978,7 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 
 | Task | Command |
 |---|---|
-| Build | `sudo ./build.sh --groups base,…` (`-f` to rebuild unchanged, `--workers N` erofs threads for this run) |
+| Build | `sudo ./build.sh --groups base,…` (`-f` to rebuild unchanged; erofs threads: all CPUs, `--workers N` for this run) |
 | Release | `./release.sh [--groups LIST \| --build BUILD] [--push safespace@<server>]` (an older `--build` = going back) |
 | Builds on this host | `./build.sh list`, `./build.sh show BUILD`, `./build.sh diff A B`, `./build.sh prune` |
 | On a distribution server | `safespace-netboot status`, `sudo safespace-netboot verify`, `journalctl -u safespace-netboot-verify` |
@@ -940,16 +992,19 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 | Machine does not boot the stick | `./hwtest-image.sh`, write `mkosi.test/hwtest.img` with `dd`, try the menu entries in order |
 | Burn / check (usb) | `sudo ./burn.sh [IMAGE\|URL] /dev/sdX`, `sudo ./diagnose.sh [--db-cert db.pem] /dev/sdX` |
 | Debug build with diagnostic tools | `sudo ./build.sh --groups … --debug` |
-| Run the tests | `tests/run.sh` (no root; `tests/run.sh keys server` for single parts) |
+| Run the tests | `tests/run.sh` (no root; `tests/run.sh keys server` for single parts); `tests/vm.sh` (build, release, boots in QEMU) |
 | Delete old builds / the caches | `./build.sh prune` / `sudo ./build.sh purge-cache [--packages]` |
 
-**Build host with many cores:** `cp mkosi.local.conf.example mkosi.local.conf` and set
-`--workers=` to `nproc`, or pass `sudo ./build.sh --workers N` for one run
-(`--workers` is a `build.sh` option, mkosi itself has none). Most of the build time goes into compressing the erofs root, which
-uses 4 threads by default (`--workers=0` means single-threaded, not "all"). zstd for the
-initrd already uses all cores. The host needs the same tools as listed under
-Quick start, plus the sbctl `db` key and certificate at the paths in `mkosi.conf` (or point
-`SecureBootKey=`/`SecureBootCertificate=` elsewhere in `mkosi.local.conf`).
+**CPUs, disk, RAM:** most of the build time goes into compressing the erofs root.
+`build.sh` gives `mkfs.erofs` all available CPUs (`nproc`, which respects CPU affinity and
+limits), unless `--workers N` (this run) or `Environment=SYSTEMD_REPART_MKFS_OPTIONS_EROFS=--workers=N`
+in `mkosi.local.conf` (this host) says otherwise, e.g. to leave cores free on a shared host
+(`--workers=0` would mean single-threaded, not "all"). zstd for the initrd already uses all
+cores. Before a build it checks the free disk space where the build lands (~8 GiB: the disk
+image next to its parts) and in `/var/tmp` (mkosi's work tree, ~8 GiB), and stops if there is
+too little; with less than 2 GiB RAM available it warns. The log shows what it found
+(`resources: … CPUs, … GiB RAM …`). The host needs the same tools as listed under "Deploy
+from scratch", plus the Secure Boot keys (see [Secure Boot keys](#secure-boot-keys)).
 
 Caches: `mkosi.pkgcache/` (packages) and `mkosi.cache/` (installed system,
 `Incremental=yes`). The cache skips package installation, not the erofs compression, which
@@ -1034,11 +1089,10 @@ sectors and a CD boot header; both are fixed (`-S512`, `ElTorito=no`).
 
 ## Known open points
 
-- **The single build is not booted yet:** everything below was tested with the separate usb
-  and network builds of before. New on the stick path: `usb-bootdev` opens the verity root
-  itself (instead of systemd's generator), and the path is chosen by `LoaderDevicePartUUID`.
-  Needs one boot each way: `test-vm.sh` (stick), `test-vm.sh --netboot`, the T450s over PXE
-  (the UKI grew by ~1 MiB with the USB/SD drivers; 82 MiB was tested there), a real stick.
+- **The single build on real hardware:** booted in QEMU from a stick and over UEFI HTTP
+  (also sealed and with enforced Secure Boot), not yet on real hardware: the T450s over PXE
+  (the UKI grew to ~83 MiB with the USB/SD drivers; 82 MiB was tested there) and a real
+  stick. Also untested: the reboot after a release replaced while a machine boots.
 - **Real hardware so far:** sticks on one machine; network boot on a ThinkPad T450s over PXE
   (Intel AMT off). UEFI HTTP boot is tested in QEMU/libvirt only. Firmware
   differs (FAT handling, UKI size for network boot, option ROMs when sealing with

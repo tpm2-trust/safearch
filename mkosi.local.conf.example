@@ -2,12 +2,13 @@
 # build host and adjust; mkosi merges it with mkosi.conf.
 #
 # Most of the build time goes into compressing the erofs root (zstd level 12).
-# mkfs.erofs uses 4 threads by default; set this to the host's core count
-# (nproc). --workers=0 does NOT mean "all cores", it means single-threaded.
+# build.sh uses all available CPUs for it (nproc) unless this line or
+# --workers says otherwise, e.g. to leave cores free on a shared host.
+# --workers=0 does NOT mean "all cores", it means single-threaded.
 # Image and initrd compression (zstd -T0) already use all cores.
 
 [Build]
-Environment=SYSTEMD_REPART_MKFS_OPTIONS_EROFS=--workers=32
+#Environment=SYSTEMD_REPART_MKFS_OPTIONS_EROFS=--workers=8
 
 # Secure Boot keys: without this, the host's sbctl keys (/var/lib/sbctl). A
 # dedicated key set for safespace (README.md, "Secure Boot keys"):

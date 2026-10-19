@@ -556,10 +556,113 @@ Every existing build and release, the server layout (rerun `server/setup.sh`, re
 - [x] 5. `burn.sh`, `test-vm.sh`, `diagnose.sh`, `hwtest-image.sh`.
 - [x] 6. Tests; the initrd path selection with shims (usb-bootdev and netroot conditions).
 - [x] 7. README, NETBOOT.md, AGENTS.md.
-- [ ] 8. Yours (root): one build, QEMU as stick and over HTTP boot, T450s over PXE, a real stick.
+- [~] 8. Boot tests. Done in QEMU (OVMF, 2026-10-19, build base_20261019-1216, released to
+      this host as distribution server, verified there by the path unit):
+      - stick: usb-bootdev took the path (LoaderDevicePartUUID set), only the stick's storage
+        interface authorized, sda + partitions read-only, /dev/mapper/root verified; netroot
+        did not run; system running, no failed units
+      - network, UEFI HTTP from the local nginx: netroot (no LoaderDevicePartUUID), DHCP,
+        arch.boot.internal resolved through QEMU/the host's resolver, 851 MiB in 6 s,
+        verified; usb-bootdev did not run; running, no failed units
+      - Setup Mode -> safespace-seal (append) -> sealed boot: Secure Boot enabled (user),
+        stick boots, root verified
+      - network with enforced Secure Boot (db = the UKI's signer): boots, verified
+      Found and fixed on the way: usb-bootdev used grep, which the initrd lacks (new test
+      `tests/run.sh initrd`); `hostname` missing on Arch (now `uname -n`).
+      Open: the reboot after a replaced release (needs a second build), the T450s over PXE,
+      a real stick.
 
 Results: `tests/run.sh` 105 pass (one build has all parts; release/verify on the flat share,
 incl. foreign systemd-boot, wrong partition tables; sticks from a build, a share and a URL;
 netroot on the flat URLs; the initrd units carry the LoaderDevicePartUUID conditions);
 upload by hand 8 pass. Not testable here: the boot itself on either path (step 8), in
 particular usb-bootdev opening the verity root and the path selection by the variable.
+
+---
+
+# PLAN: automatic integration test in QEMU (tests/vm.sh)
+
+## Goal
+
+The boot tests run so far by hand, as one script without an LLM: optionally build the base
+image first, release it to a distribution server, boot it in QEMU from a stick and over the
+network, seal it, boot with enforced Secure Boot, check each boot over ssh. All
+prerequisites are checked before anything starts; a clear PASS/FAIL per step and exit code.
+
+## Design
+
+```
+tests/vm.sh [--no-build] [--groups LIST] [--build BUILD] [--keep-logs] [STEP...]
+  STEP: stick net seal net-sb   (default: all)
+```
+
+1. **Prerequisites, all checked up front** (one list of what is missing, then exit 2):
+   - tools: qemu-system-x86_64, OVMF (edk2-ovmf), virt-fw-vars (virt-firmware), socat,
+     ssh, curl, rsync, objcopy, sbverify, python3; `/dev/kvm` read/write
+   - RAM: root image + 2 GiB free; disk: room for the stick image in `mkosi.test/`
+   - ssh: the agent (`SSH_AUTH_SOCK`) holds a key that `users.conf` lists, for the user
+     the test logs in as (the first in `users.conf`)
+   - build: unless `--no-build`, `sudo` works for `./build.sh` (asked once at the start, or
+     NOPASSWD for unattended runs); `users.conf`, keys present
+   - release: a target in `release.conf` (or `--push`), reachable over ssh in batch mode;
+     `netboot.conf` has a `NETROOT_URL`, its host resolves on this machine, and
+     `<NETROOT_URL>` answers over HTTP (the distribution server serves `/safespace/`)
+2. **Build** (`sudo ./build.sh --groups base`, or `--groups`), take the new build's name; or
+   `--build BUILD` / `--no-build` for an existing one.
+3. **Release** with `release.sh --build`, then wait until `<NETROOT_URL>release` names this
+   build (the server serves it).
+4. **Boots**, each headless (`QEMU_EXTRA='-display none'`), with a free ssh port, a
+   timeout, QEMU killed on exit:
+
+   | Step | Boot | Checks over ssh |
+   |---|---|---|
+   | `stick` | `test-vm.sh BUILD` | `usb-bootdev` opened root, no `netroot`, `LoaderDevicePartUUID` set, stick and partitions read-only, `veritysetup status root` verified, `is-system-running` = running, no failed units |
+   | `net` | `test-vm.sh --netboot --url <NETROOT_URL>boot.efi` | `netroot` opened root, no `usb-bootdev`, no `LoaderDevicePartUUID`, verified, running |
+   | `seal` | `--setup-mode` → `safespace-seal` (YES piped) → poweroff → `--sealed` | Secure Boot `enabled (user)`, verified, running |
+   | `net-sb` | `--netboot --url … --secure-boot` | Secure Boot enabled, verified, running |
+5. **Report:** PASS/FAIL per step, logs (`test-vm.sh` output, serial log, the checks'
+   output) in `mkosi.test/vm-<time>/`; exit 0 only if all passed.
+
+Not covered: the reboot after a release replaced during a boot (needs two builds and
+precise timing), real hardware.
+
+## Steps
+
+- [x] 1. `tests/vm.sh` as above (bash, same conventions as `tests/run.sh`).
+- [x] 2. `test-vm.sh`: nothing to change beyond what is needed (it already runs headless via
+      `QEMU_EXTRA`, takes builds, `--setup-mode`/`--sealed`/`--secure-boot`/`--url`).
+- [x] 3. README ("Check it": the integration test, its prerequisites, the sudo rule for
+      unattended runs with the WARNING), AGENTS.md (when to run it).
+- [x] 4. Run it here once, end to end, with a fresh base build.
+
+## Changed during the work
+
+Self-contained instead of using the real setup: a throwaway test user and key
+(`mkosi.test/vm/`), test builds apart from the real ones (`build.sh --users`,
+`--output-root`), a release into the test's own share (`release.sh --builds`, `--stage`),
+the server check run on it, the network boot served by `test-vm.sh` at `10.0.2.2:8790`. No
+real user, key, build or server is touched; prerequisites shrink to tools, `/dev/kvm`, the
+sudo rule for `build.sh`, port, RAM, disk.
+
+Result (2026-10-19, build base_20261019-1248): release, server-verify, stick, net, seal,
+net-sb all PASS. A first run found a bug in the script itself (vm_start in a command
+substitution lost the VM's PID and port), fixed.
+
+
+---
+
+# PLAN: build.sh uses the available resources
+
+## Goal
+
+Use all CPUs for the erofs compression without configuration; check disk and RAM before a
+build.
+
+## Steps
+
+- [x] 1. `--workers` default: `--workers N`, else `mkosi.local.conf`, else `nproc` (logged
+      with its source).
+- [x] 2. Before a build: ≥ 8 GiB free where the build lands and in `/var/tmp` (else stop),
+      < 2 GiB RAM available warns; one log line with what was found.
+- [x] 3. `mkosi.local.conf.example` (the workers line commented out), README.
+- [ ] 4. Test: by the user, with the next build (asked not to run a separate test).

@@ -4,7 +4,8 @@
 # USB stick / SD card (./burn.sh) and over the network (./release.sh to the
 # distribution servers, NETBOOT.md).
 #
-#   sudo ./build.sh [--groups LIST] [--url BASE_URL]... [--workers N] [--debug] [MKOSI OPTIONS...]
+#   sudo ./build.sh [--groups LIST] [--url BASE_URL]... [--workers N] [--debug]
+#                   [--users FILE] [--output-root DIR] [MKOSI OPTIONS...]
 #
 #   ./build.sh list                 the builds: groups, built at, snapshot,
 #                                   packages, size, last release
@@ -40,15 +41,26 @@
 #              NETROOT_URL= in netboot.conf (netboot.conf.example). Without
 #              any, the build boots from sticks only.
 #
+# --users FILE    the users and ssh keys to build in (default: users.conf);
+# --output-root DIR  where the build's directory goes (default: mkosi.output).
+#              Both inside this checkout. For test builds (tests/vm.sh: a
+#              throwaway user, kept apart from the real builds, so list and
+#              release.sh never offer them).
+#
 # Package source: SNAPSHOT= and MIRROR= in repos.conf, overridden per host by
 # repos.local.conf (see repos.local.conf.example). A pinned date, or latest,
 # each with mkosi's default mirror or your own. Not settable on the command
 # line, so every build of a checkout uses the same source; build.sh checks
 # that the mirror serves core.db before the build starts.
 #
-# --workers N  threads for the erofs compression of the root (mkfs.erofs,
-#              default 4; 0 would mean single-threaded, so N >= 1). Overrides
-#              mkosi.local.conf for this run; set it there to keep it.
+# --workers N  threads for the erofs compression of the root (mkfs.erofs;
+#              0 would mean single-threaded, so N >= 1). Without it: the
+#              setting in mkosi.local.conf, else all available CPUs (nproc,
+#              which respects CPU affinity and limits).
+#
+# Before a build, the free disk space where the build lands and where mkosi
+# works (/var/tmp), and the available RAM are checked: too little disk stops
+# the build before it starts, little RAM only warns.
 #
 # --debug      add the "debug" profile (mkosi.profiles/debug/: ethtool,
 #              dmidecode, pciutils, kexec-tools, tcpdump, ...) and append
@@ -122,6 +134,8 @@ esac
 URLS=()
 NETROOT=()
 GROUP_LIST=base
+USERS_FILE=users.conf
+OUTPUT_ROOT=mkosi.output
 WORKERS=""
 DEBUG=0
 MKOSI_ARGS=()
@@ -131,6 +145,8 @@ while (($#)); do
 		--url=*) URLS+=("${1#--url=}"); shift ;;
 		--groups) GROUP_LIST=${2:?--groups needs a comma-separated list}; shift 2 ;;
 		--groups=*) GROUP_LIST=${1#--groups=}; shift ;;
+		--users) USERS_FILE=${2:?--users needs a file}; shift 2 ;;
+		--output-root) OUTPUT_ROOT=${2:?--output-root needs a directory}; shift 2 ;;
 		--workers) WORKERS=${2:?--workers needs a thread count}; shift 2 ;;
 		--workers=*) WORKERS=${1#--workers=}; shift ;;
 		--debug) DEBUG=1; shift ;;
@@ -141,8 +157,28 @@ while (($#)); do
 	esac
 done
 [[ -z $WORKERS || $WORKERS =~ ^[1-9][0-9]*$ ]] || die "--workers needs a thread count >= 1, got '$WORKERS'"
+# No --workers and nothing in mkosi.local.conf: all available CPUs.
+WORKERS_FROM="--workers"
+if [[ -z $WORKERS ]]; then
+	if grep -qs '^[^#]*SYSTEMD_REPART_MKFS_OPTIONS_EROFS=' "$HERE/mkosi.local.conf"; then
+		WORKERS_FROM=mkosi.local.conf
+	else
+		WORKERS=$(nproc 2>/dev/null || echo 1)
+		WORKERS_FROM="all available CPUs"
+	fi
+fi
 
 command -v mkosi >/dev/null || die "mkosi not found (pacman -S mkosi)"
+
+# --users / --output-root: relative paths inside the checkout (mkosi sees the
+# checkout as $SRCDIR in its scripts).
+inside() { # PATH: a plain relative path below the checkout
+	[[ $1 =~ ^[A-Za-z0-9._/-]+$ && $1 != /* && /$1/ != */../* ]]
+}
+USERS_FILE=${USERS_FILE#./} OUTPUT_ROOT=${OUTPUT_ROOT#./}
+inside "$USERS_FILE" || die "--users: a relative path inside the checkout, got '$USERS_FILE'"
+inside "$OUTPUT_ROOT" || die "--output-root: a relative path inside the checkout, got '$OUTPUT_ROOT'"
+BUILDS_ROOT=$HERE/${OUTPUT_ROOT%/}
 
 # shellcheck source=lib/groups.sh
 source "$HERE/lib/groups.sh"
@@ -167,7 +203,7 @@ APPEND_VERB=""
 case $VERB in
 	build | shell | boot | vm | qemu | clean | burn)
 		[[ $EUID -eq 0 ]] || die "'$VERB' must run as root (the sbctl db key is root-only): sudo $0 ${MKOSI_ARGS[*]-}"
-		[[ -f $HERE/users.conf ]] || die "users.conf missing: cp users.conf.example users.conf and add your ssh keys"
+		[[ -f $HERE/$USERS_FILE ]] || die "$USERS_FILE missing: cp users.conf.example users.conf and add your ssh keys"
 		;;
 esac
 if [[ $VERB == build ]]; then
@@ -179,6 +215,20 @@ if [[ $VERB == build ]]; then
 	[[ -x /usr/lib/systemd/systemd-measure ]] || command -v systemd-measure >/dev/null || missing+=(systemd-measure)
 	((${#missing[@]} == 0)) ||
 		die "missing host tools: ${missing[*]} (see README.md, Quick start: pacman -S --needed ...)"
+
+	# Resources. A build needs the disk image (~2.5 GiB) next to its parts
+	# (~2.2 GiB) where it lands, and mkosi's work tree in /var/tmp (the whole
+	# installed system); mkfs.erofs with many threads wants some RAM.
+	free_gib() { df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc 0-9; }
+	mkdir -p "$BUILDS_ROOT"
+	out_free=$(free_gib "$BUILDS_ROOT") tmp_free=$(free_gib /var/tmp)
+	[[ -z $out_free ]] || ((out_free >= 8)) ||
+		die "only ${out_free} GiB free for the build in ${BUILDS_ROOT#"$HERE"/}/ (needs ~8 GiB; ./build.sh prune, sudo ./build.sh purge-cache)"
+	[[ -z $tmp_free ]] || ((tmp_free >= 8)) ||
+		die "only ${tmp_free} GiB free in /var/tmp, where mkosi builds the image (needs ~8 GiB)"
+	mem=$(awk '/^MemAvailable:/ { print int($2 / 1048576) }' /proc/meminfo)
+	((mem >= 2)) || log "WARNING: only ${mem} GiB RAM available; the build may be slow or fail (fewer --workers help)"
+	log "resources: $(nproc) CPUs, ${mem} GiB RAM available, ${out_free:-?} GiB free for builds, ${tmp_free:-?} GiB in /var/tmp"
 fi
 
 # The version goes into the output names and the release; fixed here so that
@@ -194,7 +244,8 @@ PROFILES=(${GROUP_PROFILES[@]+"${GROUP_PROFILES[@]}"})
 ((DEBUG)) && PROFILES+=(--profile=debug)
 BUILD=$(builds_id "$GROUPS_CSV" "$VERSION")
 OUTDIR=$(builds_dir "$BUILD")
-EXTRA=(${PROFILES[@]+"${PROFILES[@]}"} --image-version="$VERSION" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"})
+EXTRA=(${PROFILES[@]+"${PROFILES[@]}"} --image-version="$VERSION" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"}
+	--environment="SAFESPACE_USERS_CONF=$USERS_FILE")
 [[ $VERB == build ]] && EXTRA+=(--output-directory="$OUTDIR")
 [[ -z $WORKERS ]] || EXTRA+=(--environment="SYSTEMD_REPART_MKFS_OPTIONS_EROFS=--workers=$WORKERS")
 
@@ -217,7 +268,7 @@ log "package groups: $GROUPS_CSV"
 [[ $VERB == build ]] && log "build: $BUILD"
 log "packages: $(repos_describe)"
 if ((${#NETROOT[@]})); then log "netroot: ${NETROOT[*]}"; else log "no NETROOT_URL (netboot.conf / --url): this build boots from sticks only"; fi
-[[ -n $WORKERS ]] && log "erofs compression: $WORKERS threads"
+if [[ -n $WORKERS ]]; then log "erofs compression: $WORKERS threads ($WORKERS_FROM)"; else log "erofs compression: threads from mkosi.local.conf"; fi
 if [[ $VERB == build ]]; then
 	repos_check
 	# shellcheck source=lib/keys.sh
@@ -255,7 +306,7 @@ builds_write_info "$OUTDIR" build="$BUILD" version="$VERSION" groups="$GROUPS_CS
 	debug="$( ((DEBUG)) && echo yes || echo no)" started="$STARTED" finished="$(date -Is)" \
 	snapshot="$SNAPSHOT" mirror="${MIRROR:-default}" commit="$commit" uncommitted_changes="$dirty" \
 	signer="$(keys_fingerprint "$KEYS_SB_CERT")" netroot="$(IFS=,; echo "${NETROOT[*]-}")" \
-	builder="$(uname -n)"
+	builder="$(uname -n)" users="$USERS_FILE"
 # The build belongs to whoever ran sudo, so list, release.sh and prune work
 # without root. (Changing a file there gains nothing: release.sh and the
 # servers check signature and root hash.)
