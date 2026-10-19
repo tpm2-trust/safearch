@@ -790,3 +790,26 @@ installation, from the repository's actual configuration.
 
 Proposal written up in [PLAN-TPM2-BINDING.md](PLAN-TPM2-BINDING.md) (design, security
 analysis, steps, open questions). Not started; waits for the open questions there.
+
+---
+# PLAN: TFTP over safespace-dhcp delivers nothing
+
+## Goal
+
+PXE machines get the proxy-DHCP answer but never the boot file: dnsmasq 2.93 fails every
+TFTP reply (`failed to send packet: Network is unreachable`) when `bind-interfaces` and
+`tftp-single-port` are combined, which is what `safespace-netboot dnsmasq-config` writes.
+Reproduced in a network namespace: either option alone works. Also: a configuration error
+(`DHCP_MODE=off`) makes the unit restart five times into the start limit.
+
+## Steps
+
+- [x] 1. `server/safespace-netboot`: drop `tftp-single-port`, keep `bind-interfaces` (coexists
+      with other dnsmasq instances, e.g. libvirt's). Data then comes from ephemeral ports;
+      a stateful firewall needs only UDP 69 inbound (the client's ACKs are `established`).
+- [x] 2. `safespace-dhcp.service`: `RestartPreventExitStatus=1` (no retry on a configuration error).
+- [x] 3. `tests/run.sh`: a real TFTP download of `boot.efi` from the generated proxy
+      configuration, in an unprivileged network namespace (`unshare -rn`); fails with the old
+      configuration.
+- [x] 4. NETBOOT.md: dnsmasq example, firewall text, troubleshooting row.
+- [x] 5. `tests/run.sh`: 151 passed. On the server: `sudo server/setup.sh` (yours to run).

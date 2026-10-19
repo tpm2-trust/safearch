@@ -495,6 +495,19 @@ if wanted dnsmasq && shared && need dnsmasq; then
 	done
 	check "HTTP boot URL is \$SERVER_URL/boot.efi" grep -q "^dhcp-boot=tag:httpclient,http://127.0.0.1:$NETPORT/boot.efi$" "$W/run-dhcp/dnsmasq.conf"
 	check "PXE boot file is boot.efi under the TFTP root (the share)" grep -q "^dhcp-boot=tag:efi64,boot.efi$" "$W/run-dhcp/dnsmasq.conf"
+	# A real TFTP download from the generated proxy configuration, in an unprivileged
+	# network namespace (DHCP_INTERFACE=lo there): catches option combinations that
+	# pass --test but send nothing (bind-interfaces + tftp-single-port).
+	if ! command -v unshare ip curl >/dev/null 2>&1 || ! unshare -rn true 2>/dev/null; then
+		skip "TFTP download: needs unshare (user namespaces), ip and curl"
+	else
+		check "TFTP serves boot.efi (proxy configuration, network namespace)" unshare -rn bash -c '
+			ip link set lo up
+			dnsmasq -k -C "$1/dnsmasq.conf" --user=root --group= --pid-file= --dhcp-leasefile="$1/leases" --log-facility="$1/dnsmasq.log" &
+			p=$!; trap "kill $p" EXIT; sleep 0.5
+			n=$(timeout 20 curl -s -o /dev/null -w "%{size_download}" tftp://127.0.0.1/boot.efi)
+			test "$n" = "$(stat -c %s "$2/boot.efi")"' _ "$W/run-proxy" "$SHARE"
+	fi
 	sed -i "s/^DHCP_MODE=.*/DHCP_MODE=off/" "$W/server.conf"
 	refuse "DHCP_MODE=off writes no configuration" env RUNTIME_DIRECTORY="$W/run-off" "$NB" dnsmasq-config
 fi

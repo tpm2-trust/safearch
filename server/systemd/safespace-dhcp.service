@@ -13,6 +13,8 @@ RuntimeDirectory=safespace-dhcp
 ExecStartPre=/usr/local/bin/safespace-netboot dnsmasq-config
 ExecStart=@DNSMASQ@ --keep-in-foreground --conf-file=/run/safespace-dhcp/dnsmasq.conf
 Restart=on-failure
+# a configuration error (exit 1 from dnsmasq-config or dnsmasq) does not heal by retrying
+RestartPreventExitStatus=1
 
 [Install]
 WantedBy=multi-user.target

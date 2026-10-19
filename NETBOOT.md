@@ -225,8 +225,6 @@ dhcp-boot=tag:httpclient,http://10.0.0.1/safespace/boot.efi
 dhcp-boot=tag:efi64,boot.efi
 enable-tftp
 tftp-root=/srv/safespace/share
-# all of TFTP on port 69, so a firewall only needs UDP 69 (and 67/4011 for DHCP)
-tftp-single-port
 log-dhcp
 conf-dir=/etc/safespace/dnsmasq.d/,*.conf
 ```
@@ -413,7 +411,9 @@ Afterwards `sudo systemctl disable --now safespace-dhcp`, or
 `DHCP_MODE=off` and rerun `server/setup.sh`.
 
 A firewall between the machine and the build host has to let through UDP 67 and 4011 (proxy
-DHCP) and UDP 69 (TFTP, all of it with `tftp-single-port`). Proxy DHCP only works on the
+DHCP) and UDP 69 (TFTP; the data then comes from ephemeral ports, which a stateful firewall lets back in
+as established traffic). `tftp-single-port` is not used: together with `bind-interfaces`
+dnsmasq 2.93 sends no TFTP reply at all. Proxy DHCP only works on the
 machine's own L2 segment: a build host in a VM behind NAT never sees the broadcasts.
 
 In this mode the ~82 MiB UKI comes over TFTP, which takes about a minute; the ~2 GiB root
@@ -672,7 +672,8 @@ real system loads them from the root image.
 | `netroot: download … failed` | nginx not running, wrong path, or firewall; the message contains curl's own error |
 | `netroot: dm-verity refused the image` | `root.img`/`root.verity` in that directory are not the ones the UKI was signed for: release it again with `release.sh` (it checks this before pushing; `safespace-netboot status` on the server says whether what it serves is broken) |
 | the screen says `Start PXE over IPv4`, `Station IP address …`, but nginx sees nothing | that is the firmware's **PXE** client, not HTTP boot: it wants a TFTP file name and a TFTP server, an HTTP URL in option 67 fails. Enable HTTP boot and pick the "HTTPv4" entry, or serve the UKI over TFTP (dnsmasq `pxe-service` / proxy DHCP, [Quick one-off test](#quick-one-off-test-on-an-existing-lan)) |
-| proxy DHCP (dnsmasq) logs nothing when the client boots | the broadcasts do not reach dnsmasq: another L2 segment (e.g. the build host is a VM behind NAT), or a firewall in between. Proxy DHCP needs UDP 67 and 4011, TFTP UDP 69 (with `tftp-single-port` nothing else) |
+| proxy DHCP (dnsmasq) logs nothing when the client boots | the broadcasts do not reach dnsmasq: another L2 segment (e.g. the build host is a VM behind NAT), or a firewall in between. Proxy DHCP needs UDP 67 and 4011, TFTP UDP 69 |
+| dnsmasq: `failed to send packet: Network is unreachable`, the firmware gets no boot file | a configuration with both `bind-interfaces` and `tftp-single-port` (older `safespace-netboot`, or a snippet in `/etc/safespace/dnsmasq.d/`): update the server (`sudo server/setup.sh`), remove `tftp-single-port` from the snippets |
 | dnsmasq: `error 8 User aborted the transfer` | harmless if a `sent …` follows: UEFI PXE asks for the file size first (`tsize`) and aborts on purpose. Without a second request the firmware refused the file (too large for it) |
 | the client fetches the old boot file after a change | `safespace-dhcp` still runs with the old settings: `sudo systemctl restart safespace-dhcp` (it regenerates its configuration from `server.conf`) |
 | the server serves a broken release | `safespace-netboot status` / `journalctl -u safespace-netboot-verify` say which check failed; the server repairs nothing: release again from the build host |
