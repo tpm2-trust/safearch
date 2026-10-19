@@ -111,7 +111,7 @@ sudo sbctl create-keys                       # the host's sbctl: /var/lib/sbctl
 The upload key for the distribution servers, once:
 
 ```sh
-ssh-keygen -t ed25519 -f ~/.ssh/safespace-release -C "safespace release $(hostname)"
+ssh-keygen -t ed25519 -f ~/.ssh/safespace-release -C "safespace release $(uname -n)"
 printf 'Host <distribution server>\n    IdentityFile ~/.ssh/safespace-release\n' >>~/.ssh/config
 ```
 

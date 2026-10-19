@@ -175,7 +175,7 @@ esac
 # Check what is already served (also records it for safespace-netboot status).
 safespace-netboot verify || warn "a served release is broken (see above): release it again from the build host"
 
-host=$(hostname -f 2>/dev/null || hostname)
+host=$(uname -n)
 log "Ready."
 cat <<EOF
     upload (build host):  ./release.sh --push $USER_NAME@$host

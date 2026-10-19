@@ -255,7 +255,7 @@ builds_write_info "$OUTDIR" build="$BUILD" version="$VERSION" groups="$GROUPS_CS
 	debug="$( ((DEBUG)) && echo yes || echo no)" started="$STARTED" finished="$(date -Is)" \
 	snapshot="$SNAPSHOT" mirror="${MIRROR:-default}" commit="$commit" uncommitted_changes="$dirty" \
 	signer="$(keys_fingerprint "$KEYS_SB_CERT")" netroot="$(IFS=,; echo "${NETROOT[*]-}")" \
-	builder="$(hostname)"
+	builder="$(uname -n)"
 # The build belongs to whoever ran sudo, so list, release.sh and prune work
 # without root. (Changing a file there gains nothing: release.sh and the
 # servers check signature and root hash.)

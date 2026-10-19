@@ -7,7 +7,7 @@
 #
 #   --keep   keep the temporary directory (printed at the end)
 #   TEST     run only these (default: all): syntax groups keys builds
-#            release server stick upload netroot dnsmasq nginx units
+#            release server stick upload netroot initrd dnsmasq nginx units
 #
 # Needs the build host's tools (README.md, "Build host"): sbsigntools,
 # efitools, sbctl, cryptsetup, zstd, mtools, dosfstools, util-linux, binutils,
@@ -336,6 +336,29 @@ if wanted netroot && shared && need curl; then
 	nr "$served" "http://127.0.0.1:$P2/"
 	check "the right release but a refused image: an error, no reboot loop" test ! -e "$W/systemctl.calls"
 	rm -f "$W/veritysetup.fail"
+fi
+
+# --- initrd: the scripts only call what the initrd has ------------------------------------
+# Against the initrd of the newest real build here (SKIP without one): its
+# first archive holds the programs. Catches e.g. a grep in a script, which the
+# initrd does not have.
+if wanted initrd; then
+	section initrd
+	uki=$(ls -t "$REPO"/mkosi.output/*/boot.efi 2>/dev/null | head -1 || true)
+	if [[ -z $uki ]]; then
+		skip "initrd: no build in mkosi.output/ to compare with"
+	elif need objcopy zstd cpio; then
+		objcopy -O binary --only-section=.initrd "$uki" "$W/initrd.img"
+		zstd -dc "$W/initrd.img" 2>/dev/null | cpio -t 2>/dev/null >"$W/initrd.list" || true
+		IS=$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace
+		for f in usb-bootdev netroot; do
+			missing=$(python3 -I "$REPO/tests/lib/shcmds.py" "$IS/$f" | while IFS= read -r c; do
+				if [[ $c == /* ]]; then grep -qxF "${c#/}" "$W/initrd.list" || echo "$c"
+				else grep -qE "^(usr/)?s?bin/$c$" "$W/initrd.list" || echo "$c"; fi
+			done | tr '\n' ' ')
+			check "$f calls only programs in the initrd ($(basename "$(dirname "$uki")"))${missing:+: missing $missing}" test -z "$missing"
+		done
+	fi
 fi
 
 # --- dnsmasq ----------------------------------------------------------------------------------

@@ -36,7 +36,11 @@ cmdline=$(cat /proc/cmdline)
 arg() { printf '%s\n' "$cmdline" | tr ' ' '\n' | sed -n "s/^$1=//p" | tail -n 1; }
 
 roothash=$(arg roothash)
-printf '%s' "$roothash" | grep -qx '[0-9a-f]\{64\}' || { msg "ERROR: no roothash= on the kernel command line"; exit 1; }
+# (No grep in the initrd: a shell pattern instead.)
+case $roothash in
+	*[!0-9a-f]* | '') roothash="" ;;
+esac
+[ ${#roothash} -eq 64 ] || { msg "ERROR: no valid roothash= on the kernel command line"; exit 1; }
 uuid() { printf '%s' "$1" | sed 's/^\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)$/\1-\2-\3-\4-\5/'; }
 partuuid=$(uuid "$(printf '%s' "$roothash" | cut -c1-32)")
 hashuuid=$(uuid "$(printf '%s' "$roothash" | cut -c33-64)")
