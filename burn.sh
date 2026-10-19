@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Write a "usb" image built by mkosi (mkosi.output/) to a USB stick / SD card,
-# or (--netstick) a netstick image from netstick.sh: loader-only stick for a
-# published network build.
+# Write a "usb" image to a USB stick / SD card: built here (mkosi.output/usb/), or
+# a usb release from a distribution server (share path or URL).
 # Images of the "network" variant have no ESP and are not written to a medium;
 # they are released with release.sh (see README.md, "Releasing").
 #
@@ -15,14 +14,13 @@ HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 
 usage() {
 	cat <<EOF
-Usage: sudo $0 [--netstick] [IMAGE] DEVICE [--yes]
+Usage: sudo $0 [IMAGE] DEVICE [--yes]
 
-  IMAGE      .raw or .raw.zst to write (default: the newest usb build in mkosi.output/),
+  IMAGE      .raw or .raw.zst to write (default: the newest usb build in mkosi.output/usb/),
              or a usb release on a distribution server: a local share path
-             (/srv/safespace/share/usb/current/image.raw.zst) or its URL
-             (http://<server>/safespace/usb/current/), checked against its SHA256SUMS
+             (/srv/safespace/share/usb/image.raw.zst) or its URL
+             (http://<server>/safespace/usb/), checked against its SHA256SUMS
   DEVICE     whole target disk, e.g. /dev/sdb or /dev/mmcblk0
-  --netstick default to the newest netstick image (netstick.sh) instead
   --yes      do not ask for confirmation
 EOF
 }
@@ -31,12 +29,10 @@ log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 
 CONFIRM=1
-KIND=usb
 ARGS=()
 while (($#)); do
 	case $1 in
 		--yes) CONFIRM=0; shift ;;
-		--netstick) KIND=netstick; shift ;;
 		-h|--help) usage; exit 0 ;;
 		-*) usage >&2; exit 1 ;;
 		*) ARGS+=("$1"); shift ;;
@@ -44,12 +40,8 @@ while (($#)); do
 done
 case ${#ARGS[@]} in
 	1)
-		if [[ $KIND == netstick ]]; then
-			pick=(-name '*-netstick_*')
-		else
-			pick=(! -name '*-network_*' ! -name '*-netstick_*')
-		fi
-		IMAGE=$(find "$HERE/mkosi.output" "$HERE" -maxdepth 1 -type f \( -name '*.raw.zst' -o -name '*.raw' \) \
+		pick=(! -name '*-network_*')
+		IMAGE=$(find "$HERE/mkosi.output/usb" -mindepth 2 -maxdepth 2 -type f \( -name '*.raw.zst' -o -name '*.raw' \) \
 			"${pick[@]}" -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR == 1 { print $2 }' || true)
 		DEVICE=${ARGS[0]}
 		;;
@@ -78,7 +70,7 @@ done
 
 # --- checks --------------------------------------------------------------------
 
-[[ $KIND == netstick ]] && hint="sudo ./netstick.sh" || hint="sudo ./build.sh usb"
+hint="sudo ./build.sh usb"
 [[ -n $IMAGE && -e $IMAGE ]] || die "image ${IMAGE:-in mkosi.output/} not found (run: $hint)"
 IMAGE=$(readlink -f "$IMAGE")
 [[ $(basename "$IMAGE") == *-network_* ]] &&
@@ -163,7 +155,7 @@ for _ in {1..10}; do
 	((${#PARTS[@]} == NPARTS)) && break
 	sleep 1
 done
-# usb: ESP, root, root-verity; netstick: the ESP only.
+# ESP, root, root-verity.
 ((NPARTS >= 1 && ${#PARTS[@]} == NPARTS)) || die "partitions on $DEVICE did not show up after writing"
 
 # --- finish --------------------------------------------------------------------

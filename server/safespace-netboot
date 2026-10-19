@@ -1,30 +1,25 @@
 #!/usr/bin/env bash
-# Distribution server: verify, publish and switch the releases in the share.
-# Installed by server/setup.sh as /usr/local/bin/safespace-netboot; the units
-# call it, and it is the tool for doing things by hand.
+# Distribution server: check what the share serves. Installed by
+# server/setup.sh as /usr/local/bin/safespace-netboot; the units call it, and
+# it is the tool for checking by hand. It never changes the share: replacing a
+# release is the build host's job (release.sh).
 #
-#   safespace-netboot import                  verify releases handed over in
-#                                             <share>/.pending/, switch their
-#                                             channel, prune (the import unit)
-#   safespace-netboot list                    releases, groups, channels
-#   safespace-netboot activate [--usb] VERSION [--channel NAME]
-#   safespace-netboot rollback [--usb] [--channel NAME]
-#                                             back to the verified release
-#                                             before the channel's current one
-#   safespace-netboot prune                   keep KEEP releases per variant
-#   safespace-netboot dnsmasq-config          write the dnsmasq configuration
-#                                             for DHCP_MODE (safespace-dhcp)
+#   safespace-netboot status             the served releases and their last check
+#   safespace-netboot verify [--changed] [network|usb]
+#                                        check the served release(s): Secure Boot
+#                                        signature against the pinned db.pem, root
+#                                        image against the signed root hash;
+#                                        --changed: only what changed since the
+#                                        last check (the verify unit). Exit 1 if
+#                                        one is broken.
+#   safespace-netboot dnsmasq-config     write the dnsmasq configuration for
+#                                        DHCP_MODE (safespace-dhcp, as root)
 #
 # Settings: /etc/safespace/server.conf (SAFESPACE_SERVER_CONF= overrides).
-# Layout of the share (served by nginx under /safespace/):
-#   network/<version>/   boot.efi root.img root.verity ...   (release.sh)
-#   network/<channel>    -> <version>, only ever a verified release
-#   usb/<version>/       image.raw.zst ...
-#   usb/<channel>        -> <version>
-#   .pending/<variant>_<version>   upload finished, waiting for the import
-# What was verified is recorded outside the share ($STATE), where uploads
-# cannot reach. A release that fails the checks is deleted (it can then be
-# uploaded again).
+# The share (served by nginx under /safespace/), one release per variant:
+#   network/  boot.efi root.img root.verity roothash cmdline release ...
+#   usb/      image.raw.zst roothash release ...
+# Results of the checks: $STATE/<variant> (outside the share).
 set -Eeuo pipefail
 
 log() { printf '%s\n' "$*"; }
@@ -43,121 +38,102 @@ CONF=${SAFESPACE_SERVER_CONF:-/etc/safespace/server.conf}
 [[ -f $CONF ]] || die "no $CONF (run server/setup.sh)"
 # Sourced, so it must not be writable by anyone but its owner (root, or the
 # user running a test setup).
-[[ $(stat -c %u "$CONF") == 0 || $(stat -c %u "$CONF") == "$EUID" ]] && ! find "$CONF" -perm /022 | grep -q . ||
+owner=$(stat -c %u "$CONF")
+[[ ($owner == 0 || $owner == "$EUID") && -z $(find "$CONF" -perm /022) ]] ||
 	die "$CONF must be owned by root and writable by its owner only"
 # shellcheck source=server.conf.example
 source "$CONF"
 SHARE=${SHARE:-/srv/safespace/share}
 STATE=${STATE:-/var/lib/safespace/state}
 DB_CERT=${DB_CERT:-/etc/safespace/db.pem}
-KEEP=${KEEP:-3}
 SERVICE_USER=${SERVICE_USER:-safespace}
-[[ $KEEP =~ ^[1-9][0-9]*$ ]] || die "KEEP= must be >= 1"
 
 CMD=${1:-}
 [[ -n $CMD ]] || { usage >&2; exit 1; }
 shift
 
-# Everything that writes into the share runs as the service user, so files and
-# symlinks stay owned by it (root only for dnsmasq-config).
-if [[ $EUID -eq 0 && $CMD != dnsmasq-config && $CMD != list && $CMD != -h && $CMD != --help ]] &&
-	id "$SERVICE_USER" >/dev/null 2>&1 && [[ $(stat -c %U "$SHARE") == "$SERVICE_USER" ]]; then
+# Checks write their results as the service user (root only for dnsmasq-config).
+if [[ $EUID -eq 0 && $CMD == verify ]] && id "$SERVICE_USER" >/dev/null 2>&1; then
 	exec runuser -u "$SERVICE_USER" -- "$SELF" "$CMD" "$@"
 fi
 
-verified() { [[ -f $STATE/$1/$2 ]]; } # VARIANT VERSION
+# A fingerprint of what is served: release + SHA256SUMS name every file's hash.
+fingerprint() { cat "$SHARE/$1/release" "$SHARE/$1/SHA256SUMS" 2>/dev/null | sha256sum | cut -d' ' -f1; }
 
-# Verified versions of a variant, newest first.
-verified_list() { find "$STATE/$1" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort -r; }
-
-activate() { # VARIANT VERSION CHANNEL
-	verify_name_channel "$3" || die "invalid channel '$3'"
-	verified "$1" "$2" || die "$1/$2 is not a verified release"
-	local link=$SHARE/$1/$3
-	[[ ! -e $link || -L $link ]] || die "$link exists and is not a channel link"
-	ln -sfn "$2" "$SHARE/$1/.$3.new"
-	mv -T "$SHARE/$1/.$3.new" "$link"
-	log "$1/$3 -> $2"
-}
-
-prune() {
-	local variant v channels
-	for variant in network usb; do
-		[[ -d $SHARE/$variant ]] || continue
-		channels=" $(find "$SHARE/$variant" -mindepth 1 -maxdepth 1 -type l -printf '%l ') "
-		mapfile -t versions < <(verified_list "$variant")
-		for v in "${versions[@]:KEEP}"; do
-			[[ $channels == *" $v "* ]] && continue
-			log "pruning $variant/$v"
-			rm -rf -- "${SHARE:?}/$variant/$v"
-			rm -f -- "$STATE/$variant/$v"
-		done
-	done
-}
-
-import() {
-	local m name variant version dir channel rc=0 tmp
-	mkdir -p "$STATE"
-	exec 9>"$STATE/.lock"
-	flock 9
-	for m in "$SHARE"/.pending/*; do
-		[[ -f $m ]] || continue
-		name=$(basename "$m")
-		rm -f -- "$m"
-		variant=${name%%_*} version=${name#*_}
-		if [[ $variant != network && $variant != usb ]] || ! verify_name_version "$version"; then
-			log "ignoring marker '$name'"
-			rc=1; continue
-		fi
-		dir=$SHARE/$variant/$version
-		log "importing $variant/$version"
-		tmp=$(mktemp -d "${CACHE_DIRECTORY:-${TMPDIR:-/var/tmp}}/import.XXXXXX")
-		if verify_release "$dir" "$variant" "$version" "$DB_CERT" "$tmp"; then
-			rm -rf "$tmp"
-			mkdir -p "$STATE/$variant"
-			channel=$(release_get "$dir/release" CHANNEL)
-			verify_name_channel "${channel:-x}" || channel=current
-			printf 'GROUPS=%s\nCHANNEL=%s\nVERIFIED=%s\n' "$(release_get "$dir/release" GROUPS)" "$channel" "$(date -Is)" \
-				>"$STATE/$variant/$version"
-			log "$variant/$version verified (groups $(release_get "$dir/release" GROUPS))"
-			activate "$variant" "$version" "$channel"
+verify_one() { # VARIANT -> 0 ok, 1 broken
+	local variant=$1 tmp fp version out rc=0
+	fp=$(fingerprint "$variant")
+	version=$(release_get "$SHARE/$variant/release" VERSION 2>/dev/null || true)
+	log "checking $variant ${version:-(no release)}"
+	tmp=$(mktemp -d "${CACHE_DIRECTORY:-${TMPDIR:-/var/tmp}}/verify.XXXXXX")
+	out=$(verify_release "$SHARE/$variant" "$variant" "$DB_CERT" "$tmp" 2>&1) || rc=1
+	rm -rf "$tmp"
+	printf '%s\n' "$out" | sed 's/^/  /'
+	{
+		echo "VERSION=${version:-}"
+		echo "BUILD=$(release_get "$SHARE/$variant/release" BUILD 2>/dev/null || true)"
+		echo "GROUPS=$(release_get "$SHARE/$variant/release" GROUPS 2>/dev/null || true)"
+		echo "CHECKED=$(date -Is)"
+		echo "FINGERPRINT=$fp"
+		if ((rc == 0)); then
+			echo "RESULT=ok"
 		else
-			rm -rf "$tmp"
-			log "REJECTED $variant/$version: deleted from the share"
-			[[ -d $dir && ! -L $dir ]] && rm -rf -- "$dir"
-			rm -f -- "$STATE/$variant/$version"
-			rc=1
+			echo "RESULT=BROKEN"
+			echo "REASON=$(printf '%s\n' "$out" | grep -v '^    ' | tail -1)"
 		fi
-	done
-	prune
+	} >"$STATE/$variant.new"
+	mv "$STATE/$variant.new" "$STATE/$variant"
+	if ((rc == 0)); then
+		log "$variant $version: ok"
+	else
+		log "$variant ${version:-}: BROKEN — machines will refuse it; release it again from the build host"
+	fi
 	return $rc
 }
 
-list() {
-	local variant v link mark
-	for variant in network usb; do
-		[[ -d $SHARE/$variant ]] || continue
-		echo "$variant:"
-		for link in "$SHARE/$variant"/*; do
-			[[ -L $link ]] && printf '  channel %-12s -> %s\n' "$(basename "$link")" "$(readlink "$link")"
-		done
-		for v in $(find "$SHARE/$variant" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f\n' | sort -r); do
-			verified "$variant" "$v" && mark="verified  groups $(release_get "$STATE/$variant/$v" GROUPS)" || mark="NOT verified (not served by any channel)"
-			printf '  %-24s %s\n' "$v" "$mark"
-		done
-	done
-	ls "$SHARE/.pending" 2>/dev/null | sed 's/^/  pending: /'
-}
-
-parse_variant_channel() { # sets VARIANT CHANNEL ARG
-	VARIANT=network CHANNEL=current ARG=""
+verify() {
+	local changed=0 variants=() v rc=0
 	while (($#)); do
 		case $1 in
-			--usb) VARIANT=usb; shift ;;
-			--channel) CHANNEL=${2:?--channel needs a name}; shift 2 ;;
-			-*) die "unknown option $1" ;;
-			*) [[ -z $ARG ]] || die "too many arguments"; ARG=$1; shift ;;
+			--changed) changed=1; shift ;;
+			network | usb) variants+=("$1"); shift ;;
+			*) die "verify: unknown argument $1" ;;
 		esac
+	done
+	((${#variants[@]})) || variants=(network usb)
+	mkdir -p "$STATE"
+	exec 9>"$STATE/.lock"
+	flock 9
+	for v in "${variants[@]}"; do
+		[[ -f $SHARE/$v/release ]] || { ((changed)) || log "$v: nothing served"; continue; }
+		if ((changed)) && [[ -f $STATE/$v ]] &&
+			[[ $(release_get "$STATE/$v" FINGERPRINT) == "$(fingerprint "$v")" ]]; then
+			continue
+		fi
+		verify_one "$v" || rc=1
+	done
+	return $rc
+}
+
+status() {
+	local v
+	for v in network usb; do
+		if [[ ! -f $SHARE/$v/release ]]; then
+			printf '%-8s nothing served\n' "$v"
+			continue
+		fi
+		r=$SHARE/$v/release
+		printf '%-8s %s, served since %s\n' "$v" "$(release_get "$r" BUILD || true)" "$(date -r "$r" '+%F %T')"
+		printf '         groups %s, built %s, snapshot %s, commit %s, %s packages\n' "$(release_get "$r" GROUPS)" \
+			"$(release_get "$r" BUILT)" "$(release_get "$r" SNAPSHOT)" "$(release_get "$r" COMMIT)" "$(release_get "$r" PACKAGES)"
+		if [[ ! -f $STATE/$v ]]; then
+			printf '         not checked yet (safespace-netboot verify %s)\n' "$v"
+		elif [[ $(release_get "$STATE/$v" FINGERPRINT) != "$(fingerprint "$v")" ]]; then
+			printf '         changed since the last check (%s)\n' "$(release_get "$STATE/$v" CHECKED)"
+		else
+			printf '         %s, checked %s %s\n' "$(release_get "$STATE/$v" RESULT)" "$(release_get "$STATE/$v" CHECKED)" \
+				"$(release_get "$STATE/$v" REASON)"
+		fi
 	done
 }
 
@@ -165,12 +141,11 @@ parse_variant_channel() { # sets VARIANT CHANNEL ARG
 # server, TFTP) or dhcp (this server is the DHCP server: UEFI HTTP boot with
 # options 60/67, PXE/TFTP as fallback). Runs as root (ExecStartPre).
 dnsmasq_config() {
-	local out=${RUNTIME_DIRECTORY:-/run/safespace-dhcp}/dnsmasq.conf ch=${DHCP_CHANNEL:-current} url
+	local out=${RUNTIME_DIRECTORY:-/run/safespace-dhcp}/dnsmasq.conf url
 	[[ ${DHCP_MODE:-off} == proxy || ${DHCP_MODE:-off} == dhcp ]] ||
 		die "DHCP_MODE=${DHCP_MODE:-off}: nothing to configure (proxy or dhcp)"
-	verify_name_channel "$ch" || die "invalid DHCP_CHANNEL"
 	[[ ${DHCP_INTERFACE:-} =~ ^[A-Za-z0-9._-]+$ ]] || die "DHCP_INTERFACE= missing or invalid"
-	url=${SERVER_URL%/}/network/$ch/boot.efi
+	url=${SERVER_URL%/}/network/boot.efi
 	[[ $url =~ ^https?://[^/[:space:]]+/[^[:space:]]*$ ]] || die "SERVER_URL= missing or invalid"
 	mkdir -p "$(dirname "$out")"
 	{
@@ -180,49 +155,33 @@ dnsmasq_config() {
 		echo "port=0"
 		echo "dhcp-match=set:efi64,option:client-arch,7"
 		echo "dhcp-match=set:efi64,option:client-arch,9"
-		case ${DHCP_MODE:-off} in
-			proxy)
-				[[ ${DHCP_PROXY_SUBNET:-} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "DHCP_PROXY_SUBNET= missing or invalid"
-				echo "dhcp-range=$DHCP_PROXY_SUBNET,proxy"
-				echo "pxe-service=tag:efi64,x86-64_EFI,\"safespace netboot\",network/$ch/boot.efi"
-				;;
-			dhcp)
-				[[ ${DHCP_RANGE:-} =~ ^[0-9.]+,[0-9.]+(,[0-9]+[smhd]?)?$ ]] || die "DHCP_RANGE= missing or invalid"
-				echo "dhcp-range=$DHCP_RANGE"
-				[[ -z ${DHCP_ROUTER:-} ]] || echo "dhcp-option=option:router,$DHCP_ROUTER"
-				[[ -z ${DHCP_DNS:-} ]] || echo "dhcp-option=option:dns-server,$DHCP_DNS"
-				echo "dhcp-vendorclass=set:httpclient,HTTPClient:Arch:00016"
-				echo "dhcp-match=set:httpclient,option:client-arch,16"
-				echo "dhcp-option-force=tag:httpclient,60,HTTPClient"
-				echo "dhcp-boot=tag:httpclient,$url"
-				echo "dhcp-boot=tag:efi64,network/$ch/boot.efi"
-				;;
-			*) die "DHCP_MODE=${DHCP_MODE:-off}: nothing to configure (proxy or dhcp)" ;;
-		esac
+		if [[ $DHCP_MODE == proxy ]]; then
+			[[ ${DHCP_PROXY_SUBNET:-} =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "DHCP_PROXY_SUBNET= missing or invalid"
+			echo "dhcp-range=$DHCP_PROXY_SUBNET,proxy"
+			echo "pxe-service=tag:efi64,x86-64_EFI,\"safespace netboot\",network/boot.efi"
+		else
+			[[ ${DHCP_RANGE:-} =~ ^[0-9.]+,[0-9.]+(,[0-9]+[smhd]?)?$ ]] || die "DHCP_RANGE= missing or invalid"
+			echo "dhcp-range=$DHCP_RANGE"
+			[[ -z ${DHCP_ROUTER:-} ]] || echo "dhcp-option=option:router,$DHCP_ROUTER"
+			[[ -z ${DHCP_DNS:-} ]] || echo "dhcp-option=option:dns-server,$DHCP_DNS"
+			echo "dhcp-vendorclass=set:httpclient,HTTPClient:Arch:00016"
+			echo "dhcp-match=set:httpclient,option:client-arch,16"
+			echo "dhcp-option-force=tag:httpclient,60,HTTPClient"
+			echo "dhcp-boot=tag:httpclient,$url"
+			echo "dhcp-boot=tag:efi64,network/boot.efi"
+		fi
 		echo "enable-tftp"
 		echo "tftp-root=$SHARE"
 		echo "tftp-single-port"
 		echo "log-dhcp"
 		[[ -d /etc/safespace/dnsmasq.d ]] && echo "conf-dir=/etc/safespace/dnsmasq.d/,*.conf"
 	} >"$out"
-	log "wrote $out (DHCP_MODE=$DHCP_MODE, boot file network/$ch/boot.efi)"
+	log "wrote $out (DHCP_MODE=$DHCP_MODE, boot file network/boot.efi)"
 }
 
 case $CMD in
-	import) import ;;
-	list) list ;;
-	prune) prune ;;
-	activate)
-		parse_variant_channel "$@"
-		[[ -n $ARG ]] || die "activate needs a VERSION"
-		activate "$VARIANT" "$ARG" "$CHANNEL" ;;
-	rollback)
-		parse_variant_channel "$@"
-		[[ -z $ARG ]] || die "rollback takes no version"
-		now=$(readlink "$SHARE/$VARIANT/$CHANNEL" 2>/dev/null) || die "no channel $VARIANT/$CHANNEL"
-		prev=$(verified_list "$VARIANT" | awk -v n="$now" 'f { print; exit } $0 == n { f = 1 }')
-		[[ -n $prev ]] || die "no verified release before $now"
-		activate "$VARIANT" "$prev" "$CHANNEL" ;;
+	verify) verify "$@" ;;
+	status) status ;;
 	dnsmasq-config) dnsmasq_config ;;
 	-h | --help) usage ;;
 	*) usage >&2; die "unknown command $CMD" ;;

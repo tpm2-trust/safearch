@@ -38,7 +38,7 @@ done
 
 [[ $EUID -eq 0 ]] || die "must run as root"
 [[ -d $EFIVARS ]] || die "not booted in UEFI mode"
-[[ -f $KEYS/PK.auth ]] || die "this image contains no Secure Boot keys (build host: run secureboot-export.sh, rebuild)"
+[[ -f $KEYS/PK.auth ]] || die "this image contains no Secure Boot keys (build it with build.sh, which exports them)"
 mountpoint -q "$EFIVARS" || mount -t efivarfs efivarfs "$EFIVARS"
 grep -q " $EFIVARS efivarfs rw" /proc/mounts || mount -o remount,rw "$EFIVARS"
 

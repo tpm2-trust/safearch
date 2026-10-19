@@ -126,9 +126,9 @@ if has_group remotedesktop; then
 	mkosi-chroot chown -R "$VNC_USER:$VNC_USER" "/home/$VNC_USER/.config"
 	echo ":$VNC_DISPLAY=$VNC_USER" >"$BUILDROOT/etc/tigervnc/vncserver.users"
 	if ((generated)); then
-		# Files in $OUTPUTDIR end up in mkosi.output/.
+		# Files in $OUTPUTDIR end up in the build's directory (mkosi.output/<variant>/<build>/).
 		(umask 077; printf '%s\n' "$VNC_PASSWORD" >"$OUTPUTDIR/${IMAGE_ID}_${IMAGE_VERSION}.vnc-password")
-		log "generated VNC password: mkosi.output/${IMAGE_ID}_${IMAGE_VERSION}.vnc-password"
+		log "generated VNC password: ${IMAGE_ID}_${IMAGE_VERSION}.vnc-password in the build directory"
 	fi
 fi
 

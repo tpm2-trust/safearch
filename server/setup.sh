@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Prepare a distribution server: it receives releases from the build host,
-# verifies them and serves them (HTTP, optionally DHCP/PXE). Needs no signing
+# Prepare a distribution server: it receives releases from the build host
+# (one per variant, each replacing the last), serves them (HTTP, optionally
+# DHCP/PXE) and checks them after every upload. Needs no signing
 # key, only the public db certificate. Run from a checkout of this repository,
 # as root; running it again applies changed settings and keeps everything else.
 #
@@ -13,18 +14,18 @@
 #                      (then also --replace-db-cert).
 #   --upload-key FILE  ssh public key of the build host's releasing user
 #                      (repeatable). It may only rsync into the share: no
-#                      shell, no reading, no deleting, no overwriting.
+#                      shell, no reading, no deleting.
 #   --no-packages      do not install packages (they are there already)
 #
 # Arch Linux only (as the images). What it sets up:
 #   /etc/safespace/server.conf      settings (from server/server.conf or the
 #                                   example, once; edit it, then rerun)
 #   /etc/safespace/db.pem           the pinned db certificate
-#   user safespace                  owns the share, runs the import; its ssh
+#   user safespace                  owns the share, runs the checks; its ssh
 #                                   login is the upload account (rrsync)
-#   $SHARE (/srv/safespace/share)   network/, usb/, .pending/
+#   $SHARE (/srv/safespace/share)   network/, usb/
 #   /usr/local/bin/safespace-netboot (+ /usr/local/lib/safespace-server/)
-#   units: safespace-netboot-import.path/.service, safespace-dhcp.service
+#   units: safespace-netboot-verify.path/.service, safespace-dhcp.service
 #   nginx: the share under http://<server>/safespace/
 set -Eeuo pipefail
 
@@ -112,7 +113,7 @@ for key in "${KEYS[@]}"; do
 		die "$key: not an ssh public key"
 	k=$(awk '{ print $1, $2 }' <<<"$line")
 	if ! grep -qF "$k" "$ak"; then
-		printf 'command="%s -wo -no-del -no-overwrite -munge %s",restrict %s\n' "$RRSYNC" "$SHARE" "$line" >>"$ak"
+		printf 'command="%s -wo -no-del -munge %s",restrict %s\n' "$RRSYNC" "$SHARE" "$line" >>"$ak"
 		log "Upload key added: ${line:0:40}..."
 	fi
 done
@@ -127,12 +128,12 @@ chmod 0644 "$ak"
 # --- share, tool, units -------------------------------------------------------------------
 
 install -d -m 0755 "$(dirname "$SHARE")"
-install -d -m 0755 -o "$USER_NAME" -g "$USER_NAME" "$SHARE" "$SHARE/network" "$SHARE/usb" "$SHARE/.pending"
+install -d -m 0755 -o "$USER_NAME" -g "$USER_NAME" "$SHARE" "$SHARE/network" "$SHARE/usb"
 install -d -m 0755 /usr/local/lib/safespace-server
 install -m 0644 "$REPO/lib/verify.sh" /usr/local/lib/safespace-server/verify.sh
 install -m 0755 "$HERE/safespace-netboot" /usr/local/bin/safespace-netboot
 DNSMASQ=$(command -v dnsmasq)
-for unit in safespace-netboot-import.path safespace-netboot-import.service safespace-dhcp.service; do
+for unit in safespace-netboot-verify.path safespace-netboot-verify.service safespace-dhcp.service; do
 	sed -e "s|@SHARE@|$SHARE|g" -e "s|@DNSMASQ@|$DNSMASQ|g" "$HERE/systemd/$unit" >"/etc/systemd/system/$unit"
 	chmod 0644 "/etc/systemd/system/$unit"
 done
@@ -153,7 +154,7 @@ nginx -t >/dev/null 2>&1 ||
 systemctl daemon-reload
 systemctl enable --now nginx.service
 systemctl reload nginx.service
-systemctl enable --now safespace-netboot-import.path
+systemctl enable --now safespace-netboot-verify.path
 if [[ -s $ak ]]; then
 	systemctl enable --now sshd.service
 fi
@@ -167,12 +168,15 @@ case ${DHCP_MODE:-off} in
 	*) die "DHCP_MODE=$DHCP_MODE: off, proxy or dhcp" ;;
 esac
 
+# Check what is already served (also records it for safespace-netboot status).
+safespace-netboot verify || warn "a served release is broken (see above): release it again from the build host"
+
 host=$(hostname -f 2>/dev/null || hostname)
 log "Ready."
 cat <<EOF
     upload (build host):  ./release.sh network --push $USER_NAME@$host
-    served:               ${SERVER_URL%/}/network/<channel>/boot.efi   (DHCP option 67)
+    served:               ${SERVER_URL%/}/network/boot.efi   (DHCP option 67), ${SERVER_URL%/}/usb/
     build host netboot:   NETROOT_URL=${SERVER_URL%/}/network/   (netboot.conf)
-    state:                safespace-netboot list;  journalctl -u safespace-netboot-import
+    state:                safespace-netboot status;  journalctl -u safespace-netboot-verify
     firewall:             TCP 22 (upload), TCP 80 (HTTP)$( [[ ${DHCP_MODE:-off} != off ]] && echo ", UDP 67, 69 and 4011 (DHCP/PXE/TFTP)")
 EOF

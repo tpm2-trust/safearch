@@ -186,3 +186,217 @@ server, ssh/rrsync upload, QEMU boot of a new build from the server.
 ## Open questions
 
 - none
+
+---
+
+# PLAN: simplify releases, keys in the build, fresh-deploy docs, agent handover
+
+## Goal
+
+1. **Releases: only the newest, decided by the build host.** A distribution server holds
+   exactly one release per variant at fixed paths. No version directories, channels,
+   symlinks, activation, rollback, pruning. Going back = the build host releases an older
+   build again. The server can **check** whether what it serves is broken (automatically after
+   every upload, and by hand), but never replaces anything itself.
+2. **Keys inside the build, dedicated keys possible.** `secureboot-export.sh` goes into
+   `lib/keys.sh`. The keys come from an sbctl instance that can be dedicated to safespace
+   (its own key directory, `sbctl --config`), not necessarily the host's. Through sbctl, keys
+   can also live on a YubiKey (sbctl `--*-keytype yubikey`).
+3. **Netstick dropped.**
+4. **Groups are the only difference between images** (besides usb/network): one image per
+   variant per server, no machine classes.
+5. **Separate tools stay** (`release.sh`, `fetch-images.sh`, `burn.sh`, …); merging them is
+   decided later.
+6. **A fresh clone deploys easily** (README from `git clone`, scripts that say what is
+   missing), and **an agent can take over** (`AGENTS.md` project part, `tests/run.sh`).
+
+## Design: one release per server
+
+```mermaid
+flowchart LR
+  R["release.sh network --push …"] -- "rsync --delay-updates<br/>(all files renamed at the end)" --> S["share/network/<br/>boot.efi root.img root.verity roothash release SHA256SUMS"]
+  S -- ".path unit: release changed" --> V["safespace-netboot verify<br/>(report only)"]
+  S --> M["machines"]
+```
+
+| | today | after |
+|---|---|---|
+| server layout | `network/<version>/…`, channel links | `network/{boot.efi,root.img,root.verity,roothash,cmdline,release,manifest.json,SHA256SUMS}`, `usb/{image.raw.zst,roothash,release,SHA256SUMS}` |
+| root URL in the UKI | `<base>/<version>/` | `<base>/` exactly as in `netboot.conf` |
+| upload | into a version directory + `.pending/` marker | straight onto the served files: `rsync --delay-updates` puts the files into a temp dir and renames them all at the end, so the switch takes milliseconds. nginx keeps serving a download already running from the old file |
+| upload account (rrsync) | write-only, no overwrite, no delete | write-only, overwrite allowed (replacing is the point), no delete |
+| on the server | import: verify, activate, prune; activate/rollback by hand | `safespace-netboot verify` after every upload (path unit on `release`) and by hand; result in the journal, `safespace-netboot status`, and a failed unit (`systemctl --failed`). It deletes and replaces nothing |
+| rollback | on the server | `./release.sh network --version <older> --push …` on the build host |
+| DHCP boot file | `…/network/<channel>/boot.efi` | `…/network/boot.efi` |
+
+**Race:** a machine downloads the old `boot.efi`, the release is replaced, then the machine
+downloads the new `root.img`. dm-verity refuses it, as it must. `netroot` then fetches the
+server's `roothash`; if it differs from its own, it logs "a newer release was published while
+booting" and reboots after 10 s (the firmware then gets the new `boot.efi`). A root that is
+really broken stays an error, so no reboot loop.
+
+## Design: keys
+
+| | today | after |
+|---|---|---|
+| where the keys are | the host's sbctl (`/var/lib/sbctl`), layout `keys/db/db.key` required | an sbctl instance: the host's (default) or a dedicated one: `SBCTL_CONFIG=/var/lib/safespace/sbctl/sbctl.conf` in `mkosi.local.conf`'s environment / a build setting, with its own `keydir` (created by `sbctl --config … create-keys`) |
+| public keys + enrollment files in the image | `secureboot-export.sh` (cert-to-efi-sig-list, sign-efi-sig-list with the PK/KEK key files) | `lib/keys.sh` asks sbctl: `enroll-keys --export auth` / `esl` (signed by sbctl, so it works for file and YubiKey keys alike) plus the certificates from the keydir; the append variants for `safespace-seal` the same way if sbctl can produce them, else from the files as today (to be checked in step 1) |
+| UKI signing | mkosi with `SecureBootKey=` = sbctl's `db.key` file, systemd-sbsign | unchanged for file keys (paths taken from the sbctl config). YubiKey db key: mkosi signs through PKCS#11 (`SecureBootKeySource=provider:pkcs11`, `SecureBootKey=pkcs11:…`); designed and documented, **not testable here without a YubiKey** |
+| checks | db.pem fingerprint = SecureBootCertificate, no private key in the image | the same, plus: the exported db certificate = the one the UKI is signed with |
+
+## Steps
+
+- [x] 1. Keys:
+      - `lib/keys.sh` takes over `secureboot-export.sh` (then removed). sbctl instance from
+        `SBCTL_CONFIG` (default: the host's).
+      - Export via sbctl where it can; check with throwaway keys in a scratch sbctl config:
+        file keys, and whether `--export auth` covers the append updates `safespace-seal`
+        uses.
+      - README: "Secure Boot keys": host keys vs. dedicated keys (commands to create
+        them), YubiKey (what is needed, what is untested).
+- [x] 2. URL without version: `build.sh` signs `NETROOT_URL` as given; `netroot` handles the
+      race (compare `roothash`, reboot once).
+- [x] 3. `release.sh`: bundle as today, push with `--delay-updates` onto `<target>/<variant>/`.
+      Local stage = `mkosi.release/<variant>/` (only the newest).
+- [x] 4. Server: `safespace-netboot verify|status|dnsmasq-config` (import, activate, rollback,
+      prune, channels, `KEEP`, `DHCP_CHANNEL` removed); units:
+      `safespace-netboot-verify.path` (on `network/release`, `usb/release`) + `.service`;
+      rrsync without `-no-overwrite`; `setup.sh`, nginx, dnsmasq on the fixed paths.
+- [x] 5. Drop the netstick: `netstick.sh`, `burn.sh --netstick`, its part of `diagnose.sh`,
+      `lib/uefi.sh` if nothing else needs it, docs. `test-vm.sh --netboot` on the fixed names.
+- [x] 6. README for a fresh clone:
+      - "Deploy from scratch": numbered commands for the build host, a distribution server
+        and the first machine.
+      - Reference sections: groups, keys, release, server, DHCP, VM.
+      - Channels, version URLs and the netstick cleaned out.
+      - NETBOOT.md as the in-depth reference.
+- [x] 7. `AGENTS.md` project part:
+      - repository map and the two roles
+      - security invariants: no private key in an image or a release; a server trusts only
+        `db.pem` and never alters a release; root only via dm-verity; nothing writable on
+        the medium
+      - the test suite
+      - script conventions
+      - what needs root or hardware and goes back to the user
+- [x] 8. `tests/run.sh` (no root, no network):
+      - groups
+      - `lib/verify.sh` with good and manipulated releases
+      - release push + server verify against a temporary share
+      - dnsmasq configs, nginx site, `systemd-analyze verify`, `bash -n` of all scripts
+      - key export with throwaway sbctl keys
+- [ ] 9. Full run (yours, root): build with groups, release to a freshly set up server, QEMU
+      HTTP boot, one release while a VM boots (the race).
+
+Results:
+- **Keys:** sbctl's `enroll-keys --export auth --append` is signed for replacement (0x27),
+  not `APPEND_WRITE` (0x67), so it cannot replace the efitools signing; the export stays on
+  efitools, the keys come from any sbctl key set (`SAFESPACE_SBCTL_CONFIG`). YubiKey key
+  files are refused with a pointer to the README (the design is documented there).
+- **netroot:** reboots only if no server holds this UKI's release any more; a matching
+  server that fails otherwise is an error (found by the tests).
+- **tests/run.sh:** 74 pass. The rrsync upload test is skipped here (no `/usr/bin/rsync`);
+  run once by hand with a patched rrsync: 8 pass.
+
+## Open questions
+
+- none (YubiKey signing is designed but stays untested until a YubiKey is at hand)
+
+---
+
+# PLAN: builds on the build host — organized, listable, traceable
+
+## Goal
+
+Several builds (variants, group sets) can wait side by side on the build host. You can see at
+a glance what is there: variant, groups, when it was built, from which package snapshot and
+source state, what it contains, and whether and where it was released. Releasing picks the
+intended build, not just the newest one.
+
+## Today
+
+- flat `mkosi.output/`, `safespace-arch-<variant>_<YYYYMMDD-HHMM>.*`, root-owned, never
+  cleaned
+- the group set only in a `.groups` file next to the build; packages in `.manifest`; snapshot,
+  mirror, commit, build duration not recorded
+- `release.sh` takes the newest build of the variant (by file time), whatever its groups
+- nothing records which build was released to which server, and when
+- one incremental cache for everything: switching the group set reinstalls all packages
+
+## Design
+
+```
+mkosi.output/
+├── network/
+│   ├── base-remotedesktop-docker_20261019-0930/   one directory per build
+│   │   ├── build.json                 what, when, from what (below)
+│   │   ├── released.log               "<time> <target>" per push
+│   │   └── safespace-arch-network_20261019-0930.{efi,root.raw.zst,root-verity.raw.zst,roothash,manifest,vnc-password}
+│   └── base_20261019-1012/ …
+└── usb/
+    └── base-remotedesktop_20261019-1100/ …
+```
+
+`build.json` (written by `build.sh` after a successful build):
+variant, version, groups, debug, start/end time, snapshot + mirror (`repos.conf`), git commit
++ "dirty" flag, signing certificate fingerprint, number of packages, sizes (UKI, root),
+`NETROOT_URL` (network). The release's `release` file carries the same fields, so
+`safespace-netboot status` on a server shows them too.
+
+New verbs of `build.sh` (no root needed; no new script):
+
+| Command | Shows |
+|---|---|
+| `./build.sh list [network\|usb]` | one line per build: variant, version, groups, built at, snapshot, packages, size, last release (target, time) |
+| `./build.sh show VERSION` | `build.json` in readable form, plus the package list (name + version) |
+| `./build.sh diff VERSION VERSION` | packages added, removed and upgraded between two builds (from the manifests) |
+| `./build.sh prune [--keep N]` | deletes all but the newest N builds per variant **and group set** (default 3); never the build last released to any target |
+
+`release.sh` picks the build:
+- `--version V` as today.
+- `--groups LIST`: the newest build with exactly that group set.
+- Without either, the newest build as today. Before pushing, it prints what it picked
+  (version, groups, built at, snapshot). If an unreleased build with another group set is
+  newer than the last release, it says so.
+- Every push is appended to that build's `released.log`.
+
+Further:
+- **Ownership:** after the build, `build.sh` gives the build directory to the user who ran
+  sudo, so `list`, `release.sh` and `prune` work without root. The `.vnc-password` stays
+  0600. Changing a file there does not help an attacker: `release.sh` and the servers check
+  signature and root hash.
+- **Two builds in the same minute:** `build.sh` refuses to overwrite an existing build
+  directory (the version gets seconds if needed).
+
+## Steps
+
+- [x] 1. `build.sh`: per-build output directory `<groups>_<version>`, `build.json`,
+      `purge-cache`, ownership, collision check; `mkosi.postinst`/`mkosi.postoutput` on the new paths.
+- [x] 2. `lib/builds.sh`: find, read and select builds (shared by `build.sh` verbs and
+      `release.sh`); verbs `list`, `show`, `diff`, `prune`.
+- [x] 3. `release.sh`: `--groups`, the printed choice and warning, `released.log`, extended
+      `release` file; `safespace-netboot status` shows the new fields.
+- [x] 4. `test-vm.sh`, `burn.sh`, `diagnose.sh`, `hwtest-image.sh` find builds in the new
+      layout.
+- [x] 5. Tests: `list`/`show`/`diff`/`prune` (prune never deletes the last released build),
+      selection by `--groups`, `released.log`, the new `release` fields on the server.
+- [x] 6. README ("Build host": builds, listing, choosing, cleaning up), AGENTS.md map.
+- [ ] 7. (yours, root) The existing flat `mkosi.output/` (old layout, ~15 GB): delete it (I'll give you the
+      command, root-owned); not migrated.
+
+## Decisions
+
+1. **Build folder = `<groups>_<version>`**, groups in their fixed order joined by `-`, e.g.
+   `mkosi.output/network/base-remotedesktop-docker_20261019-0930/`, so builds of one group
+   set sort together. This name (the "build") is what `list`, `release.sh --build`, the
+   `release` file and the servers show. The image version inside stays the timestamp.
+2. **One cache, as today**, plus `./build.sh purge-cache [--packages]`. Note: mkosi's
+   package cache (downloads) serves every group set and version; its incremental image cache
+   holds one package list, so a build with another group set reinstalls from the local
+   package cache (no downloads) and replaces it.
+3. **prune** keeps 3 builds per variant and group set (`--keep N`).
+
+Results: `tests/run.sh` 90 pass (builds: list order, show, diff, choosing by
+`--groups`/`--build`/newest, warning, `released.log`, release fields, server status, prune
+with the last released build kept and leftovers removed); upload test by hand: 8 pass.
+Not testable without root: a real build writing `build.json` and handing the directory to
+the sudo user, `purge-cache`.

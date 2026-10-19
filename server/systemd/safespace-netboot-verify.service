@@ -1,19 +1,22 @@
-# Verifies new releases (Secure Boot signature against /etc/safespace/db.pem,
-# root image against the signed root hash), switches their channel, prunes.
-# Unprivileged and without network: it only reads and writes the share.
+# Checks the served releases (Secure Boot signature against
+# /etc/safespace/db.pem, root image against the signed root hash) and records
+# the result (safespace-netboot status). Report only: it changes nothing in
+# the share. A broken release leaves this unit failed (systemctl --failed).
+# Unprivileged and without network: it only reads the share.
 [Unit]
-Description=Verify and publish new safespace releases
+Description=Check the releases in the safespace share
 Documentation=file:///usr/local/bin/safespace-netboot
 
 [Service]
 Type=oneshot
 User=safespace
 Group=safespace
-ExecStart=/usr/local/bin/safespace-netboot import
+ExecStart=/usr/local/bin/safespace-netboot verify --changed
 UMask=0022
 # Room for unpacking a usb image while it is checked (on disk, not in RAM).
 CacheDirectory=safespace
-ReadWritePaths=@SHARE@ /var/lib/safespace
+ReadOnlyPaths=@SHARE@
+ReadWritePaths=/var/lib/safespace/state
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes

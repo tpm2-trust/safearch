@@ -14,8 +14,8 @@
 #   and a boot file, the firmware downloads the signed UKI into memory and
 #   starts it, and its initrd then loads the root image over HTTP.
 #   QEMU's user network is the DHCP server here (that is what option
-#   bootfile= sets), a local python HTTP server on 127.0.0.1 serves the netboot
-#   releases (default mkosi.release/network/, written by release.sh), and the VM
+#   bootfile= sets), a local python HTTP server on 127.0.0.1 serves the
+#   release (default mkosi.release/network/, written by release.sh), and the VM
 #   reaches the host as 10.0.2.2 -- so the image has to be built for that
 #   address:
 #     sudo ./build.sh network --url http://10.0.2.2:8000/ \
@@ -25,10 +25,10 @@
 #   them afterwards).
 # --tftp: hand the UKI over QEMU's built-in TFTP server instead of HTTP, for
 #   firmware without UEFI HTTP boot. The root image still comes over HTTP.
-# --tree DIR: releases to serve (a directory with current/, e.g. a
-#   distribution server's share/network/, or one release directory).
+# --tree DIR: the release to serve (a directory with boot.efi, root.img,
+#   root.verity, e.g. a distribution server's share/network/).
 # --url BOOT_URL: no local server; UEFI HTTP boot of a published UKI from a
-#   distribution server, e.g. http://10.0.0.1/safespace/network/current/boot.efi.
+#   distribution server, e.g. http://10.0.0.1/safespace/network/boot.efi.
 #   The VM reaches it through QEMU's NAT and resolves names with the host's
 #   DNS, so a normal build (netboot.conf URL) is tested as published, exactly
 #   as a machine on the LAN would boot it.
@@ -93,9 +93,7 @@ if ((NETBOOT)) && [[ -n $BOOT_URL ]]; then
 	log "UKI from $BOOT_URL, root from $NETROOT_URL"
 elif ((NETBOOT)); then
 	[[ -z $IMAGE ]] || die "--netboot takes no image (it boots the UKI from the netboot tree)"
-	TREE=${TREE:-$HERE/mkosi.release/network}
-	BOOTDIR=$TREE/current
-	[[ -e $BOOTDIR ]] || BOOTDIR=$TREE
+	BOOTDIR=${TREE:-$HERE/mkosi.release/network}
 	[[ -f $BOOTDIR/boot.efi ]] || die "no boot.efi in $BOOTDIR (run: ./release.sh network)"
 	uki=$BOOTDIR/boot.efi
 	cmdline=$(objcopy -O binary --only-section=.cmdline "$uki" /dev/stdout 2>/dev/null | tr -d '\0')
@@ -103,7 +101,8 @@ elif ((NETBOOT)); then
 	[[ -n $NETROOT_URL ]] || die "$uki has no safespace.netroot= on its command line (not a network build)"
 	rest=${NETROOT_URL#*//}
 	hostport=${rest%%/*}
-	urlpath=${rest#*/}; urlpath=${urlpath%/}      # e.g. safespace/20261016-1830
+	urlpath=${rest#*/}; urlpath=${urlpath%/}      # e.g. safespace/network, or empty
+	[[ $rest == */* ]] || urlpath=""
 	host=${hostport%%:*}; port=${hostport##*:}
 	[[ $port == "$host" ]] && port=80
 	[[ $host == 10.0.2.2 ]] ||
@@ -118,8 +117,13 @@ elif ((NETBOOT)); then
 	# Serve the published files under the exact path the signed URL names, so
 	# the initrd finds them where it looks (a symlink farm, no copying).
 	DOCROOT=$WORK/netboot-docroot
-	mkdir -p "$DOCROOT/$(dirname "$urlpath")"
-	ln -sfnT "$(readlink -f "$BOOTDIR")" "$DOCROOT/$urlpath"
+	rm -rf "$DOCROOT"
+	if [[ -z $urlpath ]]; then
+		ln -sfnT "$(readlink -f "$BOOTDIR")" "$DOCROOT"
+	else
+		mkdir -p "$DOCROOT/$(dirname "$urlpath")"
+		ln -sfnT "$(readlink -f "$BOOTDIR")" "$DOCROOT/$urlpath"
+	fi
 	log "Serving $(readlink -f "$BOOTDIR") as http://10.0.2.2:$port/$urlpath/"
 	python3 -m http.server "$port" --bind 127.0.0.1 --directory "$DOCROOT" &>"$WORK/http.log" &
 	HTTP_PID=$!
@@ -128,7 +132,7 @@ elif ((NETBOOT)); then
 	kill -0 "$HTTP_PID" 2>/dev/null || { cat "$WORK/http.log" >&2; die "the HTTP server did not start (port $port in use?)"; }
 else
 	if [[ -z $IMAGE ]]; then
-		IMAGE=$(find "$HERE/mkosi.output" "$HERE" -maxdepth 1 -type f \( -name '*.raw.zst' -o -name '*.raw' \) \
+		IMAGE=$(find "$HERE/mkosi.output/usb" -mindepth 2 -maxdepth 2 -type f \( -name '*.raw.zst' -o -name '*.raw' \) \
 			! -name '*-network_*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR == 1 { print $2 }' || true)
 	fi
 	MEM=${MEM:-2048}
@@ -211,7 +215,7 @@ if ((NETBOOT)); then
 	elif [[ $NBMODE == http ]]; then
 		# UEFI HTTP boot: the boot file is a URL, the firmware downloads it
 		# itself. This is what a machine on a real network does.
-		nic+=",bootfile=http://10.0.2.2:$port/$urlpath/boot.efi"
+		nic+=",bootfile=http://10.0.2.2:$port/${urlpath:+$urlpath/}boot.efi"
 	else
 		nic+=",tftp=$(readlink -f "$BOOTDIR"),bootfile=boot.efi"
 	fi

@@ -8,3 +8,11 @@
 
 [Build]
 Environment=SYSTEMD_REPART_MKFS_OPTIONS_EROFS=--workers=32
+
+# Secure Boot keys: without this, the host's sbctl keys (/var/lib/sbctl). A
+# dedicated key set for safespace (README.md, "Secure Boot keys"):
+#   sudo install -d -m 0700 /var/lib/safespace/sbctl
+#   sudo sbctl --config /var/lib/safespace/sbctl/sbctl.conf create-keys
+# with sbctl.conf holding keydir: /var/lib/safespace/sbctl/keys and
+# guid: /var/lib/safespace/sbctl/GUID. Several Environment= lines add up.
+#Environment=SAFESPACE_SBCTL_CONFIG=/var/lib/safespace/sbctl/sbctl.conf

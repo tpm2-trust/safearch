@@ -1,0 +1,11 @@
+# Checks a release as soon as release.sh has replaced it (release.sh writes
+# the file "release" last).
+[Unit]
+Description=Watch the safespace share for new releases
+
+[Path]
+PathChanged=@SHARE@/network/release
+PathChanged=@SHARE@/usb/release
+
+[Install]
+WantedBy=multi-user.target

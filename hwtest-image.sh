@@ -2,7 +2,7 @@
 # Build a diagnostic stick image that boots a UKI layer by layer, to find out
 # why a machine resets or hangs on the real stick. No root needed.
 #
-#   ./hwtest-image.sh [UKI]        (default: the newest mkosi.output/*.efi)
+#   ./hwtest-image.sh [UKI]        (default: the newest usb build's UKI, mkosi.output/usb/*/*.efi)
 #   sudo wipefs -a /dev/sdX
 #   sudo dd if=mkosi.test/hwtest.img of=/dev/sdX bs=4M conv=fsync oflag=direct status=progress
 #
@@ -28,8 +28,8 @@ log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 
 # Default: the newest usb UKI (a network UKI would load its root over HTTP,
 # which says nothing about why this machine will not boot from a medium).
-UKI=${1:-$(ls -t "$HERE"/mkosi.output/*.efi 2>/dev/null | grep -v -- '-network_' | head -1 || true)}
-[[ -n $UKI && -f $UKI ]] || die "no UKI found (mkosi.output/*.efi; run: sudo ./build.sh usb)"
+UKI=${1:-$(ls -t "$HERE"/mkosi.output/usb/*/*.efi 2>/dev/null | head -1 || true)}
+[[ -n $UKI && -f $UKI ]] || die "no UKI found (mkosi.output/usb/*/*.efi; run: sudo ./build.sh usb)"
 STUB=/usr/lib/systemd/boot/efi/linuxx64.efi.stub
 BOOT=/usr/lib/systemd/boot/efi/systemd-bootx64.efi
 for f in "$STUB" "$BOOT"; do [[ -f $f ]] || die "$f missing (systemd, systemd-ukify)"; done

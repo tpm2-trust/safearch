@@ -4,15 +4,13 @@
 # safespace-netboot and server/setup.sh. After a change: sudo server/setup.sh
 # (or, for DHCP_* only: sudo systemctl restart safespace-dhcp).
 
-# Where releases are uploaded to and served from (nginx: /safespace/).
+# Where releases are uploaded to and served from (nginx: /safespace/): one
+# release per variant, network/ and usb/, each upload replaces the last.
 SHARE=/srv/safespace/share
-# Releases kept per variant (network, usb); channels' releases are always kept.
-KEEP=3
 
 # How machines reach this server: the base of the share in the URL. The
 # network build's NETROOT_URL (netboot.conf on the build host) is
-# $SERVER_URL/network/, and the HTTP boot file is
-# $SERVER_URL/network/<channel>/boot.efi.
+# $SERVER_URL/network/, and the HTTP boot file is $SERVER_URL/network/boot.efi.
 SERVER_URL=http://10.0.0.1/safespace
 
 # DHCP answers for network boot (safespace-dhcp.service, dnsmasq):
@@ -24,10 +22,8 @@ SERVER_URL=http://10.0.0.1/safespace
 #          (options 60/67), PXE/TFTP as fallback
 DHCP_MODE=off
 DHCP_INTERFACE=eth0
-# Channel the DHCP answers point at (per-machine exceptions: dnsmasq snippets
-# in /etc/safespace/dnsmasq.d/*.conf, e.g. dhcp-host=<mac>,set:desktop plus
-# dhcp-boot=tag:desktop,...).
-DHCP_CHANNEL=current
+# Site additions (extra options, per-host settings): dnsmasq snippets in
+# /etc/safespace/dnsmasq.d/*.conf.
 # proxy: the LAN's network address
 DHCP_PROXY_SUBNET=10.0.0.0
 # dhcp: lease range (start,end[,lease time]), router and DNS server to hand out

@@ -88,7 +88,7 @@ for uki in "$OUTPUTDIR"/*.efi; do
 		echo "safespace: ERROR: UKI is signed by a different key than the db.pem shipped for safespace-seal" >&2
 		echo "  UKI:     $signer" >&2
 		echo "  shipped: $shipped" >&2
-		echo "  Rerun secureboot-export.sh with the keys of SecureBootKey=, then rebuild." >&2
+		echo "  Build with build.sh: it exports the keys it signs with." >&2
 		exit 1
 	fi
 	echo "safespace: UKI signed by the shipped db key (safespace-seal can enroll it)"

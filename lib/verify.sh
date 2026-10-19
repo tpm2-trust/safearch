@@ -3,12 +3,12 @@
 # Sourced; needs bash, sbverify, objcopy, veritysetup, sha256sum, zstd, sfdisk,
 # mtools, dd. No root, no python.
 #
-#   verify_release DIR VARIANT VERSION DB_CERT [TMPDIR]
+#   verify_release DIR VARIANT DB_CERT [TMPDIR]
 #       network: boot.efi root.img root.verity roothash cmdline release SHA256SUMS
 #       usb:     image.raw.zst roothash release SHA256SUMS (TMPDIR: room for the
 #                unpacked image plus a copy of its root partition)
 #   release_get FILE KEY        value of KEY=... in a release file (not sourced)
-#   verify_name_version / verify_name_channel VALUE
+#   verify_name_version VALUE
 #
 # What is trusted: only DB_CERT, the public Secure Boot db certificate. The
 # UKI must carry a valid signature from it; the root hash is taken from the
@@ -20,10 +20,8 @@
 vfail() { printf '%s\n' "$*" >&2; return 1; }
 vinfo() { printf '    %s\n' "$*"; }
 
-# Versions are what build.sh writes (date-time, optional suffix); channels are
-# lowercase names starting with a letter, so the two never collide in one dir.
+# Versions are what build.sh writes (date-time, optional suffix).
 verify_name_version() { [[ $1 =~ ^[0-9][0-9A-Za-z._-]{0,63}$ ]]; }
-verify_name_channel() { [[ $1 =~ ^[a-z][a-z0-9-]{0,31}$ ]]; }
 
 release_get() { # FILE KEY
 	sed -n "s/^$2=//p" "$1" | head -1
@@ -55,10 +53,9 @@ verify_cmdline_roothash() { # CMDLINE ROOTHASH
 		vfail "the UKI's signed command line does not carry roothash=$2"
 }
 
-verify_release() { # DIR VARIANT VERSION DB_CERT [TMPDIR]
-	local dir=$1 variant=$2 version=$3 cert=$4 tmp=${5:-} f v
+verify_release() { # DIR VARIANT DB_CERT [TMPDIR]
+	local dir=$1 variant=$2 cert=$3 tmp=${4:-} f version
 	[[ -f $cert ]] || vfail "no db certificate $cert" || return
-	verify_name_version "$version" || vfail "invalid version name '$version'" || return
 	[[ -d $dir ]] || vfail "no release directory $dir" || return
 	case $variant in
 		network) for f in boot.efi root.img root.verity roothash cmdline release SHA256SUMS; do
@@ -71,37 +68,36 @@ verify_release() { # DIR VARIANT VERSION DB_CERT [TMPDIR]
 	esac
 	verify_sums "$dir" || return
 	vinfo "SHA256SUMS ok"
-	for f in VARIANT:$variant VERSION:$version; do
-		v=$(release_get "$dir/release" "${f%%:*}")
-		[[ $v == "${f#*:}" ]] || vfail "release says ${f%%:*}=$v, expected ${f#*:}" || return
-	done
+	[[ $(release_get "$dir/release" VARIANT) == "$variant" ]] ||
+		vfail "release says VARIANT=$(release_get "$dir/release" VARIANT), expected $variant" || return
+	version=$(release_get "$dir/release" VERSION)
+	verify_name_version "$version" || vfail "release has an invalid VERSION='$version'" || return
+	vinfo "release $version (groups $(release_get "$dir/release" GROUPS))"
 	local roothash
 	roothash=$(tr -d '[:space:]' <"$dir/roothash")
 	[[ $roothash =~ ^[0-9a-f]{64}$ ]] || vfail "roothash is not a sha256 root hash" || return
-	"verify_$variant" "$dir" "$version" "$cert" "$roothash" "$tmp"
+	"verify_$variant" "$dir" "$cert" "$roothash" "$tmp"
 }
 
-verify_network() { # DIR VERSION DB_CERT ROOTHASH
-	local dir=$1 version=$2 cert=$3 roothash=$4 cmdline url urls=0
+verify_network() { # DIR DB_CERT ROOTHASH
+	local dir=$1 cert=$2 roothash=$3 cmdline url urls=0
 	verify_signature "$dir/boot.efi" "$cert" || return
 	vinfo "boot.efi signed by the db key"
 	cmdline=$(uki_cmdline "$dir/boot.efi")
 	verify_cmdline_roothash "$cmdline" "$roothash" || return
-	# The initrd loads <url>/root.img: every URL has to name this version.
 	for url in $(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace\.netroot=//p'); do
 		urls=$((urls + 1))
-		[[ $(basename "${url%/}") == "$version" ]] ||
-			vfail "the UKI loads its root from $url, not from .../$version/" || return
+		vinfo "netroot URL: $url"
 	done
 	((urls)) || vfail "no safespace.netroot= in the UKI: not a network build" || return
-	vinfo "signed command line: roothash and $urls netroot URL(s) for $version"
+	vinfo "signed command line: roothash matches"
 	veritysetup verify "$dir/root.img" "$dir/root.verity" "$roothash" >&2 ||
 		vfail "root.img does not match the signed root hash" || return
 	vinfo "root.img matches the signed root hash"
 }
 
-verify_usb() { # DIR VERSION DB_CERT ROOTHASH TMPDIR
-	local dir=$1 cert=$3 roothash=$4 tmp=$5 raw esp root verity uki cmdline
+verify_usb() { # DIR DB_CERT ROOTHASH TMPDIR
+	local dir=$1 cert=$2 roothash=$3 tmp=$4 raw esp root verity uki cmdline
 	[[ -n $tmp && -d $tmp ]] || vfail "verify_usb needs a temporary directory" || return
 	raw=$tmp/image.raw
 	zstd -dqf "$dir/image.raw.zst" -o "$raw" || vfail "image.raw.zst does not decompress" || return

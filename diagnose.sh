@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 # Read-only check of a stick/SD card written from a "usb" image (burn.sh):
 # ESP + signed UKI, dm-verity root (verified block by block), nothing writable.
-# A netstick (netstick.sh, ESP only) is recognised by its missing root
-# partitions: then the UKI's netroot URL is checked against the server instead.
 # Usage: sudo ./diagnose.sh [--db-cert db.pem] /dev/sdX
 #   --db-cert  the db certificate the signatures must verify against (default:
 #              the build host's exported db.pem, else a distribution server's
@@ -44,20 +42,12 @@ lsblk -o NAME,SIZE,FSTYPE,PARTTYPENAME,PARTUUID "$DISK"
 ESP=$(part_by_type c12a7328-f81f-11d2-ba4b-00a0c93ec93b)
 ROOT=$(part_by_type 4f68bce3-e8cd-4db1-96e7-fbcaf984b709)
 VERITY=$(part_by_type 2c7357ed-ebd2-46d9-aec1-23d437ec2bf5)
-MODE=usb
-[[ -n $ESP && -z $ROOT && -z $VERITY ]] && MODE=netstick
 n=$(lsblk -lnpo TYPE "$DISK" | grep -c part)
-if [[ $MODE == netstick ]]; then
-	ok "netstick: ESP only ($ESP), the root image comes from the netboot server"
-	((n == 1)) && ok "exactly 1 partition, nothing writable on the stick" ||
-		bad "$n partitions, expected 1 (ESP)"
-else
-	for p in ESP ROOT VERITY; do
-		[[ -n ${!p} ]] && ok "$p partition: ${!p}" || bad "no $p partition"
-	done
-	((n == 3)) && ok "exactly 3 partitions, nothing writable on the stick" ||
-		bad "$n partitions, expected 3 (ESP, root, root-verity)"
-fi
+for p in ESP ROOT VERITY; do
+	[[ -n ${!p} ]] && ok "$p partition: ${!p}" || bad "no $p partition"
+done
+((n == 3)) && ok "exactly 3 partitions, nothing writable on the stick" ||
+	bad "$n partitions, expected 3 (ESP, root, root-verity)"
 if [[ $(dd if="$DISK" bs=1 skip=32769 count=5 status=none) == CD001 ]]; then
 	bad "ISO9660/El Torito header at 32 KiB (CD boot path; image built before ElTorito=no)"
 else
@@ -84,8 +74,6 @@ UKI=${ukis[0]}
 size=$(($(stat -c %s "$UKI") / 1048576))
 if ((size <= 100)); then
 	ok "UKI ${UKI#"$TMP/esp/"} is $size MiB"
-elif [[ $MODE == netstick ]]; then
-	echo "  NOTE UKI ${UKI#"$TMP/esp/"} is $size MiB (fine through systemd-boot)"
 else
 	bad "UKI is $size MiB (too big for many firmwares)"
 fi
@@ -109,10 +97,8 @@ CMDLINE=$(objcopy -O binary --only-section=.cmdline "$UKI" /dev/stdout 2>/dev/nu
 	bad "systemd.volatile=state missing: /var would be on the read-only root"
 opts=(systemd.credentials_boot_policy=strict systemd.sysext=0 systemd.confext=0
 	rd.systemd.sysext=0 rd.systemd.confext=0)
-# usb: systemd-veritysetup opens root; network: netroot does, with its own
-# --panic-on-corruption, and needs root= pointing at its device.
-[[ $MODE == usb ]] && opts+=(systemd.verity_root_options=panic-on-corruption) ||
-	opts+=(root=/dev/mapper/root systemd.verity=no)
+# systemd-veritysetup opens root, and stops the machine on a corrupted block.
+opts+=(systemd.verity_root_options=panic-on-corruption)
 for opt in "${opts[@]}"; do
 	[[ " $CMDLINE " == *" $opt "* ]] && ok "$opt" || bad "$opt missing from the kernel command line"
 done
@@ -123,51 +109,17 @@ extra=$(cd "$TMP/esp" && find . -type f ! -ipath './efi/boot/bootx64.efi' ! -ipa
 
 ROOTHASH=$(tr ' ' '\n' <<<"$CMDLINE" | sed -n 's/^roothash=//p')
 
-if [[ $MODE == netstick ]]; then
-	hdr "Root image on the netboot server"
-	[[ -n $ROOTHASH ]] && ok "roothash=$ROOTHASH" || bad "no roothash= on the kernel command line"
-	mapfile -t urls < <(tr ' ' '\n' <<<"$CMDLINE" | sed -n 's/^safespace\.netroot=//p')
-	((${#urls[@]})) || { bad "no safespace.netroot= on the kernel command line: not a network UKI"; exit 1; }
-	command -v curl >/dev/null || { bad "curl missing, cannot check the server"; exit 1; }
-	# Checked from this host: the client resolves host names with the DNS
-	# server from its DHCP lease, which may answer differently.
-	for url in "${urls[@]}"; do
-		url=${url%/}/
-		echo "  $url"
-		for f in root.img root.verity; do
-			len=$(curl -fsSI --max-time 10 "$url$f" 2>/dev/null | tr -d '\r' |
-				awk 'tolower($1) == "content-length:" { print $2 }')
-			[[ -n $len ]] && ok "$f: $((len >> 20)) MiB" || bad "$f not served by $url"
-		done
-		served=$(curl -fsS --max-time 10 "${url}roothash" 2>/dev/null | tr -d '[:space:]')
-		if [[ -z $served ]]; then
-			echo "  NOTE ${url}roothash not served, cannot compare"
-		elif [[ $served == "$ROOTHASH" ]]; then
-			ok "the server's roothash matches the UKI"
-		else
-			bad "the server publishes roothash $served for this URL, the UKI expects $ROOTHASH"
-		fi
-	done
-	exit 0
-fi
-
 hdr "dm-verity root"
 if [[ -z $ROOTHASH ]]; then
 	bad "no roothash= on the kernel command line"
 else
 	ok "roothash=$ROOTHASH"
-	# usb builds only: a network build's root hash belongs to an image that is
-	# never written to a medium.
-	build=$(grep -lx "$ROOTHASH" "$HERE"/mkosi.output/*.roothash "$HERE"/*.roothash 2>/dev/null |
-		grep -v -- '-network_' | head -1)
-	newest=$(ls -t "$HERE"/mkosi.output/*.roothash "$HERE"/*.roothash 2>/dev/null |
-		grep -v -- '-network_' | head -1)
-	if [[ -z $build ]]; then
-		echo "  NOTE build: no matching *.roothash on this host"
-	elif [[ $build == "$newest" ]]; then
-		ok "build: $(basename "$build" .roothash) (the newest build)"
+	# The build on this host with that root hash, if any.
+	build=$(grep -lx "$ROOTHASH" "$HERE"/mkosi.output/usb/*/*.roothash 2>/dev/null | head -1)
+	if [[ -n $build ]]; then
+		ok "build: usb/$(basename "$(dirname "$build")") (./build.sh show for its packages)"
 	else
-		bad "build: $(basename "$build" .roothash), but the newest is $(basename "$newest" .roothash)"
+		echo "  NOTE build: no build with this root hash on this host"
 	fi
 	uuid() { sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12}).*/\1-\2-\3-\4-\5/' <<<"$1"; }
 	want_data=$(uuid "${ROOTHASH:0:32}")

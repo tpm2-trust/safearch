@@ -64,3 +64,54 @@ When the user requests a programming task, **do not start coding immediately.**
 - Place diagrams in `PLAN.md`, `README.md`, or inline in your response —
   wherever they add the most clarity.
 
+
+## This project
+
+safespace-arch: a read-only, Secure-Boot-signed Arch Linux image built with
+mkosi 27, in two variants (`usb`, `network`) and package groups. README.md is
+the user manual (read "Two roles" and "Deploy from scratch" first), NETBOOT.md
+the network-boot reference. Arch Linux only, everywhere.
+
+### Map
+
+| Role | Files |
+|---|---|
+| build host (has the keys) | `build.sh` (entry point), `release.sh`, `fetch-images.sh`, `update-snapshot.sh`, `burn.sh`, `diagnose.sh`, `test-vm.sh`, `hwtest-image.sh` |
+| image configuration | `mkosi.conf` (base), `mkosi.profiles/{usb,network}/` (variants), `mkosi.profiles/{remotedesktop,docker}/` (groups), `mkosi.profiles/debug/` (`--debug`), `mkosi.repart/`, `mkosi.extra/`, `mkosi.postinst`, `mkosi.finalize`, `mkosi.postoutput` |
+| initrd | `mkosi.initrd.conf/` (common), `…/mkosi.profiles/network/…/netroot` (root over HTTP), `…/mkosi.profiles/usb/…/usb-bootdev` |
+| distribution server | `server/` (`setup.sh`, `safespace-netboot`, units, nginx site, `server.conf.example`) |
+| shared shell code | `lib/repos.sh`, `lib/groups.sh`, `lib/keys.sh`, `lib/builds.sh` (the builds in `mkosi.output/<variant>/<groups>_<version>/`: list, select, prune), `lib/verify.sh` (also installed on the servers) |
+| tests | `tests/run.sh`, `tests/lib/` |
+| per-host files (gitignored, templates `*.example`) | `users.conf`, `netboot.conf`, `release.conf`, `mkosi.local.conf`, `repos.local.conf`, `server/server.conf` |
+
+### Invariants — a change that breaks one of these needs the user's explicit OK
+
+- **No private key in an image, a release or the repository.** Only certificates,
+  signed `.auth` updates and the GUID are exported (`lib/keys.sh`);
+  `mkosi.postoutput` enforces it.
+- **Every image is signed**, and the UKI is signed by exactly the `db.pem` it
+  ships (`mkosi.postoutput`).
+- **A distribution server trusts only the pinned public `db.pem`** and never
+  alters what it serves: it reports, the build host replaces. The upload account
+  is confined by rrsync (write-only, no delete, share only).
+- **Root only through dm-verity** with the root hash from the signed command
+  line; nothing on the boot medium is ever written; `/var` is RAM.
+- **One release per server and variant**, fixed file names; the initrd's
+  reaction to a replaced release must not turn into a reboot loop.
+- **Groups are the only difference between images** besides the variant.
+
+### Working on it
+
+- Run `tests/run.sh` after every change (no root, ~15 s). Add a test for new
+  behaviour there: fixtures with throwaway keys are in `tests/lib/fixtures.sh`.
+  A SKIP is not a pass: say which tool was missing.
+- Not testable without root or hardware — say so and hand it to the user with
+  the exact commands: a real `build.sh` run, `server/setup.sh`, the units under
+  systemd, booting in QEMU (`test-vm.sh`) or on a machine, YubiKey keys.
+- Script conventions: bash with `set -Eeuo pipefail` (the initrd scripts are
+  POSIX sh); the usage text is the comment header (printed by `-h`); `log`/`die`
+  helpers; validate every input that ends up in a path, a URL or a config file;
+  comments say why, not what.
+- Docs: every user-visible change goes into README.md (and NETBOOT.md if it
+  concerns network boot) in the same change; keep the anchors working.
+- PLAN.md holds the current plan; finished plans stay in git history.

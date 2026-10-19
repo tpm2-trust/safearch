@@ -6,9 +6,8 @@
 #
 # Everything it trusts comes from the kernel command line inside the signed
 # UKI, nothing from the network:
-#   safespace.netroot=<url>/  base URL, may be given more than once (tried in
-#                             order); build.sh appends the image version, so a
-#                             UKI only ever loads the root it was signed with
+#   safespace.netroot=<url>/  base URL of a distribution server, may be given
+#                             more than once (tried in order)
 #   roothash=<hash>           dm-verity root hash (added by mkosi)
 # veritysetup refuses a hash tree that does not match roothash=, and dm-verity
 # then checks every block that is read, with --panic-on-corruption. A
@@ -16,10 +15,13 @@
 # booting, never change what boots. Plain HTTP is enough for that; HTTPS only
 # adds confidentiality (and needs a certificate curl trusts).
 #
-# Files expected under each URL:
+# Files expected under each URL (one release, written by release.sh):
+#   roothash      the release's root hash
 #   root.img      the root partition (erofs, dm-verity data)
 #   root.verity   its dm-verity hash tree
-# Both are written by netboot-export.sh.
+# A server only ever holds the newest release. If no server has this UKI's
+# release any more (another roothash), a newer one was published after the
+# firmware loaded this UKI: reboot, and the firmware loads the new boot.efi.
 #
 # Progress goes to the kernel log (so `journalctl -b -g netroot` has it after
 # boot) and to /dev/console, because the kernel log at info level does not
@@ -28,7 +30,9 @@
 
 WAIT_ONLINE=60          # seconds to wait for a DHCP address
 MAX_TIME=900            # seconds for one download
-DIR=/run/netroot        # tmpfs for the images; stays mounted after switch-root
+# tmpfs for the images; stays mounted after switch-root. NETROOT_DIR and
+# NETROOT_CMDLINE only exist for tests/run.sh (netroot.service sets neither).
+DIR=${NETROOT_DIR:-/run/netroot}
 
 msg() {
 	echo "netroot: $*" >/dev/kmsg 2>/dev/null
@@ -37,7 +41,7 @@ msg() {
 }
 die() { msg "ERROR: $*"; exit 1; }
 
-cmdline=$(cat /proc/cmdline)
+cmdline=${NETROOT_CMDLINE:-$(cat /proc/cmdline)}
 args() { printf '%s\n' "$cmdline" | tr ' ' '\n' | sed -n "s/^$1=//p"; }
 
 urls=$(args safespace.netroot)
@@ -97,10 +101,27 @@ cleanup() {
 	data="" hash=""
 }
 
-data="" hash=""
+# The release this server holds: 0 = this UKI's, 1 = another one (newer),
+# 2 = unknown (no roothash served, or not reachable).
+served_release() { # base url
+	served=$(curl -fsS --retry 2 --max-time 20 "$1/roothash" 2>/dev/null | tr -d '[:space:]')
+	[ -n "$served" ] || return 2
+	[ "$served" = "$roothash" ] && return 0
+	return 1
+}
+
+data="" hash="" other=0 same=0
 try() { # base url (without trailing slash)
 	base=$1
 	tmpfs_size="" tmpfs_size_opt=""
+	served_release "$base"
+	case $? in
+		1) msg "$base holds another release (roothash $(printf %.12s "$served")..., this UKI: $(printf %.12s "$roothash")...)"
+			other=1
+			return 1 ;;
+		2) msg "$base serves no roothash, trying the image anyway" ;;
+		*) same=1 ;;
+	esac
 	msg "fetching the root image from $base"
 
 	# Reserve RAM for both images before downloading: the root image stays in
@@ -135,7 +156,10 @@ try() { # base url (without trailing slash)
 	# The root hash comes from the signed command line: this is the step that
 	# decides whether the downloaded image is the one that was signed.
 	if ! out=$(veritysetup open "$data" root "$hash" "$roothash" --panic-on-corruption 2>&1); then
-		msg "dm-verity refused the image (wrong build on the server?): $out"
+		msg "dm-verity refused the image: $out"
+		# Replaced while downloading?
+		served_release "$base"
+		[ $? -eq 1 ] && { msg "$base published another release meanwhile"; other=1; }
 		return 1
 	fi
 	msg "root opened as /dev/mapper/root ($data = $DIR/root.img), verified against roothash=$(printf %.12s "$roothash")..."
@@ -157,4 +181,12 @@ for url in $urls; do
 	cleanup
 done
 
+# Reboot only if no server holds this UKI's release any more: a server that
+# has it but failed otherwise is an error, not a newer release.
+if [ "$other" -eq 1 ] && [ "$same" -eq 0 ]; then
+	msg "this UKI's release is no longer served: a newer one was published after the firmware loaded it. Rebooting in 10 s to load the new one."
+	sleep 10
+	systemctl reboot
+	exit 1
+fi
 die "no server provided a usable root image, tried: $(echo "$urls" | tr '\n' ' ')"
