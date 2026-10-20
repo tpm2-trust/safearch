@@ -161,6 +161,29 @@ if wanted groups; then
 		check "base: no desktop, no docker, no debug tools; btrfs-progs" bash -c '[[ " $1 " != *" xfce4 "* && " $1 " != *" docker "* && " $1 " != *" tcpdump "* && " $1 " == *" openssh "* && " $1 " == *" btrfs-progs "* ]]' _ "$base"
 		check "xfce4-headless-vnc + docker add theirs" bash -c '[[ " $1 " == *" xfce4 "* && " $1 " == *" docker "* && " $1 " == *" tigervnc "* ]]' _ "$all"
 		check "debug adds its tools" bash -c '[[ " $1 " == *" tcpdump "* && " $1 " == *" kexec-tools "* && " $1 " != *" docker "* ]]' _ "$dbg"
+		# Smaller roots: the filters as mkosi itself evaluates them (mkosi.kmod).
+		mkosi --directory "$REPO" --json summary >"$W/summary-slim.json" 2>/dev/null
+		check "root modules: no Wi-Fi, Bluetooth, NVIDIA; NICs, docker, storage, DRM stay" python3 -I -c '
+import json, sys
+sys.path[:0] = [p for p in sys.argv[2:]]
+from mkosi.kmod import globs_match_module, globs_match_firmware
+i = json.load(open(sys.argv[1]))["Images"][-1]
+km, fw = i["KernelModules"], i["FirmwareFiles"]
+gone = ["kernel/drivers/net/wireless/intel/iwlwifi/iwlwifi", "kernel/net/mac80211/mac80211",
+        "kernel/net/wireless/cfg80211", "kernel/drivers/bluetooth/btusb", "kernel/net/bluetooth/bluetooth",
+        "kernel/drivers/gpu/drm/nouveau/nouveau", "kernel/drivers/gpu/nova-core/nova_core",
+        "kernel/drivers/staging/rtl8723bs/r8723bs", "kernel/net/batman-adv/batman-adv"]
+kept = ["kernel/drivers/net/ethernet/realtek/r8169", "kernel/drivers/net/ethernet/intel/e1000e/e1000e",
+        "kernel/fs/overlayfs/overlay", "kernel/net/bridge/br_netfilter", "kernel/drivers/net/veth",
+        "kernel/drivers/gpu/drm/amd/amdgpu/amdgpu", "kernel/drivers/gpu/drm/i915/i915", "kernel/fs/btrfs/btrfs"]
+bad = [m for m in gone if globs_match_module(m, km)] + [m for m in kept if not globs_match_module(m, km)]
+bad += [f for f in ["nvidia/tu102/gsp/booter_load-570.144.bin"] if globs_match_firmware(f, fw, match_default=True)]
+bad += [f for f in ["rtl_nic/rtl8168h-2.fw", "amdgpu/navi10_sos.bin"] if not globs_match_firmware(f, fw, match_default=True)]
+sys.exit(print("wrong:", bad) if bad else 0)' "$W/summary-slim.json" "$(python3 -I -c 'import mkosi, os; print(os.path.dirname(os.path.dirname(mkosi.__file__)))')"
+		check "root: no headers, docs, man pages; locales en_US only" bash -c '
+			python3 -I -c "import json, sys; r = json.load(open(sys.argv[1]))[\"Images\"][-1][\"RemoveFiles\"]
+sys.exit(not {\"/usr/include\", \"/usr/share/doc\", \"/usr/share/man\", \"/usr/share/info\"} <= set(r))" "$1" &&
+			grep -q "^find \"\$BUILDROOT/usr/share/locale\" .* ! -name en ! -name en_US -exec rm -rf" "$2/mkosi.postinst"' _ "$W/summary-slim.json" "$REPO"
 	fi
 fi
 

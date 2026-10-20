@@ -186,7 +186,7 @@ A group is what goes into a root on top of the base system:
 
 | Group | What it adds | Where it is defined |
 |---|---|---|
-| `base` (always) | kernel, firmware, microcode, systemd, openssh, sudo, nftables, usbguard, cryptsetup, btrfs-progs, efitools + openssl (`safespace-seal`), vim, tmux, qemu-guest-agent; users, ssh, hardening, volatile `/var` | `mkosi.conf`, `mkosi.extra/` |
+| `base` (always) | kernel (no Wi-Fi, Bluetooth or NVIDIA drivers), the firmware its drivers declare, microcode, systemd, openssh, sudo, nftables, usbguard, cryptsetup, btrfs-progs, efitools + openssl (`safespace-seal`), vim, tmux, qemu-guest-agent; users, ssh, hardening, volatile `/var` | `mkosi.conf`, `mkosi.extra/` |
 | `docker` | Docker and containerd with their storage on a data disk at `/opt/docker`, the shipped images (`fetch-images.sh`) and their loader; users get the `docker` group. Docker is not started at boot (see [Docker](#docker)) | `mkosi.profiles/docker/` |
 | `xfce4-headless-vnc` | XFCE, TigerVNC on `localhost:5901` (through an ssh tunnel), firefox, vlc, gwenview, fonts, pulseaudio; VNC user and password (`safespace.env`) | `mkosi.profiles/xfce4-headless-vnc/` |
 | `debug` | diagnostic tools: ethtool, dmidecode, pciutils, usbutils, lshw, iperf3, tcpdump, kexec-tools | `mkosi.profiles/debug/` |
@@ -571,7 +571,9 @@ VM's view of the host (`sudo ./build.sh --url http://10.0.2.2:8000/`) — see
 `tests/vm.sh` runs the whole chain unattended, without a window, and **self-contained**: it
 builds a test image with a throwaway user, releases it into a share of its own, checks it as
 a distribution server does, boots it in QEMU from a stick and over the network, seals it,
-boots with enforced Secure Boot, and checks each boot over ssh. It touches no real user, key,
+boots with enforced Secure Boot, and checks each boot over ssh (in every boot also: kernel
+lockdown, and none of what the roots leave out: Wi-Fi/Bluetooth/NVIDIA drivers and firmware,
+headers, docs, man pages, locales but en_US). It touches no real user, key,
 build or server. Exit 0 only if every step passed.
 
 ```sh
@@ -911,6 +913,8 @@ combination's groups as `--profile=<group>`).
 | `Environment=SYSTEMD_REPART_MKFS_OPTIONS_VFAT=-S512` | FAT with 512-byte sectors (many firmwares don't read 4K-sector FAT on USB), while erofs and verity keep 4K blocks |
 | `Ssh=never` | no sshd-over-vsock units for `mkosi vm` |
 | `Hostname=`, `Locale=`, `Keymap=`, `Timezone=` | safespace, en_US.UTF-8, us, UTC |
+| `KernelModules=` (all but Wi-Fi, Bluetooth, nouveau/nova), `FirmwareFiles=-nvidia/` | every network client downloads its whole root (and holds it in RAM); modules and firmware are zstd already, so erofs cannot shrink them, and they were 2/3 of the base root. With a module filter mkosi keeps only the firmware the remaining modules declare, plus microcode. The image has no Wi-Fi tools; a headless machine needs no nouveau. Applied on every build, after mkosi's cache |
+| `RemoveFiles=` `/usr/include`, docs, man/info pages; `mkosi.postinst`: locales other than `en`/`en_US` | nothing on a read-only machine without compilers reads them. Not `WithDocs=no`/pacman `NoExtract`: mkosi's cache manifest does not cover them, so a cached tree would keep the files |
 | `mkosi.version` | `ImageVersion` is the build timestamp, so every build gets its own directory. `build.sh` runs it once and passes `--image-version` |
 | `mkosi.local.conf.example` | per-host settings, e.g. more erofs compression threads |
 
@@ -970,7 +974,7 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 | Script | What it does |
 |---|---|
 | `mkosi.postinst` | users from `users.conf` without password (`*`) and with groups from `safespace.env`; their ssh keys into the read-only `/etc/ssh/authorized_keys/<user>`; root locked; `/home` → `/var/home`, `/root` → `/var/roothome`; sudoers check; usbguard daemon settings (block new devices, keep present ones, IPC for `wheel`); mount points `/efi`, `/var`; per group: VNC password (random per build, saved next to the image; xfce4-headless-vnc), the `docker` user group, `/opt/docker` and its fstab entry (docker); records the groups |
-| `mkosi.finalize` | `resolv.conf` → systemd-resolved stub; moves the built `/var` to `/usr/share/factory/var` (caches and logs dropped) |
+| `mkosi.finalize` | `resolv.conf` → systemd-resolved stub; moves the built `/var` to `/usr/share/factory/var` (caches and logs dropped); reruns `depmod` after the module filter (mkosi 27 skips it, so `modules.dep`/`modules.alias` would still name the removed drivers) and fails the build if a Wi-Fi/Bluetooth stack or nouveau is left |
 | `mkosi.postoutput` | per combination: prints the UKI's size and parts, warns above 85 MiB (network boot on old firmware), fails above 128 MiB, fails if it is signed by another key than the exported `db.pem` or lacks `lockdown=integrity`, and says when there is no `safespace.netroot=` URL (sticks only). The composed UKI is checked again by `compose_check` in `lib/compose.sh` |
 
 ### Files in the system (`mkosi.extra/`)
@@ -1025,7 +1029,7 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 | `mkosi.extra/` | files of the base system: sshd, sudo, networkd, usbguard drop-in, fstab, guest agent restrictions, service presets, unit masks, volatile `/var` |
 | `mkosi.initrd.conf/` | initrd configuration: unit masks, both boot paths (`usb-bootdev`, `netroot` and the initrd network config), each run only on its path |
 | `mkosi.postinst` | `/home` and `/root` into `/var`, users and ssh keys, usbguard, sudoers check, mount points; per group: VNC (xfce4-headless-vnc), the docker group and data disk mount (docker); records the groups |
-| `mkosi.finalize` | resolv.conf, moves the built `/var` to `/usr/share/factory/var` |
+| `mkosi.finalize` | resolv.conf, moves the built `/var` to `/usr/share/factory/var`, `depmod` + check after the module filter |
 | `mkosi.postoutput` | UKI size and signature checks, netroot URL check (see above) |
 | `docker-images.txt`, `fetch-images.sh` | images to ship and their downloader |
 | `users.conf.example`, `safespace.env` | users and ssh keys (copy to `users.conf`); groups and VNC settings |

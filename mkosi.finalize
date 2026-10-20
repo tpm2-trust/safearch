@@ -25,3 +25,17 @@ stub=$BUILDROOT/usr/lib/systemd/boot/efi/linuxx64.efi.stub
 if [[ -f $stub && -n ${OUTPUTDIR:-} ]]; then
 	cp "$stub" "$OUTPUTDIR/${IMAGE_ID}_${IMAGE_VERSION}.systemd-stub"
 fi
+
+# The module filter of mkosi.conf (KernelModules=): mkosi 27 skips depmod after
+# deleting modules (it compares mtimes only), so modules.dep/modules.alias would
+# still name the removed drivers and udev would try them on matching hardware.
+# Then make sure no radio stack or nouveau is left: a new kernel can add a
+# module elsewhere that pulls one back in (as rtl8723bs and batman-adv did).
+for kdir in "$BUILDROOT"/usr/lib/modules/*/; do
+	[[ -d $kdir/kernel ]] || continue
+	kver=$(basename "$kdir")
+	mkosi-chroot depmod --all "$kver"
+	left=$(find "$kdir" -name '*.ko*' \( -name 'cfg80211.*' -o -name 'mac80211.*' -o -name 'bluetooth.*' -o -name 'nouveau.*' -o -path '*/drivers/net/wireless/*' \) -printf '%P\n')
+	[[ -z $left ]] || { echo "safespace: ERROR: excluded modules left in $kver (add their dependents to KernelModules= in mkosi.conf):" >&2; echo "$left" >&2; exit 1; }
+	find "$kdir" -mindepth 1 -type d -empty -delete
+done

@@ -244,6 +244,14 @@ echo groups=$(cat /usr/lib/safespace/groups)
 echo suid=$(sudo find / -xdev -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null | sort | sha256sum | cut -c1-16)
 echo caps=$(sudo getcap -r /usr 2>/dev/null | sort | sha256sum | cut -c1-16)
 echo enabled=$( (systemctl list-unit-files --state=enabled --no-legend; systemctl --global list-unit-files --state=enabled --no-legend) 2>/dev/null | awk "{ print \$1 }" | sort | sha256sum | cut -c1-16)
+# Smaller roots (mkosi.conf KernelModules=/FirmwareFiles=/RemoveFiles=, mkosi.postinst):
+# what must not be in any root, by name, or "ok".
+bad=""
+for p in /usr/lib/firmware/nvidia /usr/lib/firmware/intel/iwlwifi /usr/share/man /usr/share/doc /usr/include; do [ -e $p ] && bad="$bad,$p"; done
+find /usr/lib/modules -name "*.ko*" \( -name "cfg80211.*" -o -name "mac80211.*" -o -name "bluetooth.*" -o -name "nouveau.*" -o -path "*/drivers/net/wireless/*" \) | grep -q . && bad="$bad,modules"
+modprobe -n -q iwlwifi 2>/dev/null && bad="$bad,modules.dep"
+ls /usr/share/locale | grep -qvx -e en -e en_US -e locale.alias && bad="$bad,locale"
+echo slim=${bad:-ok}
 echo lockdown=$(sudo cat /sys/kernel/security/lockdown | sed -n "s/.*\[\(.*\)\].*/\1/p")
 echo secure_boot=$(bootctl status 2>/dev/null | sed -n "s/^ *Secure Boot: *//p" | head -1 | tr " " _)
 '
@@ -261,7 +269,7 @@ expect() {
 	if [[ -z $bad ]]; then result PASS "$name"; else result FAIL "$name" "$bad"; fi
 }
 
-COMMON=(root=/dev/mapper/root,erofs verity=verified state=running failed=0 lockdown=integrity)
+COMMON=(root=/dev/mapper/root,erofs verity=verified state=running failed=0 lockdown=integrity slim=ok)
 STICK=$RUN/stick.raw
 
 if wants stick || wants seal; then

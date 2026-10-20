@@ -13,6 +13,91 @@ T450s findings with usb/network aligned.
 
 ---
 
+# PLAN: tests/vm.sh boots in parallel
+
+## Goal
+
+Shorter integration runs: boot the VMs side by side instead of one after another, with
+the same checks. Today (run 20261020-0947): ~1 min per boot, 4 path steps + 2 seal boots +
+7 select boots ≈ 15 min after the build (the build itself, ~35 min, is untouched: its erofs
+compression already uses every core).
+
+## Steps
+
+- [ ] 1. `test-vm.sh`: work directory per VM (`--work DIR`, default `mkosi.test/` as now):
+      `vars.fd`, `sealed-vars.fd`, `serial.log`, `qga.sock`, `sig.p7`, `db.pem`, docroot,
+      stick copy. Today all of them are fixed paths in `mkosi.test/`, so two VMs overwrite
+      each other's firmware variables and logs.
+- [ ] 2. `tests/vm.sh`: one HTTP server for the share (the port is in the signed URL, so
+      there can only be one), net boots with `test-vm.sh --netboot --url`; one ssh port and
+      one work directory per VM; `vm_start`/`probe`/`vm_stop` take the VM's slot.
+- [ ] 3. Schedule (waves, at most `--jobs N` VMs, default from free RAM: a net boot holds
+      its root in RAM, up to ~3.5 GiB for remote-workstation; 15 GiB here → 3):
+      wave 1 `stick`, `net`, `net-sb`, `seal-setup` (independent: net-sb enrolls its keys
+      with virt-fw-vars); wave 2 `seal` (needs seal-setup's variables); then the select
+      sequence on that firmware, unchanged and sequential (default → set → once →
+      persistent → clear: it tests safespace-select and the once/persistent semantics);
+      in parallel to it, one VM per further combination on a copy of the sealed
+      variables with `SafespaceSelectOnce=<name>` preset by `virt-fw-vars --set-json`
+      (the initrd's selection is what is tested there; safespace-select is covered by
+      the sequence).
+- [ ] 4. Results stay in step order in the output; logs per VM as now.
+- [ ] 5. Docs (README "Integration test", AGENTS.md), `tests/run.sh`, full `tests/vm.sh`.
+
+Expected: ~15 → ~6 min after the build.
+
+## Open questions
+
+- Presetting `SafespaceSelectOnce` offline for the per-combination boots instead of
+  writing it with `safespace-select` from a running system: OK?
+
+---
+
+# PLAN: smaller roots (less data to network clients)
+
+## Goal
+
+Less data per network boot (and per stick, and RAM: a network client holds its root in
+tmpfs), without touching the security model. Decided: no Wi-Fi/Bluetooth, no NVIDIA,
+locales en_US only, no man pages/docs/headers. Baseline (test build 20261020-0855):
+root 856 MiB, containers 937, remotedesktop 1869, remote-workstation 1949, debug 860;
+firmware 437 MiB and modules 182 MiB (both already zstd) are 2/3 of `containers`.
+
+## Steps
+
+- [x] 1. A1/A2 `mkosi.conf`: `KernelModules=` all, minus Wi-Fi (`drivers/net/wireless`,
+      `net/wireless`, `net/mac80211`), Bluetooth (`drivers/bluetooth`, `net/bluetooth`),
+      NVIDIA (`nouveau`, `nova`). With a module filter mkosi keeps only the firmware the
+      remaining modules declare (plus microcode); `FirmwareFiles=-nvidia/` on top. Runs on
+      every build (after the cache), so no stale cache.
+- [x] 2. A3 `RemoveFiles=` `/usr/include`, `/usr/share/{doc,man,info,gtk-doc,groff}`
+      (also every build; `WithDocs=`/pacman `NoExtract` would be frozen in mkosi's cache,
+      whose manifest does not cover them). Locales: `mkosi.postinst` drops every
+      `/usr/share/locale/<lang>/` except `en`, `en_US` (`locale.alias` stays;
+      `/usr/share/i18n` stays for `locale-gen`).
+- [x] 3. Tests: `tests/vm.sh` probe `slim=` (no nvidia/Wi-Fi firmware, no wireless or
+      bluetooth modules, no man/doc/include, only en/en_US locales) expected in every boot;
+      `tests/run.sh` static check of the settings.
+- [x] 4. Docs: README (base group, build configuration table), SECURITY.md (no Wi-Fi /
+      Bluetooth stacks: smaller attack surface).
+- [x] 6. First vm.sh run: every boot ok, but `slim=modules`: rtl8723bs (staging) and
+      batman-adv pulled cfg80211 back in, and mkosi 27 skips depmod after the filter
+      (mtime check), leaving modules.dep/alias with the removed drivers. Fixed: both
+      excluded; `mkosi.finalize` reruns depmod and fails the build if a radio stack or
+      nouveau is left; the probe also checks modules.dep (`modprobe -n iwlwifi`).
+- [x] 5. `tests/run.sh` 166 passed, 1 skipped (initrd: no build in mkosi.output/);
+      `tests/vm.sh` all 13 PASS (run 20261020-1250, `slim=ok` in every boot). Roots:
+      root 856 → 394 MiB, containers 937 → 475, remotedesktop 1869 → 1217,
+      remote-workstation 1949 → 1298, debug 860 → 398 (5.4 → 3.7 GiB together);
+      firmware 437 → 73 MiB (amdgpu, radeon, i915, xe, rtl_nic, … stay).
+
+## Open questions
+
+- Firmware a module loads without declaring it (rare) would be gone; real hardware
+  (`hwtest-image.sh` / a T450s boot) is up to the user.
+
+---
+
 # PLAN: Docker off by default, QEMU guest agent, cleanup
 
 ## Goal

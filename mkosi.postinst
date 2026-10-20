@@ -130,5 +130,12 @@ if has_group docker; then
 	printf 'LABEL=safespace-docker\t/opt/docker\tauto\tnofail,noatime,x-systemd.device-timeout=10s\t0 2\n' >>"$BUILDROOT/etc/fstab"
 fi
 
+# --- locales: en_US only (Locale= in mkosi.conf) -----------------------------------
+# Translations are downloaded with every network boot. en_US is the untranslated
+# original; gettext falls back from en_US to en. locale.alias (a file) stays, and
+# /usr/share/i18n stays for locale-gen. (Here, not as pacman NoExtract: mkosi's
+# cache would keep a tree installed before the setting changed.)
+find "$BUILDROOT/usr/share/locale" -mindepth 1 -maxdepth 1 -type d ! -name en ! -name en_US -exec rm -rf -- {} +
+
 # Mount points in the read-only root (see /etc/fstab).
 install -d "$BUILDROOT/efi" "$BUILDROOT/var"
