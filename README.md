@@ -579,6 +579,7 @@ build or server. Exit 0 only if every step passed.
 ```sh
 tests/vm.sh                          # build the whole stack, release, all steps
 tests/vm.sh --no-build stick net     # the last test build, two steps only
+tests/vm.sh --no-build --jobs 2      # at most two VMs at a time
 ```
 
 | Step | What | Checked |
@@ -588,7 +589,7 @@ tests/vm.sh --no-build stick net     # the last test build, two steps only
 | `net` | UEFI HTTP boot of the share | `netroot` opened the root, no `usb-bootdev`, no `LoaderDevicePartUUID`, `verified`, `running` |
 | `seal` | Setup Mode → `safespace-seal` → the sealed firmware | Secure Boot `enabled (user)`, `verified`, `running` |
 | `net-sb` | network boot with enforced Secure Boot | Secure Boot enabled, `verified`, `running` |
-| `select` | on the sealed firmware, every combination once: no selection, `safespace-select set <second>`, `once <first>`, the second again (persistent), then `once` for each further one, `clear` | the booted combination's name and groups (`/usr/lib/safespace/groups`; the docker command exactly with the docker group); `debug` has exactly the default's setuid/setgid files, file capabilities and enabled units; each Secure Boot enabled and `verified` |
+| `select` | on the sealed firmware, one VM, one boot after the other: no selection, `safespace-select set <second>`, `once <first>`, the second again (persistent), `clear`, the first again. Side by side, every further combination in a VM of its own: `SafespaceSelectOnce=<name>` written into a copy of the sealed variables (`virt-fw-vars`) | the booted combination's name and groups (`/usr/lib/safespace/groups`; the docker command exactly with the docker group); a preset `SafespaceSelectOnce` deleted by the initrd; `debug` has exactly the default's setuid/setgid files, file capabilities and enabled units; each Secure Boot enabled and `verified` |
 
 **Kept apart from everything real**, in `mkosi.test/vm/` (gitignored): the test user
 `tester` and its key (created on the first run, used for nothing else), the test builds
@@ -596,7 +597,14 @@ tests/vm.sh --no-build stick net     # the last test build, two steps only
 kept; `./build.sh list` and `./release.sh` never see them, so a build with the test key
 cannot reach a real server by accident), and one directory per run with the share and the
 logs. The test build loads its root from `http://10.0.2.2:8790/` (QEMU's view of the build
-host), where `test-vm.sh --netboot` serves the share.
+host), where one HTTP server serves the share to every network boot.
+
+**Boots side by side:** `stick`, `net`, `net-sb` and `seal` start together, `select` once
+`seal` has sealed the firmware; at most `--jobs N` VMs at a time (default: as many as the
+available RAM allows for a network boot of the largest root, i.e. root + 2.5 GiB each, at
+most 4). Each step's VMs have their own files (`test-vm.sh --work`: firmware variables,
+serial log, guest-agent socket) in `run-<time>/w/<step>/`; the report lists the results in
+step order.
 
 **Prerequisites**, all checked before anything starts (the script lists what is missing and
 exits with 2):
@@ -604,7 +612,8 @@ exits with 2):
 - `qemu-desktop`, `edk2-ovmf`, `virt-firmware`, `openssh`, `curl`, `rsync`, `binutils`,
   `sbsigntools`, `cryptsetup`, `dosfstools`, `mtools`, `util-linux`, `python`; read/write
   access to `/dev/kvm`
-- the public keys of a real build (`build.sh` writes them on every build)
+- with `--no-build` / `--build`: the public keys the test build was signed with (every
+  build exports them)
 - `sudo` for `build.sh` (not with `--no-build`): asked once at the start, or for unattended
   runs (cron, CI) a rule without password:
   ```
@@ -612,7 +621,8 @@ exits with 2):
   ```
   ⚠️ That is root for whoever can write the checkout: `build.sh` runs the repository's
   scripts as root. Only on a build host where that is acceptable.
-- TCP port 8790 free on `127.0.0.1`, 4 GiB RAM available, 6 GiB free in `mkosi.test/`
+- TCP port 8790 free on `127.0.0.1`, 4 GiB RAM available (enough for one VM at a time),
+  6 GiB + 4 GiB per combination free in `mkosi.test/`
 
 Logs: `mkosi.test/vm/run-<time>/` (the build and release logs, the server check, each boot's
 `test-vm.sh` output and serial log, what the checks saw). Not covered: real hardware, the
@@ -1039,7 +1049,7 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 | `lib/` | shared shell helpers: `repos.sh` (package source), `groups.sh` (package groups), `keys.sh` (Secure Boot keys: which set, export into the image, PCR signing key), `builds.sh` (the builds in `mkosi.output/`: their parts, list, show, diff, prune), `stick.sh` (a usb stick assembled from the parts: `burn.sh`, `test-vm.sh`), `verify.sh` (release checks, used by `release.sh` and the servers) |
 | `SECURITY.md` | the hardening of the standard installation, each measure with where it is configured |
 | `NETBOOT.md` | network boot in depth: trust model, what the clients need, DHCP for other servers, Secure Boot enrollment, QEMU test, old firmware, troubleshooting |
-| `test-vm.sh` | optional rehearsal in QEMU: boot an image as a USB stick, or `--netboot` a released network build (DHCP + HTTP boot, no disk), optionally with enforced Secure Boot, in Setup Mode or sealed |
+| `test-vm.sh` | optional rehearsal in QEMU: boot an image as a USB stick, or `--netboot` a released network build (DHCP + HTTP boot, no disk), optionally with enforced Secure Boot, in Setup Mode or sealed; `--work DIR` keeps a VM's files apart (several at once, `tests/vm.sh`) |
 | `hwtest-image.sh` | diagnostic stick for machines that reset/hang on the real stick: systemd-boot menu that starts the UKI layer by layer (see the script header) |
 | `tests/` | `run.sh`: the test suite without root (fixtures with throwaway keys in `tests/lib/`), run it after every change; `vm.sh`: the integration test (build, release, boots in QEMU, checks over ssh) |
 | `AGENTS.md` | how to work on this repository: map, invariants, conventions, what needs root or hardware |

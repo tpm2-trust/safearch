@@ -6,12 +6,14 @@
 # unattended; no LLM, no window, no access to real users, keys or servers.
 # Exit 0 only if every step passed.
 #
-#   tests/vm.sh [--no-build | --build BUILD] [STEP...]
+#   tests/vm.sh [--no-build | --build BUILD] [--jobs N] [STEP...]
 #
 #   (default)       build and test the whole stack: every combination of
 #                   combinations.conf, as build.sh builds it
 #   --no-build      test the newest existing test build
 #   --build BUILD   test this existing test build (mkosi.test/vm/builds/)
+#   --jobs N        at most N VMs at a time (default: what the free RAM allows
+#                   for network boots of the largest root, at most 4)
 #   STEP            stick net seal net-sb select (default: all; select needs
 #                   seal and runs it first)
 #
@@ -22,9 +24,11 @@
 #                            newest is kept. ./build.sh list and
 #                            ./release.sh never see them: a test build has the
 #                            test key and must never reach a real server.
-#   run-<time>/              one run: share/ (the release), logs
+#   run-<time>/              one run: share/ (the release), logs, w/<step>/
+#                            (the step's VM files: test-vm.sh --work)
 # The test build loads its root from http://10.0.2.2:PORT/ (QEMU's view of
-# this host); test-vm.sh --netboot serves the share there.
+# this host); one HTTP server serves the share there for every network boot.
+# The steps run side by side (--jobs); select waits for seal.
 #
 # Steps (each boot headless, checked over ssh as tester, then powered off):
 #   (always) release.sh into run-<time>/share, then server/safespace-netboot
@@ -40,11 +44,14 @@
 #           Secure Boot enabled (user), verified, running
 #   net-sb  network boot with enforced Secure Boot: enabled, verified, running
 #   select  on the sealed firmware of seal, every combination of the build
-#           booted once, each checked for its name and its package groups
+#           booted, each checked for its name and its package groups
 #           (/usr/lib/safespace/groups, the docker command exactly with the
-#           docker group): the first without a selection; safespace-select
-#           set SECOND -> SECOND; once FIRST -> FIRST for one boot; SECOND
-#           again (persistent); then once for each further combination; clear.
+#           docker group). One VM, one boot after the other, safespace-select:
+#           no selection -> FIRST; set SECOND -> SECOND; once FIRST -> FIRST for
+#           one boot; SECOND again (persistent); clear -> FIRST. Side by side,
+#           every further combination in a VM of its own, its
+#           SafespaceSelectOnce written into a copy of the sealed variables
+#           (virt-fw-vars): that root opened, the variable deleted.
 #           A combination that is the first plus the group debug must have the
 #           first one's setuid/setgid files, file capabilities and enabled
 #           units (debug adds packages, nothing else). Every boot with Secure
@@ -61,7 +68,8 @@
 #     with (mkosi.extra/usr/share/safespace/secureboot/db.pem: every build,
 #     the test build too, exports them)
 #   - TCP port 8790 free on 127.0.0.1 (the test's HTTP server)
-#   - 4 GiB RAM available, 6 GiB + 4 GiB per combination free in mkosi.test/
+#   - 4 GiB RAM available (more boots side by side with more), 6 GiB + 4 GiB
+#     per combination free in mkosi.test/
 set -Euo pipefail
 
 REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
@@ -70,16 +78,18 @@ log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,${/^#/!q;s/^# \?//;p}' "$0"; }
 
-BUILD_MODE=build BUILD="" STEPS=()
+BUILD_MODE=build BUILD="" STEPS=() JOBS=""
 while (($#)); do
 	case $1 in
 		--no-build) BUILD_MODE=existing; shift ;;
 		--build) BUILD_MODE=given; BUILD=${2:?--build needs a build}; shift 2 ;;
+		--jobs) JOBS=${2:?--jobs needs a number}; shift 2 ;;
 		-h | --help) usage; exit 0 ;;
 		stick | net | seal | net-sb | select) STEPS+=("$1"); shift ;;
 		*) usage >&2; die "unknown argument $1" ;;
 	esac
 done
+[[ -z $JOBS || $JOBS =~ ^[1-9]$ ]] || die "--jobs needs a number from 1 to 9, got '$JOBS'"
 ((${#STEPS[@]})) || STEPS=(stick net seal net-sb select)
 wants() { [[ " ${STEPS[*]} " == *" $1 "* ]]; }
 # select boots the firmware seal sealed
@@ -142,10 +152,14 @@ fi
 log "prerequisites ok (steps: ${STEPS[*]})"
 
 RUN=$REPO/$VM/run-$(date +%Y%m%d-%H%M%S)
-mkdir -p "$RUN/share" "$RUN/state"
+mkdir -p "$RUN/share" "$RUN/state" "$RUN/results"
 LOGS=$RUN
-RESULTS=()
-result() { RESULTS+=("$1 $2${3:+  ($3)}"); printf '  \e[%sm%s\e[0m %s%s\n' "$([[ $1 == PASS ]] && echo 32 || echo 31)" "$1" "$2" "${3:+  ($3)}"; }
+# result PASS|FAIL NAME [REASON]: shown at once, kept in results/$KEY for the report
+KEY=00
+result() {
+	printf '%s %s%s\n' "$1" "$2" "${3:+  ($3)}" >>"$RUN/results/$KEY"
+	printf '  \e[%sm%s\e[0m %s%s\n' "$([[ $1 == PASS ]] && echo 32 || echo 31)" "$1" "$2" "${3:+  ($3)}"
+}
 
 # --- build, release, server check ------------------------------------------------------------
 
@@ -170,19 +184,27 @@ mapfile -t COMBOS < <(builds_info "$DIR" combinations | tr ',' '\n')
 log "build $BUILD: ${COMBOS[*]}"
 
 log "release into ${RUN#"$REPO"/}/share"
+KEY=01-release
 "$REPO/release.sh" --builds "$BUILDS_ROOT" --build "$BUILD" --stage "$RUN/stage" --push "$RUN/share" \
 	>"$LOGS/release.log" 2>&1 && result PASS release || { result FAIL release "see ${LOGS#"$REPO"/}/release.log"; }
 printf 'SHARE=%s\nSTATE=%s\nDB_CERT=%s\nSERVER_URL=http://10.0.2.2:%s\nDHCP_MODE=off\n' \
 	"$RUN/share" "$RUN/state" "$DB" "$PORT_HTTP" >"$RUN/server.conf"
 chmod 0644 "$RUN/server.conf"
+KEY=02-server-verify
 SAFESPACE_SERVER_CONF=$RUN/server.conf "$REPO/server/safespace-netboot" verify >"$LOGS/server-verify.log" 2>&1 &&
 	result PASS server-verify || result FAIL server-verify "see ${LOGS#"$REPO"/}/server-verify.log"
 
 # --- booting -------------------------------------------------------------------------------
+# The boots run side by side, at most $JOBS VMs at a time. Each step has its own work
+# directory for its VMs (firmware variables, serial log, qga socket: test-vm.sh --work), its
+# own ssh port and log files; one HTTP server serves the share to every network boot (its
+# port is in the signed URL). Each step writes its results to results/<key>; the report
+# lists them in key order, whatever order the steps finished in.
 
 SSH=(ssh -i "$REPO/$VM/id_ed25519" -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=no
 	-o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=error -o ConnectTimeout=5)
-VM_PID="" PORT=""
+SELECT_GUID=8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34
+VM_PID="" PORT="" WORK=""
 free_port() { python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
 vm_ssh() { "${SSH[@]}" -p "$PORT" tester@127.0.0.1 "$@"; }
 vm_kill() {
@@ -192,18 +214,28 @@ vm_kill() {
 	kill -9 -- "-$VM_PID" 2>/dev/null
 	VM_PID=""
 }
-trap vm_kill EXIT
+# On any exit of the test: every step, every VM (by process group), the HTTP server.
+HTTP_PID=""
+: >"$RUN/vm.pids"
+cleanup() {
+	local p
+	jobs -p | xargs -r kill 2>/dev/null
+	while read -r p; do kill -9 -- "-$p" 2>/dev/null; done <"$RUN/vm.pids"
+	[[ -z $HTTP_PID ]] || kill "$HTTP_PID" 2>/dev/null
+}
+trap cleanup EXIT
 
 # vm_start NAME TEST-VM-ARGS...: boot, wait for ssh and a finished start-up.
-# Runs in this shell (never in $(...): VM_PID and PORT must reach vm_stop);
+# Runs in the step's shell (never in $(...): VM_PID and PORT must reach vm_stop);
 # on failure the reason is in ERR.
 ERR=""
 vm_start() {
 	local name=$1; shift
 	ERR=""
 	PORT=$(free_port)
-	QEMU_EXTRA='-display none' setsid "$REPO/test-vm.sh" "$@" --ssh "$PORT" >"$LOGS/$name.log" 2>&1 &
+	QEMU_EXTRA='-display none' setsid "$REPO/test-vm.sh" "$@" --work "$WORK" --ssh "$PORT" >"$LOGS/$name.log" 2>&1 &
 	VM_PID=$!
+	echo "$VM_PID" >>"$RUN/vm.pids"
 	for _ in $(seq 150); do
 		vm_ssh true 2>/dev/null && break
 		kill -0 "$VM_PID" 2>/dev/null || { ERR="QEMU exited (see ${LOGS#"$REPO"/}/$name.log)"; return 1; }
@@ -216,7 +248,7 @@ vm_start() {
 vm_stop() { # NAME: power off, then make sure QEMU is gone
 	vm_ssh 'sudo systemctl poweroff' >/dev/null 2>&1 || true
 	for _ in $(seq 60); do kill -0 "$VM_PID" 2>/dev/null || break; sleep 1; done
-	cp -f "$REPO/mkosi.test/serial.log" "$LOGS/$1.serial.log" 2>/dev/null || true
+	cp -f "$WORK/serial.log" "$LOGS/$1.serial.log" 2>/dev/null || true
 	vm_kill
 }
 
@@ -256,7 +288,7 @@ echo lockdown=$(sudo cat /sys/kernel/security/lockdown | sed -n "s/.*\[\(.*\)\].
 echo secure_boot=$(bootctl status 2>/dev/null | sed -n "s/^ *Secure Boot: *//p" | head -1 | tr " " _)
 '
 probe() { vm_ssh "$PROBE" >"$LOGS/$1.probe" 2>&1; }
-val() { sed -n "s/^$2=//p" "$LOGS/$1.probe" | head -1; }
+val() { sed -n "s/^$2=//p" "$LOGS/$1.probe" 2>/dev/null | head -1; }
 
 # expect NAME KEY=VALUE...: every key has the value (VALUE* = starts with)
 expect() {
@@ -266,20 +298,14 @@ expect() {
 		if [[ $v == *'*' ]]; then [[ $got == "${v%\*}"* ]] || bad+="$k=$got (want $v) "
 		else [[ $got == "$v" ]] || bad+="$k=$got (want $v) "; fi
 	done
-	if [[ -z $bad ]]; then result PASS "$name"; else result FAIL "$name" "$bad"; fi
+	if [[ -z $bad ]]; then result PASS "$name"; else result FAIL "$name" "$bad"; return 1; fi
 }
 
 COMMON=(root=/dev/mapper/root,erofs verity=verified state=running failed=0 lockdown=integrity slim=ok)
+SEALED=(secure_boot=enabled* path_var=set usb_bootdev=1 "${COMMON[@]}")
 STICK=$RUN/stick.raw
 
-if wants stick || wants seal; then
-	log "assembling the stick image"
-	(source "$REPO/lib/stick.sh"; stick_write "$STICK" "$RUN/share") >"$LOGS/stick-image.log" 2>&1 ||
-		die "could not assemble the stick image (see ${LOGS#"$REPO"/}/stick-image.log)"
-fi
-
-if wants stick; then
-	log "step stick: boot from a USB stick"
+step_stick() {
 	if vm_start stick "$STICK"; then
 		probe stick
 		expect stick path_var=set usb_bootdev=1 netroot=0 stick_ro=1 "${COMMON[@]}"
@@ -287,99 +313,179 @@ if wants stick; then
 		result FAIL stick "$ERR"
 	fi
 	vm_stop stick
-fi
+}
 
-if wants net; then
-	log "step net: UEFI HTTP boot of the share"
-	if vm_start net --netboot --tree "$RUN/share"; then
+step_net() {
+	if vm_start net --netboot --tree "$RUN/share" --no-server; then
 		probe net
 		expect net path_var=unset usb_bootdev=0 netroot=1 "${COMMON[@]}"
 	else
 		result FAIL net "$ERR"
 	fi
 	vm_stop net
-fi
+}
 
-if wants seal; then
-	log "step seal: Setup Mode, safespace-seal, boot sealed"
-	if vm_start seal-setup "$STICK" --setup-mode; then
-		probe seal-setup
-		vm_ssh 'echo YES | sudo safespace-seal' >"$LOGS/seal.log" 2>&1
-		if [[ $(val seal-setup secure_boot) == *setup* ]] && grep -q "Sealed." "$LOGS/seal.log"; then
-			vm_stop seal-setup
-			if vm_start seal "$STICK" --sealed; then
-				probe seal
-				expect seal secure_boot=enabled* path_var=set usb_bootdev=1 "${COMMON[@]}"
-			else
-				result FAIL seal "$ERR"
-			fi
-			vm_stop seal
-		else
-			result FAIL seal "not in Setup Mode or safespace-seal failed (see ${LOGS#"$REPO"/}/seal.log)"
-			vm_stop seal-setup
-		fi
-	else
-		result FAIL seal "$ERR"
-		vm_stop seal-setup
-	fi
-fi
-
-if wants net-sb; then
-	log "step net-sb: UEFI HTTP boot with enforced Secure Boot"
-	if vm_start net-sb --netboot --tree "$RUN/share" --secure-boot; then
+step_net_sb() {
+	if vm_start net-sb --netboot --tree "$RUN/share" --no-server --secure-boot; then
 		probe net-sb
 		expect net-sb secure_boot=enabled* path_var=unset netroot=1 "${COMMON[@]}"
 	else
 		result FAIL net-sb "$ERR"
 	fi
 	vm_stop net-sb
+}
+
+# Setup Mode, safespace-seal, boot sealed. The sealed variables go to
+# $RUN/sealed-vars.fd only if all of it passed: the select steps start from them.
+step_seal() {
+	if ! vm_start seal-setup "$STICK" --setup-mode; then
+		result FAIL seal "$ERR"
+		vm_stop seal-setup
+		return
+	fi
+	probe seal-setup
+	vm_ssh 'echo YES | sudo safespace-seal' >"$LOGS/seal.log" 2>&1
+	if [[ $(val seal-setup secure_boot) != *setup* ]] || ! grep -q "Sealed." "$LOGS/seal.log"; then
+		result FAIL seal "not in Setup Mode or safespace-seal failed (see ${LOGS#"$REPO"/}/seal.log)"
+		vm_stop seal-setup
+		return
+	fi
+	vm_stop seal-setup
+	if vm_start seal "$STICK" --sealed; then
+		probe seal
+		expect seal "${SEALED[@]}" && cp "$WORK/sealed-vars.fd" "$RUN/sealed-vars.fd"
+	else
+		result FAIL seal "$ERR"
+	fi
+	vm_stop seal
+}
+
+# What a combination must look like from inside: its name, its groups,
+# the docker command exactly with the docker group.
+looks() { # "name:group+group"
+	local n=${1%%:*} g=${1#*:} d=no
+	[[ +$g+ == *+docker+* ]] && d=yes
+	echo "combination=$n" "groups=${g//+/,}" "docker=$d"
+}
+# sel_boot NAME COMBO COMMAND-AFTER: boot the stick on the step's sealed
+# variables, check, run a command, power off
+sel_boot() {
+	local name=$1 combo=$2 cmd=$3 want
+	read -ra want <<<"$(looks "$combo")"
+	if vm_start "$name" "$STICK" --sealed; then
+		probe "$name"
+		expect "$name" "${want[@]}" "${SEALED[@]}"
+		vm_ssh "$cmd" >"$LOGS/$name.select.log" 2>&1 || result FAIL "$name" "'$cmd' failed (see ${LOGS#"$REPO"/}/$name.select.log)"
+	else
+		result FAIL "$name" "$ERR"
+	fi
+	vm_stop "$name"
+}
+
+# safespace-select on one firmware, one boot after the other: no selection ->
+# the first; set SECOND -> SECOND; once FIRST -> FIRST for one boot; SECOND
+# again (persistent); clear -> the first again.
+step_select() {
+	local first=${COMBOS[0]%%:*} second
+	cp "$RUN/sealed-vars.fd" "$WORK/sealed-vars.fd"
+	if ((${#COMBOS[@]} < 2)); then
+		sel_boot select-default "${COMBOS[0]}" 'sudo safespace-select list'
+		return
+	fi
+	second=${COMBOS[1]%%:*}
+	sel_boot select-default "${COMBOS[0]}" "sudo safespace-select list && sudo safespace-select set $second"
+	sel_boot "select-$second" "${COMBOS[1]}" "sudo safespace-select list && sudo safespace-select once $first"
+	sel_boot select-once "${COMBOS[0]}" 'sudo safespace-select list'
+	sel_boot select-persistent "${COMBOS[1]}" 'sudo safespace-select clear'
+	sel_boot select-cleared "${COMBOS[0]}" 'sudo safespace-select list'
+}
+
+# Every further combination in a VM of its own, on a copy of the sealed
+# variables with SafespaceSelectOnce=<name> written offline (safespace-select
+# itself is step_select's): the initrd must open that root and delete the
+# variable.
+step_select_once() { # INDEX
+	local combo=${COMBOS[$1]} n=${COMBOS[$1]%%:*}
+	printf '{"version":2,"variables":[{"name":"SafespaceSelectOnce","guid":"%s","attr":7,"data":"%s"}]}\n' \
+		"$SELECT_GUID" "$(printf %s "$n" | od -An -tx1 | tr -d ' \n')" >"$WORK/select-once.json"
+	if ! virt-fw-vars -i "$RUN/sealed-vars.fd" -o "$WORK/sealed-vars.fd" --set-json "$WORK/select-once.json" >"$LOGS/select-$n.vars.log" 2>&1; then
+		result FAIL "select-$n" "could not write SafespaceSelectOnce (see ${LOGS#"$REPO"/}/select-$n.vars.log)"
+		return
+	fi
+	sel_boot "select-$n" "$combo" "! test -e /sys/firmware/efi/efivars/SafespaceSelectOnce-$SELECT_GUID"
+}
+
+# job KEY FUNCTION ARGS...: run a step in the background, at most $JOBS at a time.
+# KEY orders the report and names the step's work directory (short: qga.sock is a
+# unix socket).
+JOB_PID=""
+job() {
+	local key=$1; shift
+	while (($(jobs -rp | wc -l) >= JOBS)); do wait -n; done
+	(
+		KEY=$key WORK=$RUN/w/${key%%-*}
+		mkdir -p "$WORK"
+		trap vm_kill EXIT
+		"$@"
+	) &
+	JOB_PID=$!
+}
+
+if wants stick || wants seal; then
+	log "assembling the stick image"
+	(source "$REPO/lib/stick.sh"; stick_write "$STICK" "$RUN/share") >"$LOGS/stick-image.log" 2>&1 ||
+		die "could not assemble the stick image (see ${LOGS#"$REPO"/}/stick-image.log)"
+fi
+if wants net || wants net-sb; then
+	python3 -m http.server "$PORT_HTTP" --bind 127.0.0.1 --directory "$RUN/share" >"$LOGS/http.log" 2>&1 &
+	HTTP_PID=$!
+	disown "$HTTP_PID"
+	for _ in $(seq 30); do curl -fsS -o /dev/null "http://127.0.0.1:$PORT_HTTP/boot.efi" 2>/dev/null && break; sleep 0.3; done
 fi
 
+# How many VMs at once: a network boot holds its root in RAM (test-vm.sh: largest
+# root + 2 GiB), each VM has 2 CPUs; at most 4.
+if [[ -z $JOBS ]]; then
+	root_mib=$(($(stat -c %s "$DIR"/root-*.img | sort -n | tail -1) / 1048576))
+	avail_mib=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
+	JOBS=$((avail_mib / (root_mib + 2560)))
+	((JOBS > $(nproc) / 2)) && JOBS=$(($(nproc) / 2))
+	((JOBS > 4)) && JOBS=4
+	((JOBS < 1)) && JOBS=1
+fi
+log "booting, up to $JOBS VMs at a time (logs: ${RUN#"$REPO"/})"
+
+# seal first: the select steps wait for it.
+wants seal && { job 12-seal step_seal; SEAL_PID=$JOB_PID; }
+wants stick && job 10-stick step_stick
+wants net && job 11-net step_net
+wants net-sb && job 13-net-sb step_net_sb
 if wants select; then
-	log "step select: every combination on the sealed firmware"
-	SEALED=(secure_boot=enabled* path_var=set usb_bootdev=1 "${COMMON[@]}")
-	# What a combination must look like from inside: its name, its groups,
-	# the docker command exactly with the docker group.
-	looks() { # "name:group+group"
-		local n=${1%%:*} g=${1#*:} d=no
-		[[ +$g+ == *+docker+* ]] && d=yes
-		echo "combination=$n" "groups=${g//+/,}" "docker=$d"
-	}
-	# sel_boot NAME COMBO COMMAND-AFTER: boot sealed, check, run a command, power off
-	sel_boot() {
-		local name=$1 combo=$2 cmd=$3 want k
-		read -ra want <<<"$(looks "$combo")"
-		if [[ ${combo#*:} == "${COMBOS[0]#*:}+debug" ]]; then
-			for k in suid caps enabled; do want+=("$k=$(val select-default "$k")"); done
-		fi
-		if vm_start "$name" "$STICK" --sealed; then
-			probe "$name"
-			expect "$name" "${want[@]}" "${SEALED[@]}"
-			vm_ssh "$cmd" >>"$LOGS/select.log" 2>&1 || result FAIL "$name" "'$cmd' failed (see ${LOGS#"$REPO"/}/select.log)"
-		else
-			result FAIL "$name" "$ERR"
-		fi
-		vm_stop "$name"
-	}
-	if [[ ! -f $REPO/mkosi.test/sealed-vars.fd ]]; then
-		result FAIL select "no sealed firmware variables (the step seal failed?)"
-	elif ((${#COMBOS[@]} < 2)); then
-		sel_boot select-default "${COMBOS[0]}" 'sudo safespace-select list'
+	wait "$SEAL_PID" 2>/dev/null
+	if [[ ! -f $RUN/sealed-vars.fd ]]; then
+		KEY=20-select result FAIL select "no sealed firmware variables (the step seal failed)"
 	else
-		first=${COMBOS[0]%%:*} second=${COMBOS[1]%%:*}
-		sel_boot select-default "${COMBOS[0]}" "sudo safespace-select list && sudo safespace-select set $second"
-		sel_boot "select-$second" "${COMBOS[1]}" "sudo safespace-select list && sudo safespace-select once $first"
-		sel_boot select-once "${COMBOS[0]}" 'sudo safespace-select list'
-		# Every further combination once, from the boot before it; the last clears.
-		next=clear
-		((${#COMBOS[@]} > 2)) && next="once ${COMBOS[2]%%:*}"
-		sel_boot select-persistent "${COMBOS[1]}" "sudo safespace-select $next"
+		job 20-select step_select
 		for ((i = 2; i < ${#COMBOS[@]}; i++)); do
-			next=clear
-			((i + 1 < ${#COMBOS[@]})) && next="once ${COMBOS[i + 1]%%:*}"
-			sel_boot "select-${COMBOS[i]%%:*}" "${COMBOS[i]}" "sudo safespace-select list && sudo safespace-select $next"
+			job "$((19 + i))-select-${COMBOS[i]%%:*}" step_select_once "$i"
 		done
 	fi
+fi
+wait
+
+# debug adds packages, nothing else: a combination that is the first plus debug
+# must have the first one's setuid/setgid files, file capabilities and enabled units.
+if wants select; then
+	KEY=90-debug
+	for c in "${COMBOS[@]:1}"; do
+		[[ ${c#*:} == "${COMBOS[0]#*:}+debug" ]] || continue
+		n=select-${c%%:*} bad=""
+		for k in suid caps enabled; do
+			[[ -n $(val select-default "$k") && $(val "$n" "$k") == "$(val select-default "$k")" ]] ||
+				bad+="$k=$(val "$n" "$k") (want $(val select-default "$k")) "
+		done
+		if [[ -z $bad ]]; then result PASS "$n-surface"; else result FAIL "$n-surface" "$bad"; fi
+	done
 fi
 
 # --- report --------------------------------------------------------------------------------
@@ -387,7 +493,6 @@ fi
 # The stick image is large and can be assembled again; the logs stay.
 rm -f "$STICK"
 printf '\n\e[1mbuild %s\e[0m\n' "$BUILD"
-printf '  %s\n' "${RESULTS[@]}"
+cat "$RUN/results"/* | sed 's/^/  /'
 printf 'logs: %s\n' "${RUN#"$REPO"/}"
-for r in "${RESULTS[@]}"; do [[ $r == PASS* ]] || exit 1; done
-exit 0
+! grep -qv '^PASS' "$RUN/results"/*

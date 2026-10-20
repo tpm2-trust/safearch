@@ -3,11 +3,11 @@
 # hardware), with OVMF. The stick image is assembled from the build's parts
 # (lib/stick.sh, as burn.sh writes a stick) and opened with snapshot=on.
 #
-#   ./test-vm.sh [SOURCE] [--secure-boot | --setup-mode | --sealed] [--ssh PORT]
+#   ./test-vm.sh [SOURCE] [--secure-boot | --setup-mode | --sealed] [--ssh PORT] [--work DIR]
 #     SOURCE: a build (./build.sh list), a directory with the parts, or a
 #     stick image file (.raw); default: the newest build
-#   ./test-vm.sh --netboot [--tree DIR] [--tftp] [--secure-boot | ...] [--ssh PORT]
-#   ./test-vm.sh --netboot --url BOOT_URL [--secure-boot | ...] [--ssh PORT]
+#   ./test-vm.sh --netboot [--tree DIR] [--no-server] [--tftp] [--secure-boot | ...] [--ssh PORT] [--work DIR]
+#   ./test-vm.sh --netboot --url BOOT_URL [--secure-boot | ...] [--ssh PORT] [--work DIR]
 #
 # --netboot: a local netboot lab, no disk at all -- a rehearsal of the real
 #   thing on this host. A real machine needs none of this: it is told to boot
@@ -24,12 +24,14 @@
 #     sudo ./build.sh --url http://10.0.2.2:8000/ \
 #          --kernel-command-line console=ttyS0,115200
 #   (the console= part is optional and only makes the kernel and the netroot
-#   messages show up in mkosi.test/serial.log, where this script looks for
+#   messages show up in serial.log in the work directory, where this script looks for
 #   them afterwards).
 # --tftp: hand the UKI over QEMU's built-in TFTP server instead of HTTP, for
 #   firmware without UEFI HTTP boot. The root image still comes over HTTP.
 # --tree DIR: the release to serve (a directory with boot.efi and the
 #   root-<name>.img/.verity files, e.g. a distribution server's share).
+# --no-server: the tree is served at the signed URL already (tests/vm.sh runs
+#   one server for VMs booting side by side: the port is in the signed URL).
 # --url BOOT_URL: no local server; UEFI HTTP boot of a published UKI from a
 #   distribution server, e.g. http://10.0.0.1/safespace/boot.efi.
 #   The VM reaches it through QEMU's NAT and resolves names with the host's
@@ -41,10 +43,14 @@
 #   virt-fw-vars (pacman -S virt-firmware).
 # --setup-mode: Secure Boot firmware with no keys (Setup Mode), as after
 #   "Reset to Setup Mode". Run safespace-seal inside; the firmware variables
-#   are kept in mkosi.test/sealed-vars.fd.
-# --sealed: boot again with mkosi.test/sealed-vars.fd (after safespace-seal).
+#   are kept in sealed-vars.fd in the work directory.
+# --sealed: boot again with sealed-vars.fd of the work directory (after safespace-seal).
 # --ssh PORT: forward localhost:PORT to the VM's sshd.
-# Guest agent: the VM gets the qemu-ga channel, its socket is mkosi.test/qga.sock
+# --work DIR: the VM's files (firmware variables, serial.log, qga.sock, the
+#   stick image, the netboot docroot); default mkosi.test/. One per VM when
+#   several run at once (tests/vm.sh). Keep the path short: qga.sock is a unix
+#   socket (at most 107 bytes).
+# Guest agent: the VM gets the qemu-ga channel, its socket is qga.sock in the work directory
 #   (echo '{"execute":"guest-network-get-interfaces"}' | socat - UNIX-CONNECT:mkosi.test/qga.sock).
 # Console: the QEMU window. A reset ends QEMU (-no-reboot) instead of looping.
 # No root needed (user must be able to open /dev/kvm).
@@ -55,7 +61,7 @@ HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 
-IMAGE="" SB=0 SETUP=0 SEALED=0 SSH_PORT="" NETBOOT=0 TREE="" NBMODE=http BOOT_URL=""
+IMAGE="" SB=0 SETUP=0 SEALED=0 SSH_PORT="" NETBOOT=0 TREE="" NBMODE=http BOOT_URL="" SERVE=1 WORK=""
 while (($#)); do
 	case $1 in
 		--netboot) NETBOOT=1; shift ;;
@@ -66,6 +72,8 @@ while (($#)); do
 		--setup-mode) SETUP=1; shift ;;
 		--sealed) SEALED=1; shift ;;
 		--ssh) SSH_PORT=${2:?--ssh needs a port}; shift 2 ;;
+		--no-server) SERVE=0; shift ;;
+		--work) WORK=${2:?--work needs a directory}; shift 2 ;;
 		-h|--help) sed -n '2,${/^#/!q;s/^# \?//;p}' "$0"; exit 0 ;;
 		-*) die "unknown option $1" ;;
 		*) IMAGE=$1; shift ;;
@@ -73,15 +81,19 @@ while (($#)); do
 done
 OVMF=/usr/share/edk2/x64
 [[ -f $OVMF/OVMF_CODE.4m.fd ]] || die "OVMF missing (pacman -S edk2-ovmf)"
-WORK=$HERE/mkosi.test
+[[ -z $SSH_PORT || $SSH_PORT =~ ^[1-9][0-9]{0,4}$ ]] || die "--ssh needs a port number: $SSH_PORT"
+WORK=${WORK:-$HERE/mkosi.test}
 mkdir -p "$WORK"
+WORK=$(cd "$WORK" && pwd)
+((${#WORK} + 9 <= 107)) || die "--work path too long for the qga.sock unix socket: $WORK"
 
 # RAM for the VM; MEM= in the environment overrides.
 MEM=${MEM:-}
 RAW=""
 [[ -z $BOOT_URL ]] || ((NETBOOT)) || die "--url needs --netboot"
+((SERVE || NETBOOT)) || die "--no-server needs --netboot"
 if ((NETBOOT)) && [[ -n $BOOT_URL ]]; then
-	[[ -z $IMAGE && -z $TREE && $NBMODE == http ]] || die "--url takes no image, --tree or --tftp"
+	[[ -z $IMAGE && -z $TREE && $NBMODE == http && $SERVE == 1 ]] || die "--url takes no image, --tree, --tftp or --no-server"
 	[[ $BOOT_URL =~ ^https?://[^/]+/.+ ]] || die "--url needs a full http(s) URL of boot.efi: $BOOT_URL"
 	# A local copy only to read the signed command line (and the signer for
 	# --secure-boot); the VM downloads its own.
@@ -124,20 +136,26 @@ elif ((NETBOOT)); then
 
 	# Serve the published files under the exact path the signed URL names, so
 	# the initrd finds them where it looks (a symlink farm, no copying).
-	DOCROOT=$WORK/netboot-docroot
-	rm -rf "$DOCROOT"
-	if [[ -z $urlpath ]]; then
-		ln -sfnT "$(readlink -f "$BOOTDIR")" "$DOCROOT"
+	if ((SERVE)); then
+		DOCROOT=$WORK/netboot-docroot
+		rm -rf "$DOCROOT"
+		if [[ -z $urlpath ]]; then
+			ln -sfnT "$(readlink -f "$BOOTDIR")" "$DOCROOT"
+		else
+			mkdir -p "$DOCROOT/$(dirname "$urlpath")"
+			ln -sfnT "$(readlink -f "$BOOTDIR")" "$DOCROOT/$urlpath"
+		fi
+		log "Serving $(readlink -f "$BOOTDIR") as http://10.0.2.2:$port/$urlpath/"
+		python3 -m http.server "$port" --bind 127.0.0.1 --directory "$DOCROOT" &>"$WORK/http.log" &
+		HTTP_PID=$!
+		trap 'kill "$HTTP_PID" 2>/dev/null' EXIT
+		sleep 0.3
+		kill -0 "$HTTP_PID" 2>/dev/null || { cat "$WORK/http.log" >&2; die "the HTTP server did not start (port $port in use?)"; }
 	else
-		mkdir -p "$DOCROOT/$(dirname "$urlpath")"
-		ln -sfnT "$(readlink -f "$BOOTDIR")" "$DOCROOT/$urlpath"
+		curl -fsS -o /dev/null "http://127.0.0.1:$port/${urlpath:+$urlpath/}boot.efi" ||
+			die "--no-server: nothing serves boot.efi on 127.0.0.1:$port/${urlpath:+$urlpath/}"
+		log "Using the server on port $port (--no-server)"
 	fi
-	log "Serving $(readlink -f "$BOOTDIR") as http://10.0.2.2:$port/$urlpath/"
-	python3 -m http.server "$port" --bind 127.0.0.1 --directory "$DOCROOT" &>"$WORK/http.log" &
-	HTTP_PID=$!
-	trap 'kill "$HTTP_PID" 2>/dev/null' EXIT
-	sleep 0.3
-	kill -0 "$HTTP_PID" 2>/dev/null || { cat "$WORK/http.log" >&2; die "the HTTP server did not start (port $port in use?)"; }
 else
 	MEM=${MEM:-2048}
 	if [[ -f $IMAGE ]]; then

@@ -117,7 +117,9 @@ db-signed UKI that lacks the lockdown or is single-root, every refusal of `compo
 the selection order and its missing fallback, the rrsync confinement, the units' sandbox syntax, the initrd only calling programs it
 contains. `tests/vm.sh` (QEMU): in every boot the root is `verified`, lockdown is
 `integrity`, no unit failed; stick read-only, sealing, booting with enforced Secure Boot, every
-combination booted through the selection on the sealed firmware.
+combination booted through the selection on the sealed firmware (`safespace-select` set,
+once, persistent, clear on one firmware; a `SafespaceSelectOnce` written offline is consumed
+by the initrd).
 
 ## Accepted trade-offs
 

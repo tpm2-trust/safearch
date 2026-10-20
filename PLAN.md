@@ -24,14 +24,14 @@ compression already uses every core).
 
 ## Steps
 
-- [ ] 1. `test-vm.sh`: work directory per VM (`--work DIR`, default `mkosi.test/` as now):
+- [x] 1. `test-vm.sh`: work directory per VM (`--work DIR`, default `mkosi.test/` as now):
       `vars.fd`, `sealed-vars.fd`, `serial.log`, `qga.sock`, `sig.p7`, `db.pem`, docroot,
       stick copy. Today all of them are fixed paths in `mkosi.test/`, so two VMs overwrite
       each other's firmware variables and logs.
-- [ ] 2. `tests/vm.sh`: one HTTP server for the share (the port is in the signed URL, so
+- [x] 2. `tests/vm.sh`: one HTTP server for the share (the port is in the signed URL, so
       there can only be one), net boots with `test-vm.sh --netboot --url`; one ssh port and
       one work directory per VM; `vm_start`/`probe`/`vm_stop` take the VM's slot.
-- [ ] 3. Schedule (waves, at most `--jobs N` VMs, default from free RAM: a net boot holds
+- [x] 3. Schedule (waves, at most `--jobs N` VMs, default from free RAM: a net boot holds
       its root in RAM, up to ~3.5 GiB for remote-workstation; 15 GiB here → 3):
       wave 1 `stick`, `net`, `net-sb`, `seal-setup` (independent: net-sb enrolls its keys
       with virt-fw-vars); wave 2 `seal` (needs seal-setup's variables); then the select
@@ -41,15 +41,17 @@ compression already uses every core).
       variables with `SafespaceSelectOnce=<name>` preset by `virt-fw-vars --set-json`
       (the initrd's selection is what is tested there; safespace-select is covered by
       the sequence).
-- [ ] 4. Results stay in step order in the output; logs per VM as now.
-- [ ] 5. Docs (README "Integration test", AGENTS.md), `tests/run.sh`, full `tests/vm.sh`.
+- [x] 4. Results stay in step order in the output; logs per VM as now.
+- [x] 5. Docs (README "Integration test", AGENTS.md, SECURITY.md), `tests/run.sh` 166
+      passed, 1 skipped; `tests/vm.sh --no-build` all 15 PASS (run 20261020-1338, 3 VMs at
+      a time): boot phase 12.4 → 6.6 min with one boot more (select-cleared).
 
 Expected: ~15 → ~6 min after the build.
 
-## Open questions
-
-- Presetting `SafespaceSelectOnce` offline for the per-combination boots instead of
-  writing it with `safespace-select` from a running system: OK?
+Decided: preset offline is fine, as long as safespace-select's changes are verified
+elsewhere: the sequence covers set, once, persistent and clear (now with a boot after
+`clear`, which was not checked before). `test-vm.sh` also gets `--no-server` (one server
+for all VMs; `--url` does not fit, the host cannot fetch from 10.0.2.2).
 
 ---
 

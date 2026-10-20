@@ -121,8 +121,8 @@ the network-boot reference, SECURITY.md the applied hardening. Arch Linux only, 
 - After a change to the image, the initrd, the build, the release or the server, run the
   integration test `tests/vm.sh` (test build with a throwaway user, release into its own
   share, server check, QEMU boots from a stick and over the network, sealing, Secure Boot,
-  every combination booted through the selection; one mkosi run per combination, so the
-  duration grows with `combinations.conf`). It needs the build host's sudo rule for `build.sh`; if a prerequisite is
+  every combination booted through the selection; the boots run side by side, `--jobs N`;
+  one mkosi run per combination, so the build's duration grows with `combinations.conf`). It needs the build host's sudo rule for `build.sh`; if a prerequisite is
   missing it says which: hand that to the user instead of working around it. Never release
   a test build (`mkosi.test/vm/builds/`) to a real server: it carries the test key.
 - Not testable without root or hardware — say so and hand it to the user with
