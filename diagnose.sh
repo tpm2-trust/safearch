@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Read-only check of a stick/SD card written by burn.sh:
-# ESP + signed UKI, dm-verity root (verified block by block), nothing writable.
+# ESP + signed UKI, one dm-verity root per combination (each verified block
+# by block against its hash on the signed command line), nothing writable.
 # Usage: sudo ./diagnose.sh [--db-cert db.pem] /dev/sdX
 #   --db-cert  the db certificate the signatures must verify against (default:
 #              the build host's exported db.pem, else a distribution server's
@@ -40,14 +41,8 @@ hdr "Partition table"
 sfdisk -d "$DISK"
 lsblk -o NAME,SIZE,FSTYPE,PARTTYPENAME,PARTUUID "$DISK"
 ESP=$(part_by_type c12a7328-f81f-11d2-ba4b-00a0c93ec93b)
-ROOT=$(part_by_type 4f68bce3-e8cd-4db1-96e7-fbcaf984b709)
-VERITY=$(part_by_type 2c7357ed-ebd2-46d9-aec1-23d437ec2bf5)
-n=$(lsblk -lnpo TYPE "$DISK" | grep -c part)
-for p in ESP ROOT VERITY; do
-	[[ -n ${!p} ]] && ok "$p partition: ${!p}" || bad "no $p partition"
-done
-((n == 3)) && ok "exactly 3 partitions, nothing writable on the stick" ||
-	bad "$n partitions, expected 3 (ESP, root, root-verity)"
+[[ -n $ESP ]] && ok "ESP partition: $ESP" || { bad "no ESP partition"; exit 1; }
+NPARTS=$(lsblk -lnpo TYPE "$DISK" | grep -c part)
 if [[ $(dd if="$DISK" bs=1 skip=32769 count=5 status=none) == CD001 ]]; then
 	bad "ISO9660/El Torito header at 32 KiB (CD boot path; image built before ElTorito=no)"
 else
@@ -108,72 +103,82 @@ done
 extra=$(cd "$TMP/esp" && find . -type f ! -ipath './efi/boot/bootx64.efi' ! -ipath './efi/linux/*.efi' | sed 's|^\./||')
 [[ -z $extra ]] && ok "ESP holds nothing but systemd-boot and the UKI" || { bad "unexpected files on the ESP:"; sed 's/^/       /' <<<"$extra"; }
 
-ROOTHASH=$(tr ' ' '\n' <<<"$CMDLINE" | sed -n 's/^roothash=//p')
+[[ " $CMDLINE " == *" lockdown=integrity "* ]] && ok "lockdown=integrity" || bad "lockdown=integrity missing from the kernel command line"
+[[ " $CMDLINE " != *" roothash="* ]] && ok "no roothash= (the roots are named per combination)" || bad "roothash= on the command line"
+mapfile -t COMBOS < <(tr ' ' '\n' <<<"$CMDLINE" | sed -n 's/^safespace\.root\.\([a-z][a-z0-9-]*\)=[0-9a-f]\{64\}$/\1/p')
+((${#COMBOS[@]})) && ok "combinations: ${COMBOS[*]} (default ${COMBOS[0]})" || { bad "no safespace.root.<name>= on the kernel command line"; exit 1; }
+((NPARTS == 1 + 2 * ${#COMBOS[@]})) && ok "exactly $NPARTS partitions (ESP + a root/verity pair per combination), nothing writable on the stick" ||
+	bad "$NPARTS partitions, expected $((1 + 2 * ${#COMBOS[@]})) (ESP, root-<name> and root-<name>-verity per combination)"
 
-hdr "dm-verity root"
-if [[ -z $ROOTHASH ]]; then
-	bad "no roothash= on the kernel command line"
-else
-	ok "roothash=$ROOTHASH"
+check_root() { # NAME PARTITION: what is inside a root (read-only)
+	local C=$1 ROOT=$2 list root_fs root_bs f l
+	hdr "Root content of $C (read-only)"
+	# udev's blkid must recognise root, or systemd never marks /dev/mapper/root
+	# ready (99-systemd.rules) and the initrd times out. libblkid does not detect
+	# erofs with 512-byte blocks.
+	root_fs=$(blkid -p -s TYPE -o value "$ROOT")
+	root_bs=$(blkid -p -s FSBLOCKSIZE -o value "$ROOT")
+	[[ $root_fs == erofs && $root_bs == 4096 ]] && ok "blkid sees erofs, block size 4096" ||
+		bad "blkid sees '${root_fs:-nothing}' (block size ${root_bs:-?}): the initrd will wait for /dev/mapper/root forever"
+	if mount -o ro "$ROOT" "$TMP/root"; then
+		ok "root mounted ($(blkid -p -s TYPE -o value "$ROOT"))"
+		for f in etc/fstab etc/machine-id; do
+			[[ -e $TMP/root/$f ]] && { ok "/$f"; sed 's/^/       /' "$TMP/root/$f"; } || bad "/$f missing"
+		done
+		for l in home root; do
+			[[ -L $TMP/root/$l ]] && ok "/$l -> $(readlink "$TMP/root/$l")" || bad "/$l is not a symlink into /var"
+		done
+		ls "$TMP/root/etc/ssh/authorized_keys" 2>/dev/null | sed 's/^/  ssh keys for: /'
+		ls "$TMP/root/usr/lib/modules" | sed 's/^/  kernel modules: /'
+		sed 's/^/  package groups: /' "$TMP/root/usr/lib/safespace/groups" 2>/dev/null || bad "no /usr/lib/safespace/groups"
+	else
+		bad "cannot mount root"
+	fi
+
+	hdr "Volatile /var and Docker (inside root of $C)"
+	if mountpoint -q "$TMP/root"; then
+		[[ -d $TMP/root/usr/share/factory/var ]] &&
+			ok "factory /var: $(du -sh "$TMP/root/usr/share/factory/var" | cut -f1), homes: $(ls "$TMP/root/usr/share/factory/var/home" 2>/dev/null | tr '\n' ' ')" ||
+			bad "no /usr/share/factory/var"
+		[[ -z $(ls -A "$TMP/root/var" 2>/dev/null) ]] && ok "/var in root is an empty mount point" ||
+			bad "/var in root is not empty"
+		sed 's/^/  daemon.json: /' "$TMP/root/etc/docker/daemon.json" 2>/dev/null | tr -d '\n'; echo
+		grep -v '^#' "$TMP/root/etc/fstab" 2>/dev/null | grep . | sed 's/^/  fstab: /'
+		list=$TMP/root/usr/share/safespace/docker-images/images.list
+		if [[ -f $list ]]; then
+			grep -v '^#' "$list" | awk '{ print "  shipped image: " $3 " (" $2 ")" }'
+		else
+			echo "  no Docker images shipped"
+		fi
+	fi
+	umount -q "$TMP/root" 2>/dev/null
+}
+
+uuid() { sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12}).*/\1-\2-\3-\4-\5/' <<<"$1"; }
+part_by_uuid() { lsblk -lnpo NAME,PARTUUID "$DISK" | awk -v u="$1" 'tolower($2) == u { print $1; exit }'; }
+# The roots, each checked as the initrd opens it: partitions by the UUIDs
+# derived from its signed hash, every block against that hash.
+for C in "${COMBOS[@]}"; do
+	ROOTHASH=$(tr ' ' '\n' <<<"$CMDLINE" | sed -n "s/^safespace\.root\.$C=//p")
+	hdr "dm-verity root of $C"
+	ok "safespace.root.$C=$ROOTHASH"
 	# The build on this host with that root hash, if any.
-	build=$(grep -lx "$ROOTHASH" "$HERE"/mkosi.output/*/roothash 2>/dev/null | head -1)
+	build=$(grep -lx "$ROOTHASH" "$HERE"/mkosi.output/*/roothash-"$C" 2>/dev/null | head -1)
 	if [[ -n $build ]]; then
 		ok "build: $(basename "$(dirname "$build")") (./build.sh show for its packages)"
 	else
 		echo "  NOTE build: no build with this root hash on this host"
 	fi
-	uuid() { sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12}).*/\1-\2-\3-\4-\5/' <<<"$1"; }
-	want_data=$(uuid "${ROOTHASH:0:32}")
-	want_hash=$(uuid "${ROOTHASH: -32}")
-	have_data=$(blkid -p -s PART_ENTRY_UUID -o value "$ROOT")
-	have_hash=$(blkid -p -s PART_ENTRY_UUID -o value "$VERITY")
-	[[ ${have_data,,} == "$want_data" ]] && ok "root partition UUID matches the root hash" ||
-		bad "root partition UUID $have_data, expected $want_data"
-	[[ ${have_hash,,} == "$want_hash" ]] && ok "verity partition UUID matches the root hash" ||
-		bad "verity partition UUID $have_hash, expected $want_hash"
+	ROOT=$(part_by_uuid "$(uuid "${ROOTHASH:0:32}")")
+	VERITY=$(part_by_uuid "$(uuid "${ROOTHASH: -32}")")
+	[[ -n $ROOT ]] && ok "root partition $ROOT: UUID from the root hash" || { bad "no partition with the root UUID $(uuid "${ROOTHASH:0:32}")"; continue; }
+	[[ -n $VERITY ]] && ok "verity partition $VERITY: UUID from the root hash" || { bad "no partition with the verity UUID $(uuid "${ROOTHASH: -32}")"; continue; }
 	echo "  verifying every block of root against the root hash (takes a while)..."
 	if veritysetup verify "$ROOT" "$VERITY" "$ROOTHASH"; then
-		ok "root is exactly what was signed"
+		ok "root of $C is exactly what was signed"
 	else
-		bad "verity verification FAILED: root was modified or the write is damaged"
+		bad "verity verification FAILED: root of $C was modified or the write is damaged"
 	fi
-fi
+	check_root "$C" "$ROOT"
+done
 
-hdr "Root content (read-only)"
-# udev's blkid must recognise root, or systemd never marks /dev/mapper/root
-# ready (99-systemd.rules) and the initrd times out. libblkid does not detect
-# erofs with 512-byte blocks.
-root_fs=$(blkid -p -s TYPE -o value "$ROOT")
-root_bs=$(blkid -p -s FSBLOCKSIZE -o value "$ROOT")
-[[ $root_fs == erofs && $root_bs == 4096 ]] && ok "blkid sees erofs, block size 4096" ||
-	bad "blkid sees '${root_fs:-nothing}' (block size ${root_bs:-?}): the initrd will wait for /dev/mapper/root forever"
-if mount -o ro "$ROOT" "$TMP/root"; then
-	ok "root mounted ($(blkid -p -s TYPE -o value "$ROOT"))"
-	for f in etc/fstab etc/machine-id; do
-		[[ -e $TMP/root/$f ]] && { ok "/$f"; sed 's/^/       /' "$TMP/root/$f"; } || bad "/$f missing"
-	done
-	for l in home root; do
-		[[ -L $TMP/root/$l ]] && ok "/$l -> $(readlink "$TMP/root/$l")" || bad "/$l is not a symlink into /var"
-	done
-	ls "$TMP/root/etc/ssh/authorized_keys" 2>/dev/null | sed 's/^/  ssh keys for: /'
-	ls "$TMP/root/usr/lib/modules" | sed 's/^/  kernel modules: /'
-else
-	bad "cannot mount root"
-fi
-
-hdr "Volatile /var and Docker (inside root)"
-if mountpoint -q "$TMP/root"; then
-	[[ -d $TMP/root/usr/share/factory/var ]] &&
-		ok "factory /var: $(du -sh "$TMP/root/usr/share/factory/var" | cut -f1), homes: $(ls "$TMP/root/usr/share/factory/var/home" 2>/dev/null | tr '\n' ' ')" ||
-		bad "no /usr/share/factory/var"
-	[[ -z $(ls -A "$TMP/root/var" 2>/dev/null) ]] && ok "/var in root is an empty mount point" ||
-		bad "/var in root is not empty"
-	sed 's/^/  daemon.json: /' "$TMP/root/etc/docker/daemon.json" 2>/dev/null | tr -d '\n'; echo
-	grep -v '^#' "$TMP/root/etc/fstab" 2>/dev/null | grep . | sed 's/^/  fstab: /'
-	list=$TMP/root/usr/share/safespace/docker-images/images.list
-	if [[ -f $list ]]; then
-		grep -v '^#' "$list" | awk '{ print "  shipped image: " $3 " (" $2 ")" }'
-	else
-		echo "  no Docker images shipped"
-	fi
-fi

@@ -5,15 +5,12 @@
 # both boot paths: machines boot boot.efi over the network, burn.sh writes
 # sticks from it.
 #
-#   ./release.sh [--build BUILD | --groups LIST] [--push TARGET]...
-#                [--builds DIR] [--stage DIR]
+#   ./release.sh [--build BUILD] [--push TARGET]... [--builds DIR] [--stage DIR]
 #
 #   --build BUILD   the build to release, as ./build.sh list shows it
-#                   (e.g. base-remotedesktop_20261019-0930). Releasing an older
+#                   (e.g. combined_20261019-0930). Releasing an older
 #                   build again is how a release is rolled back.
-#   --groups LIST   the newest build with exactly this group set ("combined":
-#                   the newest whole-stack build)
-#   (neither)       the newest build, whatever its groups
+#   (without)       the newest build
 #   --builds DIR    where the builds are (default: mkosi.output; tests/vm.sh
 #                   keeps its test builds apart)
 #   --stage DIR     where the release is staged (default: mkosi.release)
@@ -26,16 +23,13 @@
 #
 # The bundle, mkosi.release/ (the newest release only): the build's parts as
 # hardlinks (nothing is copied or unpacked) plus the release files:
-#   boot.efi (signed UKI), root.img, root.verity, roothash, systemd-boot.efi,
-#   layout.sfdisk, manifest.json; cmdline (the UKI's signed command line,
-#   readable), release (VERSION, BUILD, GROUPS, BUILT, SNAPSHOT, COMMIT,
-#   PACKAGES), SHA256SUMS
-#   a combined build (build.sh without --groups): root-<name>.img, root-<name>.verity,
-#   roothash-<name>, manifest-<name>.json per combination instead of the single
-#   root, and COMBINATIONS= in release
+#   boot.efi (signed UKI), systemd-boot.efi, layout.sfdisk; per combination
+#   root-<name>.img, root-<name>.verity, roothash-<name>, manifest-<name>.json;
+#   cmdline (the UKI's signed command line, readable), release (VERSION,
+#   BUILD, COMBINATIONS, BUILT, SNAPSHOT, COMMIT, PACKAGES), SHA256SUMS
 # It is checked here exactly as a server checks it (lib/verify.sh): Secure
-# Boot signatures against the exported db.pem, root image against the signed
-# root hash, the stick's partition table. test-vm.sh --netboot serves
+# Boot signatures against the exported db.pem, every root image against its
+# signed root hash, the stick's partition table. test-vm.sh --netboot serves
 # mkosi.release/.
 #
 # Pushing: rsync over ssh into the share. --delay-updates collects
@@ -54,17 +48,11 @@ usage() { sed -n '2,${/^#/!q;s/^# \?//;p}' "$0"; }
 source "$HERE/lib/verify.sh"
 # shellcheck source=lib/builds.sh
 source "$HERE/lib/builds.sh"
-# shellcheck source=lib/groups.sh
-source "$HERE/lib/groups.sh"
 
-case ${1:-} in
-	network | usb) die "there are no variants any more: one release serves sticks and the network ($0 [--build ...])" ;;
-esac
-BUILD="" WANT_GROUPS="" TARGETS=() STAGE_DIR=$HERE/mkosi.release
+BUILD="" TARGETS=() STAGE_DIR=$HERE/mkosi.release
 while (($#)); do
 	case $1 in
 		--build) BUILD=${2:?--build needs a build (./build.sh list)}; shift 2 ;;
-		--groups) WANT_GROUPS=${2:?--groups needs a comma-separated list}; shift 2 ;;
 		--push) TARGETS+=("${2:?--push needs a target}"); shift 2 ;;
 		--builds) BUILDS_ROOT=$(readlink -f "${2:?--builds needs a directory}"); shift 2 ;;
 		--stage) STAGE_DIR=$(readlink -f "${2:?--stage needs a directory}"); shift 2 ;;
@@ -86,17 +74,7 @@ DB=$HERE/mkosi.extra/usr/share/safespace/secureboot/db.pem
 
 # --- pick the build ------------------------------------------------------------
 
-[[ -z $BUILD || -z $WANT_GROUPS ]] || die "--build or --groups, not both"
-if [[ -n $WANT_GROUPS ]]; then
-	if [[ ${WANT_GROUPS,,} == combined ]]; then
-		WANT_GROUPS=combined
-	else
-		groups_parse "$WANT_GROUPS"
-		WANT_GROUPS=$(IFS=,; echo "${SAFESPACE_GROUPS[*]}")
-	fi
-	BUILD=$(builds_newest "$WANT_GROUPS")
-	[[ -n $BUILD ]] || die "no build with groups $WANT_GROUPS (./build.sh list)"
-elif [[ -n $BUILD ]]; then
+if [[ -n $BUILD ]]; then
 	BUILD=$(builds_find "$BUILD")
 else
 	BUILD=$(builds_newest)
@@ -104,11 +82,12 @@ else
 fi
 DIR=$(builds_dir "$BUILD")
 VERSION=$(builds_info "$DIR" version)
-GROUPS_SET=$(builds_info "$DIR" groups)
+COMBOS=$(builds_info "$DIR" combinations | tr ',' '\n' | cut -d: -f1 | paste -sd,)
+[[ -n $COMBOS ]] || die "$DIR/build.json names no combinations (a build from before the combinations? rebuild)"
 verify_name_version "$VERSION" || die "invalid version '$VERSION' in $DIR/build.json"
 log "Release $BUILD"
-log "  groups $GROUPS_SET, built $(builds_info "$DIR" finished), snapshot $(builds_info "$DIR" snapshot), commit $(builds_info "$DIR" commit)$([[ $(builds_info "$DIR" uncommitted_changes) == yes ]] && echo ' + uncommitted changes'), $(builds_info "$DIR" packages) packages"
-# Newer builds of other group sets that were never released: maybe the one meant.
+log "  combinations $COMBOS, built $(builds_info "$DIR" finished), snapshot $(builds_info "$DIR" snapshot), commit $(builds_info "$DIR" commit)$([[ $(builds_info "$DIR" uncommitted_changes) == yes ]] && echo ' + uncommitted changes'), $(builds_info "$DIR" packages) packages"
+# Newer builds that were never released: maybe the one meant.
 while IFS= read -r b; do
 	[[ $b != "$BUILD" && $(builds_version_of "$b") > $VERSION && ! -s $(builds_dir "$b")/released.log ]] &&
 		warn "a newer build is not released: $b (release it with --build $b)"
@@ -120,15 +99,8 @@ DEST=$STAGE_DIR
 [[ $DEST != / && $DEST != "$HERE" ]] || die "--stage $DEST: not a staging directory"
 rm -rf "$DEST"
 mkdir -p "$DEST"
-# A combined build (build.sh without --groups) has one root per combination.
-COMBOS=$(builds_info "$DIR" combinations | tr ',' '\n' | cut -d: -f1 | tr '\n' ',')
-COMBOS=${COMBOS%,}
 PARTS=(boot.efi systemd-boot.efi layout.sfdisk)
-if [[ -n $COMBOS ]]; then
-	for n in ${COMBOS//,/ }; do PARTS+=("root-$n.img" "root-$n.verity" "roothash-$n" "manifest-$n.json"); done
-else
-	PARTS+=(root.img root.verity roothash manifest.json)
-fi
+for n in ${COMBOS//,/ }; do PARTS+=("root-$n.img" "root-$n.verity" "roothash-$n" "manifest-$n.json"); done
 for f in "${PARTS[@]}"; do
 	[[ -f $DIR/$f ]] || die "$DIR/$f missing (a build from before the parts layout? rebuild)"
 	ln "$DIR/$f" "$DEST/$f" 2>/dev/null || cp --reflink=auto "$DIR/$f" "$DEST/$f"
@@ -138,12 +110,11 @@ echo >>"$DEST/cmdline"
 {
 	echo "VERSION=$VERSION"
 	echo "BUILD=$BUILD"
-	echo "GROUPS=$GROUPS_SET"
+	echo "COMBINATIONS=$COMBOS"
 	echo "BUILT=$(builds_info "$DIR" finished)"
 	echo "SNAPSHOT=$(builds_info "$DIR" snapshot)"
 	echo "COMMIT=$(builds_info "$DIR" commit)$([[ $(builds_info "$DIR" uncommitted_changes) == yes ]] && echo +uncommitted)"
 	echo "PACKAGES=$(builds_info "$DIR" packages)"
-	[[ -z $COMBOS ]] || echo "COMBINATIONS=$COMBOS"
 } >"$DEST/release"
 (cd "$DEST" && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | sort | xargs sha256sum >SHA256SUMS)
 chmod 0644 "$DEST"/{cmdline,release,SHA256SUMS}

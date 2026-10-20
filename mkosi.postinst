@@ -13,7 +13,7 @@ die() { echo "safespace: ERROR: $*" >&2; exit 1; }
 # base is always in; the other groups are profiles of their own name.
 has_group() { case " ${PROFILES:-} " in *" $1 "*) return 0 ;; esac; return 1; }
 groups=base
-for g in remotedesktop docker; do has_group "$g" && groups+=",$g"; done
+for g in ${PROFILES:-}; do groups+=",$g"; done
 log "package groups: $groups"
 install -d "$BUILDROOT/usr/lib/safespace"
 echo "$groups" >"$BUILDROOT/usr/lib/safespace/groups"
@@ -97,9 +97,9 @@ set_conf "$conf" IPCAllowedGroups wheel
 [[ -f $BUILDROOT/etc/usbguard/rules.conf ]] || install -m 600 /dev/null "$BUILDROOT/etc/usbguard/rules.conf"
 chmod 600 "$BUILDROOT/etc/usbguard/rules.conf"
 
-# --- VNC desktop (group remotedesktop) -------------------------------------------
+# --- VNC desktop (group xfce4-headless-vnc) --------------------------------------
 
-if has_group remotedesktop; then
+if has_group xfce4-headless-vnc; then
 	VNC_USER=${VNC_USER:-${USERS[0]}}
 	[[ -v KEYS[$VNC_USER] ]] || die "VNC_USER '$VNC_USER' is not defined in users.conf"
 	generated=0
@@ -115,7 +115,7 @@ if has_group remotedesktop; then
 	mkosi-chroot chown -R "$VNC_USER:$VNC_USER" "/home/$VNC_USER/.config"
 	echo ":$VNC_DISPLAY=$VNC_USER" >"$BUILDROOT/etc/tigervnc/vncserver.users"
 	if ((generated)); then
-		# Files in $OUTPUTDIR end up in the build's directory (mkosi.output/<variant>/<build>/).
+		# Files in $OUTPUTDIR end up in the build's directory (lib/compose.sh: vnc-password-<combination>).
 		(umask 077; printf '%s\n' "$VNC_PASSWORD" >"$OUTPUTDIR/${IMAGE_ID}_${IMAGE_VERSION}.vnc-password")
 		log "generated VNC password: ${IMAGE_ID}_${IMAGE_VERSION}.vnc-password in the build directory"
 	fi

@@ -1,7 +1,7 @@
 # Security of the standard installation
 
-What a standard safespace-arch image (`sudo ./build.sh`, no `--debug`) does to be
-trustworthy, and where each measure lives. Usage is in [README.md](README.md), network
+What a standard safespace-arch build (`sudo ./build.sh`, every combination of
+`combinations.conf`) does to be trustworthy, and where each measure lives. Usage is in [README.md](README.md), network
 boot in [NETBOOT.md](NETBOOT.md). What is still open is listed at the end.
 
 ## Chain of trust
@@ -23,7 +23,7 @@ block of the root as it is read.
 
 | Measure | What it prevents | Where |
 |---|---|---|
-| **Signed UKI and systemd-boot** (db key), checked by the build against the shipped `db.pem` | booting anything not built here, once the machine is sealed | `mkosi.conf` `[Validation]`, `mkosi.postoutput` |
+| **Signed UKI and systemd-boot** (db key), checked by the build against the shipped `db.pem`: each combination's UKI by `mkosi.postoutput`, the composed UKI that ships again by `compose_check` (signer, `lockdown=integrity`, no `roothash=`, every root hash in order, signed expected PCRs, partition table) | booting anything not built here, once the machine is sealed; a composed UKI that lost a property of its parts | `mkosi.conf` `[Validation]`, `mkosi.postoutput`, `lib/compose.sh` |
 | **Sealing** (`safespace-seal`): enrols our PK, KEK, db from Setup Mode (signed `.auth` updates); `--replace` keeps only our keys | other operating systems / boot loaders on a sealed machine | `mkosi.extra/usr/local/sbin/safespace-seal`, `lib/keys.sh` |
 | **dm-verity root** with the root hash on the signed command line, opened with `--panic-on-corruption` | any change to the system files; a modified block stops the machine instead of being used | `mkosi.repart/`, `usb-bootdev`, `netroot` |
 | **Read-only root (erofs)**, **`/var` in RAM** (`systemd.volatile=state`, factory copy from the verified `/usr`) | persistence of changes across a reboot; every boot starts from the verified state | `mkosi.conf`, `mkosi.finalize`, `safespace-var-factory.service` |
@@ -31,13 +31,13 @@ block of the root as it is read.
 | **No extension images** (`systemd.sysext=0`, `systemd.confext=0`, `rd.` variants; units masked in the system and the initrd) | sysext/confext images on the unverified ESP overlaying `/usr` or `/etc` | `mkosi.conf`, `mkosi.extra/`, `mkosi.initrd.conf/mkosi.extra/` |
 | **Strict credentials** (`systemd.credentials_boot_policy=strict`) | credentials "encrypted" with the null key from the ESP (e.g. a planted `systemd.extra-unit.*` = root code) | `mkosi.conf` |
 | **Signed expected PCR 11 values** (own PCR key, not the db key) | lets the TPM bind secrets to "a signed safespace UKI booted"; rotating one key doesn't touch the other | `mkosi.conf` `SignExpectedPcr=` |
-| **Combinations:** the EFI variables / `safespace.select=` only *name* a root; its hash comes from the signed command line; an unknown name stops the boot | choosing an unsigned root through the selection | `mkosi.initrd.conf/.../select` |
+| **Combinations:** the EFI variables / `safespace.select=` only *name* a root; its hash comes from the signed command line; an unknown name stops the boot; without `safespace.root.<name>=` on the command line nothing is opened (no `roothash=` fallback) | choosing an unsigned root through the selection | `mkosi.initrd.conf/.../select` |
 
 ## Running kernel
 
 | Measure | What it prevents | Where |
 |---|---|---|
-| **`lockdown=integrity`** on the signed command line; the build refuses a UKI without it. The Arch kernel does not lock down under Secure Boot by itself (`LOCK_DOWN_KERNEL_FORCE_NONE`) | root leaving the signed chain at runtime: unsigned kexec or kernel modules, writes to `/dev/mem`/`/dev/port`, MSR writes, `iopl`/`ioperm`, hibernation images, runtime ACPI overrides, unsafe module parameters | `mkosi.conf`, `mkosi.postoutput`; checked in every boot by `tests/vm.sh` |
+| **`lockdown=integrity`** on the signed command line; the build (per combination and for the composed UKI), `release.sh` and every distribution server refuse a UKI without it. The Arch kernel does not lock down under Secure Boot by itself (`LOCK_DOWN_KERNEL_FORCE_NONE`) | root leaving the signed chain at runtime: unsigned kexec or kernel modules, writes to `/dev/mem`/`/dev/port`, MSR writes, `iopl`/`ioperm`, hibernation images, runtime ACPI overrides, unsafe module parameters | `mkosi.conf`, `mkosi.postoutput`, `lib/compose.sh`, `lib/verify.sh`; checked in every boot by `tests/vm.sh` |
 | **Signed modules only** (follows from the lockdown; every Arch module is signed) | loading a modified or foreign driver | kernel |
 
 `integrity`, not `confidentiality`: the latter would also block perf, kprobes and BPF reads
@@ -83,9 +83,9 @@ of kernel memory, i.e. any tracing.
 
 | Group | Measure | Where |
 |---|---|---|
-| remotedesktop | TigerVNC listens on `localhost` only (reach it through an ssh tunnel), with a password generated per build (shown only in the build directory, mode 0600) | `mkosi.profiles/remotedesktop/`, `mkosi.postinst` |
+| xfce4-headless-vnc | TigerVNC listens on `localhost` only (reach it through an ssh tunnel), with a password generated per build (shown only in the build directory, mode 0600) | `mkosi.profiles/xfce4-headless-vnc/`, `mkosi.postinst` |
 | docker | Docker and containerd are not started at boot (manual start), and only run when the data disk is mounted at `/opt/docker`; all their state is on that disk, nothing on the verified root | `mkosi.profiles/docker/` |
-| debug (`--debug`, not a group) | marked `-debug`; meant for diagnosis, not for production servers | `mkosi.profiles/debug/` |
+| debug | packages only (diagnostic tools); no setting of the image depends on the group, so the combination `debug` has the same hardening as every other (`tests/run.sh groups` checks the profile is a bare package list and nothing refers to it). `tests/vm.sh` checks on the booted image that `debug` has exactly `root`'s setuid/setgid files, file capabilities and enabled units (system and user); under the lockdown `kexec` only loads signed kernels. It is in every build, so root on a sealed machine can select it — root can run any tool anyway | `mkosi.profiles/debug/` |
 
 ## Keys and the build host
 
@@ -102,7 +102,7 @@ of kernel memory, i.e. any tracing.
 
 | Measure | Where |
 |---|---|
-| Trusts only the pinned public `db.pem`; checks every release (signatures, root against the signed hash, partition table) and only reports; it never alters what it serves | `server/safespace-netboot`, `lib/verify.sh` |
+| Trusts only the pinned public `db.pem`; checks every release (signatures, `lockdown=integrity`, every root against its signed hash, partition table) and only reports; it never alters what it serves | `server/safespace-netboot`, `lib/verify.sh` |
 | Upload account confined by rrsync: write-only, no delete, the share only | `server/setup.sh` |
 | The check runs sandboxed: own user, no network, read-only share, no capabilities, `ProtectSystem=strict`, system call filter, … | `server/systemd/safespace-netboot-verify.service` |
 | nginx serves the share read-only: GET/HEAD only, no directory listing, no hidden files (rsync's temporary files), no version banner | `server/nginx/safespace.conf` |
@@ -111,11 +111,12 @@ of kernel memory, i.e. any tracing.
 ## Checked by the tests
 
 `tests/run.sh` (no root): manipulated, unsigned and foreign-signed releases, wrong partition
-tables, combinations with a changed root or a forged `COMBINATIONS=`, the selection order,
-the rrsync confinement, the units' sandbox syntax, the initrd only calling programs it
+tables, combinations with a changed root or a forged `COMBINATIONS=`, releases with a
+db-signed UKI that lacks the lockdown or is single-root, every refusal of `compose_check`,
+the selection order and its missing fallback, the rrsync confinement, the units' sandbox syntax, the initrd only calling programs it
 contains. `tests/vm.sh` (QEMU): in every boot the root is `verified`, lockdown is
-`integrity`, no unit failed; stick read-only, sealing, booting with enforced Secure Boot, the
-combination selection on the sealed firmware.
+`integrity`, no unit failed; stick read-only, sealing, booting with enforced Secure Boot, every
+combination booted through the selection on the sealed firmware.
 
 ## Accepted trade-offs
 

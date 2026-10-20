@@ -28,8 +28,8 @@
 #   them afterwards).
 # --tftp: hand the UKI over QEMU's built-in TFTP server instead of HTTP, for
 #   firmware without UEFI HTTP boot. The root image still comes over HTTP.
-# --tree DIR: the release to serve (a directory with boot.efi, root.img,
-#   root.verity, e.g. a distribution server's share).
+# --tree DIR: the release to serve (a directory with boot.efi and the
+#   root-<name>.img/.verity files, e.g. a distribution server's share).
 # --url BOOT_URL: no local server; UEFI HTTP boot of a published UKI from a
 #   distribution server, e.g. http://10.0.0.1/safespace/boot.efi.
 #   The VM reaches it through QEMU's NAT and resolves names with the host's
@@ -90,9 +90,9 @@ if ((NETBOOT)) && [[ -n $BOOT_URL ]]; then
 	cmdline=$(objcopy -O binary --only-section=.cmdline "$uki" /dev/stdout 2>/dev/null | tr -d '\0')
 	NETROOT_URL=$(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace.netroot=//p' | head -1)
 	[[ -n $NETROOT_URL ]] || die "$BOOT_URL has no safespace.netroot= on its command line (built without NETROOT_URL)"
-	# The largest root the VM might load: root.img, or one per combination.
+	# The largest root the VM might load: one per combination.
 	root_bytes=0
-	for f in root.img $(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace\.root\.\([a-z0-9-]*\)=.*/root-\1.img/p'); do
+	for f in $(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace\.root\.\([a-z0-9-]*\)=.*/root-\1.img/p'); do
 		b=$(curl -fsSI "${NETROOT_URL%/}/$f" 2>/dev/null | tr -d '\r' | awk 'tolower($1) == "content-length:" { print $2 }')
 		[[ $b =~ ^[0-9]+$ ]] && ((b > root_bytes)) && root_bytes=$b
 	done
@@ -156,7 +156,7 @@ else
 			[[ -n $b ]] || die "no build (run: sudo ./build.sh)"
 			SRC=$(builds_dir "$b")
 		fi
-		[[ -f $SRC/layout.sfdisk ]] || die "$SRC is not a build (or one from before the single build)"
+		[[ -f $SRC/layout.sfdisk ]] || die "$SRC is not a build"
 		RAW=$WORK/stick.raw
 		log "Assembling the stick image from $SRC"
 		stick_write "$RAW" "$SRC"
@@ -264,7 +264,7 @@ if ((NETBOOT)); then
 	step "firmware: UKI downloaded and started" 'NBP file downloaded successfully|Downloading\.\.\.100%|starting Boot[0-9]+ "UEFI (PXEv4|HTTPv4)'
 	step "UKI started, initrd running" 'Booting initrd|Expecting device /dev/mapper/root|netroot:'
 	step "initrd: netroot waited for DHCP" 'netroot: waiting|netroot: link up'
-	step "initrd: root.img downloaded" 'netroot: got root.img'
+	step "initrd: root image downloaded" 'netroot: got root-[a-z0-9-]*\.img'
 	step "initrd: dm-verity root opened" 'netroot: root opened as'
 	step "root mounted, system started" 'Mounted /sysroot|Startup finished|login:'
 	grep -qa 'netroot:' <<<"$s" ||

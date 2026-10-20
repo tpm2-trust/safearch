@@ -79,15 +79,15 @@ else
 	[[ -n $b ]] || die "no build here (sudo ./build.sh, or give a SOURCE)"
 	SRC=$(builds_dir "$b")
 fi
-[[ -f $SRC/layout.sfdisk ]] || die "$SRC has no layout.sfdisk: not a build or release (or one from before the single build)"
+[[ -f $SRC/layout.sfdisk ]] || die "$SRC has no layout.sfdisk: not a build or release"
 if [[ -z $BASE_URL && -f $SRC/SHA256SUMS ]]; then
 	log "Checking $SRC against its SHA256SUMS"
 	(cd "$SRC" && sha256sum --quiet --strict -c SHA256SUMS) || die "$SRC does not match its SHA256SUMS"
 fi
 if [[ -f $SRC/build.json ]]; then
-	what="build $(builds_info "$SRC" build), groups $(builds_info "$SRC" groups), built $(builds_info "$SRC" finished)"
+	what="build $(builds_info "$SRC" build), combinations $(builds_info "$SRC" combinations | tr ',' '\n' | cut -d: -f1 | paste -sd,), built $(builds_info "$SRC" finished)"
 elif [[ -f $SRC/release ]]; then
-	what="release $(release_get "$SRC/release" BUILD), groups $(release_get "$SRC/release" GROUPS), built $(release_get "$SRC/release" BUILT)"
+	what="release $(release_get "$SRC/release" BUILD), combinations $(release_get "$SRC/release" COMBINATIONS), built $(release_get "$SRC/release" BUILT)"
 else
 	what=$SRC
 fi

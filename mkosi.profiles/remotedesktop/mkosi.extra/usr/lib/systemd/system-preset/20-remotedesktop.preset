@@ -1,3 +1,0 @@
-# Group remotedesktop: XFCE desktop on VNC display :1 (keep in sync with
-# VNC_DISPLAY in safespace.env).
-enable vncserver@.service :1

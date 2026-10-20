@@ -813,3 +813,69 @@ Reproduced in a network namespace: either option alone works. Also: a configurat
       configuration.
 - [x] 4. NETBOOT.md: dnsmasq example, firewall text, troubleshooting row.
 - [x] 5. `tests/run.sh`: 151 passed. On the server: `sudo server/setup.sh` (yours to run).
+
+---
+# PLAN: cleanup — the whole stack is the only build; new group/combination matrix
+
+## Goal
+
+`build.sh` always builds every combination of `combinations.conf`; switches and code paths
+that only exist for a single group-set build go. New groups and combinations. Security is
+never weakened: removed paths are fallbacks, checks only get stricter.
+
+Each combination stays a complete root built on its own; a machine loads only its own root
+(network: only that root is downloaded; stick: only that pair is opened). Only the signed UKI
+(kernel, initrd) is common.
+
+## Matrix
+
+| combination | groups |
+|---|---|
+| `root` (default: boots without a selection) | base |
+| `containers` | base, docker |
+| `remotedesktop` | base, xfce4-headless-vnc |
+| `remote-workstation` | base, docker, xfce4-headless-vnc |
+| `debug` | base, debug |
+
+- `btrfs-progs` moves from docker to base.
+- group `remotedesktop` → `xfce4-headless-vnc`.
+- `debug` is a normal group (it only adds packages; verified: `mkosi.profiles/debug/` holds a
+  package list and nothing reads it elsewhere) → `--debug` and the `-debug` suffix go.
+- The default combination is the **first** line of `combinations.conf` (no hard-coded name in
+  initrd, `safespace-select`, compose).
+
+## Steps
+
+- [x] 1. Groups/combinations: `combinations.conf`, `lib/groups.sh` (names with digits and `-`),
+      `mkosi.profiles/xfce4-headless-vnc/`, `mkosi.conf` (btrfs-progs), `mkosi.postinst`
+      (groups from `$PROFILES`, no fixed list).
+- [x] 2. `build.sh`: drop `--groups`, `--version`, `--debug`, mkosi verbs; per-combination mkosi
+      run as a function (no recursive call); keys/repos/resources checked once.
+- [x] 3. **Security (stricter):** after composing, check the shipped UKI (`mkosi.postoutput` only
+      sees the per-combination ones): signed by the exported `db.pem`, `lockdown=integrity`, no
+      `roothash=`, `safespace.root.*` = the combinations in order with their `roothash-<name>`,
+      `.pcrsig` present, systemd-boot signed, layout consistent. Build fails otherwise.
+- [x] 4. initrd `select`: no `roothash=` fallback; default = first `safespace.root.*`.
+      `usb-bootdev`/`netroot`: single-root branches go. `safespace-select`: default = first.
+- [x] 5. `release.sh` (no `--groups`), `lib/verify.sh`, `lib/stick.sh`, `burn.sh`, `test-vm.sh`,
+      `diagnose.sh` (today single-root only: fails on a combined stick): combined only.
+- [x] 6. `lib/builds.sh`: `prune` keeps the newest N; no group filter.
+- [x] 7. `tests/vm.sh`: no `--groups`; db.pem no longer a prerequisite for a build run (the
+      test build exports it); step `select` boots every combination once and checks its groups.
+      (The test user and key are already its own: `mkosi.test/vm/users.conf`, `id_ed25519`.)
+- [x] 8. `tests/run.sh`: shared fixtures become a composed build; new tests (composed-UKI
+      checks, `--groups`/`--debug` refused, select default = first, no fallback).
+- [x] 9. Docs: README, NETBOOT.md, SECURITY.md, AGENTS.md; stale texts in scripts.
+      Also: `verify_release` (build host and servers) now requires `lockdown=integrity`;
+      `diagnose.sh` checks every pair of a stick (needs root and a stick: yours to run).
+- [x] 10. `tests/run.sh`: 164 passed (SKIP: initrd comparison, no build in mkosi.output/). `tests/vm.sh`: all 13 PASS (combined_20261020-0855); `--no-build select` with the debug attack-surface check: all PASS.
+
+## Breaks
+
+- `build.sh --groups/--debug`, `release.sh --groups`, `tests/vm.sh --groups`, `./build.sh
+  shell|boot|summary|...` are refused.
+- Single-root builds/releases are refused by `release.sh`, servers' check, `burn.sh`.
+- Combination names change (`base` → `root`, `docker` → `containers`): a machine with
+  `SafespaceSelect=docker` stops in the initrd with "not in this build" after the update:
+  `safespace-select clear` before, or select it at the firmware (boot entry) afterwards.
+- A stick holds all five roots (bigger stick needed).

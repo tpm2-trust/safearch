@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Download the images listed in docker-images.txt as docker-archive files into
-# mkosi.profiles/docker/mkosi.extra/usr/share/safespace/docker-images/, where a
-# build with the docker group (--groups base,docker) puts them
-# into the dm-verity protected root. At boot, safespace-docker-images.service
+# mkosi.profiles/docker/mkosi.extra/usr/share/safespace/docker-images/, where every
+# combination with the docker group (combinations.conf) puts them into its
+# dm-verity protected root. At boot, safespace-docker-images.service
 # loads them into Docker's storage on the data disk (/opt/docker).
 # Needs skopeo (pacman -S skopeo), no root and no running Docker.
 set -euo pipefail

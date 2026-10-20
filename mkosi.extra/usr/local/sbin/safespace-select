@@ -1,6 +1,6 @@
 #!/bin/bash
-# Preselect the combination this machine boots (combined builds, build.sh
-# --combined). The initrd reads the choice from an EFI variable; the root hash
+# Preselect the combination this machine boots. The initrd reads the choice
+# from an EFI variable; the root hash
 # of every combination is on the UKI's signed command line, so only the names
 # offered there can be selected (see /usr/local/lib/safespace/select in the
 # initrd).
@@ -9,7 +9,7 @@
 #                               the preselection
 #   safespace-select set NAME   boot NAME from the next boot on
 #   safespace-select once NAME  boot NAME on the next boot only
-#   safespace-select clear      no preselection: base
+#   safespace-select clear      no preselection: the first combination
 #
 # The variables (NV, BS, RT; vendor GUID 8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34):
 #   SafespaceSelect      the persistent preselection
@@ -25,7 +25,8 @@ die() { printf 'safespace-select: %s\n' "$*" >&2; exit 1; }
 
 cmdline=$(cat /proc/cmdline)
 mapfile -t NAMES < <(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace\.root\.\([a-z][a-z0-9-]*\)=[0-9a-f]\{64\}$/\1/p')
-((${#NAMES[@]})) || die "this build has no combinations (not built with build.sh --combined)"
+((${#NAMES[@]})) || die "no safespace.root.<name>= on the command line"
+DEFAULT=${NAMES[0]}
 
 # efivarfs makes variables of unknown vendors immutable: chattr -i before
 # deleting or replacing one.
@@ -50,12 +51,12 @@ case ${1:-list} in
 		echo "combinations: ${NAMES[*]}"
 		echo "booted:       $(booted || true)"
 		p=$(var_get SafespaceSelect) o=$(var_get SafespaceSelectOnce)
-		echo "preselected:  ${p:-base (none set)}"
+		echo "preselected:  ${p:-$DEFAULT (none set)}"
 		[[ -z $o ]] || echo "next boot:    $o (once)"
 		;;
 	set)
 		check_name "${2:?set needs a name}"
-		if [[ $2 == base ]]; then
+		if [[ $2 == "$DEFAULT" ]]; then
 			[[ $EUID -eq 0 ]] || die "must run as root"
 			var_rm SafespaceSelect
 		else
@@ -71,7 +72,7 @@ case ${1:-list} in
 	clear)
 		[[ $EUID -eq 0 ]] || die "must run as root"
 		var_rm SafespaceSelect SafespaceSelectOnce
-		echo "no preselection: base"
+		echo "no preselection: $DEFAULT"
 		;;
 	-h | --help) sed -n '2,${/^#/!q;s/^# \?//;p}' "$0" ;;
 	*) die "unknown command $1 (list, set, once, clear)" ;;

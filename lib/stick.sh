@@ -7,10 +7,10 @@
 #                                   an image file, created if missing)
 #
 # SRC is a directory with layout.sfdisk, systemd-boot.efi, boot.efi and the
-# root/verity files the layout names: root.img and root.verity (one root), or
-# root-<name>.img and root-<name>.verity per combination (build.sh without --groups;
-# the partitions are named root-<name> and root-<name>-verity). FETCH is a
-# command that prints a file's content (FETCH root.img), so burn.sh can stream
+# root/verity files the layout names: root-<name>.img and root-<name>.verity
+# per combination (the partitions are named root-<name> and
+# root-<name>-verity). FETCH is a command that prints a file's content
+# (FETCH root-<name>.img), so burn.sh can stream
 # the large files from a server; without it they are read from SRC. Each is
 # written into its partition and never beyond it.
 #
@@ -47,9 +47,7 @@ stick_files() { # SRC
 			split($i, kv, "="); k = kv[1]; v = kv[2]; gsub(/[ "]/, "", k); gsub(/[ "]/, "", v)
 			if (k ~ /start$/) start = v; else if (k == "size") size = v; else if (k == "name") name = v
 		}
-		if (name == "root-x86-64") f = "root.img"
-		else if (name == "root-x86-64-verity") f = "root.verity"
-		else if (name ~ /-verity$/) { sub(/-verity$/, "", name); f = name ".verity" }
+		if (name ~ /-verity$/) { sub(/-verity$/, "", name); f = name ".verity" }
 		else f = name ".img"
 		print f, start, size
 	}' "$1/layout.sfdisk"
@@ -65,7 +63,7 @@ stick_write() { # TARGET SRC [FETCH]
 	files=$(stick_files "$src")
 	[[ -n $files ]] || die "$layout: no root partitions"
 	while read -r f start size; do
-		[[ $f =~ ^root[a-z0-9-]*\.(img|verity)$ && $start =~ ^[0-9]+$ && $size =~ ^[0-9]+$ ]] ||
+		[[ $f =~ ^root-[a-z][a-z0-9-]*\.(img|verity)$ && $start =~ ^[0-9]+$ && $size =~ ^[0-9]+$ ]] ||
 			die "$layout: unexpected partition $f"
 		[[ -n $fetch ]] && continue
 		[[ -f $src/$f ]] || die "$src/$f missing"

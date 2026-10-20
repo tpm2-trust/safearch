@@ -4,16 +4,18 @@
 # No root, no temp space: everything is checked on the files as they are.
 #
 #   verify_release DIR DB_CERT
-#       boot.efi root.img root.verity roothash systemd-boot.efi layout.sfdisk
-#       cmdline release SHA256SUMS
+#       boot.efi systemd-boot.efi layout.sfdisk cmdline release SHA256SUMS,
+#       per combination root-<name>.img root-<name>.verity roothash-<name>
+#   verify_combinations CMDLINE  the combination names on a signed command line
 #   release_get FILE KEY        value of KEY=... in a release file (not sourced)
 #   verify_name_version VALUE
 #
 # What is trusted: only DB_CERT, the public Secure Boot db certificate. The
-# UKI and systemd-boot must carry a valid signature from it; the root hash is
-# taken from the UKI's signed command line, and the root image must match it
-# block by block. The partition table for sticks must name the partitions by
-# that root hash, as the initrd finds them. So a release that
+# UKI and systemd-boot must carry a valid signature from it; the root hashes
+# are taken from the UKI's signed command line (safespace.root.<name>=), and
+# each root image must match its hash block by block. The partition table for
+# sticks must name the partitions by those root hashes, as the initrd finds
+# them. So a release that
 # passes was built and signed by the holder of the db key, whatever path it
 # took to get here. SHA256SUMS only catches broken transfers.
 # On failure: a message on stderr and return 1.
@@ -48,10 +50,8 @@ verify_sums() { # DIR
 	(cd "$dir" && sha256sum --quiet --strict -c SHA256SUMS) >&2 || vfail "SHA256SUMS does not match (broken or incomplete transfer)"
 }
 
-# The signed command line: roothash= must be the release's root hash.
-verify_cmdline_roothash() { # CMDLINE ROOTHASH
-	[[ -n $2 && " $1 " == *" roothash=$2 "* ]] ||
-		vfail "the UKI's signed command line does not carry roothash=$2"
+verify_combinations() { # CMDLINE
+	tr ' ' '\n' <<<"$1" | sed -n 's/^safespace\.root\.\([a-z][a-z0-9-]*\)=[0-9a-f]\{64\}$/\1/p'
 }
 
 verify_release() { # DIR DB_CERT
@@ -65,53 +65,46 @@ verify_release() { # DIR DB_CERT
 	vinfo "SHA256SUMS ok"
 	version=$(release_get "$dir/release" VERSION)
 	verify_name_version "$version" || vfail "release has an invalid VERSION='$version'" || return
-	vinfo "release $(release_get "$dir/release" BUILD) (groups $(release_get "$dir/release" GROUPS))"
+	vinfo "release $(release_get "$dir/release" BUILD)"
 
 	verify_signature "$dir/boot.efi" "$cert" || return
 	verify_signature "$dir/systemd-boot.efi" "$cert" || return
 	vinfo "boot.efi and systemd-boot.efi signed by the db key"
 	cmdline=$(uki_cmdline "$dir/boot.efi")
+	[[ " $cmdline " == *" lockdown=integrity "* ]] || vfail "the UKI's signed command line lacks lockdown=integrity" || return
 	for url in $(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace\.netroot=//p'); do
 		urls=$((urls + 1))
 		vinfo "netroot URL: $url"
 	done
 	((urls)) || vinfo "no safespace.netroot= in the UKI: this release boots from sticks only"
 
-	# The roots: one (roothash=), or one per combination (safespace.root.<name>=);
-	# each "name file-suffix root-hash partition-name" ("_" = no suffix).
-	mapfile -t names < <(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace\.root\.\([a-z][a-z0-9-]*\)=[0-9a-f]\{64\}$/\1/p')
-	if ((${#names[@]})); then
-		[[ $(release_get "$dir/release" COMBINATIONS) == "$(IFS=,; echo "${names[*]}")" ]] ||
-			vfail "release names COMBINATIONS=$(release_get "$dir/release" COMBINATIONS), the signed command line ${names[*]}" || return
-		for n in "${names[@]}"; do
-			h=$(tr ' ' '\n' <<<"$cmdline" | sed -n "s/^safespace\.root\.$n=//p")
-			pairs+=("$n -$n $h root-$n")
+	# One root per combination, its hash from the signed command line.
+	mapfile -t names < <(verify_combinations "$cmdline")
+	((${#names[@]})) || vfail "the UKI's signed command line names no combination (safespace.root.<name>=)" || return
+	[[ $(release_get "$dir/release" COMBINATIONS) == "$(IFS=,; echo "${names[*]}")" ]] ||
+		vfail "release names COMBINATIONS=$(release_get "$dir/release" COMBINATIONS), the signed command line ${names[*]}" || return
+	vinfo "combinations on the signed command line: ${names[*]} (default ${names[0]})"
+	for n in "${names[@]}"; do
+		h=$(tr ' ' '\n' <<<"$cmdline" | sed -n "s/^safespace\.root\.$n=//p")
+		for f in "root-$n.img" "root-$n.verity" "roothash-$n"; do
+			[[ -f $dir/$f && ! -L $dir/$f ]] || vfail "$f missing" || return
 		done
-		vinfo "combinations on the signed command line: ${names[*]}"
-	else
-		h=$(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^roothash=//p' | tail -1)
-		pairs+=("- _ $h root-x86-64")
-	fi
-	for p in "${pairs[@]}"; do
-		read -r n f h _ <<<"$p"
-		[[ $f == _ ]] && f=""
-		for x in "root$f.img" "root$f.verity" "roothash$f"; do
-			[[ -f $dir/$x && ! -L $dir/$x ]] || vfail "$x missing" || return
-		done
-		[[ $h =~ ^[0-9a-f]{64}$ && $(tr -d '[:space:]' <"$dir/roothash$f") == "$h" ]] ||
-			vfail "roothash$f is not the root hash on the UKI's signed command line" || return
-		veritysetup verify "$dir/root$f.img" "$dir/root$f.verity" "$h" >&2 ||
-			vfail "root$f.img does not match the signed root hash" || return
-		vinfo "root$f.img matches the signed root hash"
+		[[ $(tr -d '[:space:]' <"$dir/roothash-$n") == "$h" ]] ||
+			vfail "roothash-$n is not the root hash on the UKI's signed command line" || return
+		veritysetup verify "$dir/root-$n.img" "$dir/root-$n.verity" "$h" >&2 ||
+			vfail "root-$n.img does not match the signed root hash" || return
+		vinfo "root-$n.img matches the signed root hash"
+		pairs+=("$n $h")
 	done
 	verify_layout "$dir" "${pairs[@]}" || return
 }
 
-# The stick's partition table: an ESP, and for each root a root and a verity
-# partition with the UUIDs the initrd looks for (the two halves of the root
-# hash, as systemd-repart derives them), large enough for the files.
-verify_layout() { # DIR "NAME SUFFIX HASH PARTNAME"...
-	local dir=$1 l=$1/layout.sfdisk p n f h pn want field size uuid; shift
+# The stick's partition table: an ESP, and for each combination a root and a
+# verity partition (root-<name>, root-<name>-verity) with the UUIDs the initrd
+# looks for (the two halves of the root hash, as systemd-repart derives them),
+# large enough for the files.
+verify_layout() { # DIR "NAME HASH"...
+	local dir=$1 l=$1/layout.sfdisk p n h want size uuid type name half file; shift
 	uuid_of() { sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12}).*/\1-\2-\3-\4-\5/' <<<"$1"; }
 	part() { # TYPE PARTNAME KEY: a value of the partition with that type and name
 		awk -v t="$1" -v pn="$2" -v k="$3" 'toupper($0) ~ "TYPE=" t && $0 ~ "name=\"" pn "\"" {
@@ -119,9 +112,8 @@ verify_layout() { # DIR "NAME SUFFIX HASH PARTNAME"...
 	[[ $(grep -c 'type=' "$l") == $((1 + 2 * $#)) ]] || vfail "layout.sfdisk: not 1 + 2 x $# partitions" || return
 	grep -qi 'type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B' "$l" || vfail "layout.sfdisk: no ESP" || return
 	for p in "$@"; do
-		read -r n f h pn <<<"$p"
-		[[ $f == _ ]] && f=""
-		for x in "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709:$pn:${h:0:32}:root$f.img" "2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5:$pn-verity:${h:32}:root$f.verity"; do
+		read -r n h <<<"$p"
+		for x in "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709:root-$n:${h:0:32}:root-$n.img" "2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5:root-$n-verity:${h:32}:root-$n.verity"; do
 			IFS=: read -r type name half file <<<"$x"
 			want=$(uuid_of "$half")
 			uuid=$(part "$type" "$name" uuid | tr A-F a-f)

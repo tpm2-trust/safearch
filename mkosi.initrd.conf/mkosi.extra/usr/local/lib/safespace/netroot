@@ -8,19 +8,19 @@
 # UKI, nothing from the network:
 #   safespace.netroot=<url>/  base URL of a distribution server, may be given
 #                             more than once (tried in order)
-#   roothash=<hash>           dm-verity root hash (added by mkosi)
-# veritysetup refuses a hash tree that does not match roothash=, and dm-verity
+#   safespace.root.<name>=<hash>  dm-verity root hash per combination; select
+#                             (next to this script) picks the combination
+# veritysetup refuses a hash tree that does not match that hash, and dm-verity
 # then checks every block that is read, with --panic-on-corruption. A
 # manipulated or wrong server can therefore only keep the machine from
 # booting, never change what boots. Plain HTTP is enough for that; HTTPS only
 # adds confidentiality (and needs a certificate curl trusts).
 #
-# Files expected under each URL (one release, written by release.sh):
-#   roothash      the release's root hash
-#   root.img      the root partition (erofs, dm-verity data)
-#   root.verity   its dm-verity hash tree
-# For a combined build (several combinations, select next to this script):
-# roothash-<name>, root-<name>.img, root-<name>.verity of the selected one.
+# Files expected under each URL (one release, written by release.sh), of the
+# selected combination only:
+#   roothash-<name>      its root hash
+#   root-<name>.img      its root partition (erofs, dm-verity data)
+#   root-<name>.verity   its dm-verity hash tree
 # A server only ever holds the newest release. If no server has this UKI's
 # release any more (another roothash), a newer one was published after the
 # firmware loaded this UKI: reboot, and the firmware loads the new boot.efi.
@@ -48,16 +48,11 @@ args() { printf '%s\n' "$cmdline" | tr ' ' '\n' | sed -n "s/^$1=//p"; }
 
 urls=$(args safespace.netroot)
 [ -n "$urls" ] || { msg "no safespace.netroot= on the kernel command line, nothing to do"; exit 0; }
-# Which root: a single build's roothash=, or the selected combination's.
+# Which root: the selected combination's.
 . "${0%/*}/select"
 select_root || die "no root to boot"
 roothash=$SELECT_HASH
-[ -n "$roothash" ] || die "no roothash= on the kernel command line"
-if [ -n "$SELECT_NAME" ]; then
-	F_IMG=root-$SELECT_NAME.img F_VERITY=root-$SELECT_NAME.verity F_HASH=roothash-$SELECT_NAME
-else
-	F_IMG=root.img F_VERITY=root.verity F_HASH=roothash
-fi
+F_IMG=root-$SELECT_NAME.img F_VERITY=root-$SELECT_NAME.verity F_HASH=roothash-$SELECT_NAME
 
 modprobe -a loop dm-verity erofs 2>/dev/null
 

@@ -19,8 +19,8 @@ find "$BUILDROOT/var" -mindepth 1 -delete
 echo "safespace: /var moved to /usr/share/factory/var ($(du -sh "$factory" | cut -f1))"
 
 # The systemd-stub the UKI is built from, next to the outputs: build.sh
-# --combined builds the common UKI of several combinations with exactly this
-# stub (lib/compose.sh). Not part of any release.
+# composes the common UKI of all combinations with exactly this stub
+# (lib/compose.sh). Not part of any release.
 stub=$BUILDROOT/usr/lib/systemd/boot/efi/linuxx64.efi.stub
 if [[ -f $stub && -n ${OUTPUTDIR:-} ]]; then
 	cp "$stub" "$OUTPUTDIR/${IMAGE_ID}_${IMAGE_VERSION}.systemd-stub"

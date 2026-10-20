@@ -68,8 +68,8 @@ When the user requests a programming task, **do not start coding immediately.**
 ## This project
 
 safespace-arch: a read-only, Secure-Boot-signed Arch Linux image built with
-mkosi 27: one build boots from a USB stick / SD card and over the network, package
-groups decide what is in it. README.md is
+mkosi 27: one build boots from a USB stick / SD card and over the network; it holds every
+combination of package groups (`combinations.conf`) as a root of its own. README.md is
 the user manual (read "Two roles" and "Deploy from scratch" first), NETBOOT.md
 the network-boot reference, SECURITY.md the applied hardening. Arch Linux only, everywhere.
 
@@ -78,11 +78,11 @@ the network-boot reference, SECURITY.md the applied hardening. Arch Linux only, 
 | Role | Files |
 |---|---|
 | build host (has the keys) | `build.sh` (entry point), `release.sh`, `fetch-images.sh`, `update-snapshot.sh`, `burn.sh`, `diagnose.sh`, `test-vm.sh`, `hwtest-image.sh` |
-| image configuration | `mkosi.conf` (the image, both boot paths), `mkosi.profiles/{remotedesktop,docker}/` (groups), `mkosi.profiles/debug/` (`--debug`), `mkosi.repart/`, `mkosi.extra/`, `mkosi.postinst`, `mkosi.finalize`, `mkosi.postoutput` |
+| image configuration | `mkosi.conf` (the image, both boot paths), `mkosi.profiles/{docker,xfce4-headless-vnc,debug}/` (groups), `mkosi.repart/`, `mkosi.extra/`, `mkosi.postinst`, `mkosi.finalize`, `mkosi.postoutput` |
 | initrd | `mkosi.initrd.conf/`: `usb-bootdev` (root from the stick) and `netroot` (root over HTTP), chosen at boot by `LoaderDevicePartUUID`; `select` (sourced by both: which root of a combined build) |
-| combinations | `combinations.conf`, `lib/compose.sh` (`build.sh` without `--groups`, the default: one UKI for several roots), `mkosi.extra/usr/local/sbin/safespace-select` |
+| combinations | `combinations.conf` (the first is the default), `lib/compose.sh` (one mkosi run per combination → one UKI for all roots; `compose_check`), `mkosi.extra/usr/local/sbin/safespace-select` |
 | distribution server | `server/` (`setup.sh`, `safespace-netboot`, units, nginx site, `server.conf.example`) |
-| shared shell code | `lib/repos.sh`, `lib/groups.sh`, `lib/keys.sh`, `lib/builds.sh` (the builds in `mkosi.output/<groups>_<version>/`: their parts, list, select, prune), `lib/stick.sh` (a stick assembled from the parts), `lib/verify.sh` (also installed on the servers) |
+| shared shell code | `lib/repos.sh`, `lib/groups.sh`, `lib/keys.sh`, `lib/builds.sh` (the builds in `mkosi.output/combined_<version>/`: their parts, list, prune), `lib/stick.sh` (a stick assembled from the parts), `lib/verify.sh` (also installed on the servers) |
 | tests | `tests/run.sh` (no root), `tests/vm.sh` (integration in QEMU), `tests/lib/` |
 | per-host files (gitignored, templates `*.example`) | `users.conf`, `netboot.conf`, `release.conf`, `mkosi.local.conf`, `repos.local.conf`, `server/server.conf` |
 
@@ -103,9 +103,13 @@ the network-boot reference, SECURITY.md the applied hardening. Arch Linux only, 
   both open the root the same way (dm-verity, signed root hash, `--panic-on-corruption`).
 - **One release per server**, fixed file names; the initrd's reaction to a replaced release
   must not turn into a reboot loop.
-- **Groups are the only difference between images.**
-- **A selection never supplies a root hash.** In a combined build the EFI variables /
-  `safespace.select=` only name a combination; its hash comes from the signed command line.
+- **Groups are the only difference between combinations;** every combination is a complete
+  root of its own (nothing shared or layered between roots), only the UKI is common.
+- **The composed UKI is checked like the per-combination ones** (`compose_check`): signer,
+  `lockdown=integrity`, no `roothash=`, every root hash in order, signed expected PCRs.
+- **A selection never supplies a root hash.** The EFI variables / `safespace.select=` only
+  name a combination; its hash comes from the signed command line, and without
+  `safespace.root.<name>=` there nothing is opened.
 - **Builds are kept and shipped as parts** (UKI, root, verity, root hash, systemd-boot,
   partition table); no disk image is stored or shipped.
 
@@ -116,9 +120,9 @@ the network-boot reference, SECURITY.md the applied hardening. Arch Linux only, 
   A SKIP is not a pass: say which tool was missing.
 - After a change to the image, the initrd, the build, the release or the server, run the
   integration test `tests/vm.sh` (test build with a throwaway user, release into its own
-  share, server check, QEMU boots from a stick and over the network, sealing, Secure Boot;
-  ~20 min with a warm cache; without --groups it builds and tests the whole stack, incl.
-  preselecting a combination). It needs the build host's sudo rule for `build.sh`; if a prerequisite is
+  share, server check, QEMU boots from a stick and over the network, sealing, Secure Boot,
+  every combination booted through the selection; one mkosi run per combination, so the
+  duration grows with `combinations.conf`). It needs the build host's sudo rule for `build.sh`; if a prerequisite is
   missing it says which: hand that to the user instead of working around it. Never release
   a test build (`mkosi.test/vm/builds/`) to a real server: it carries the test key.
 - Not testable without root or hardware — say so and hand it to the user with

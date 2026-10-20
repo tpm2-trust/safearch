@@ -7,7 +7,7 @@
 #   safespace-netboot status             the served release and its last check
 #   safespace-netboot verify [--changed] check the served release: Secure Boot
 #                                        signatures against the pinned db.pem,
-#                                        root image against the signed root hash,
+#                                        every root image against its signed root hash,
 #                                        the stick's partition table; --changed:
 #                                        only if it changed since the last check
 #                                        (the verify unit). Exit 1 if broken.
@@ -16,8 +16,9 @@
 #
 # Settings: /etc/safespace/server.conf (SAFESPACE_SERVER_CONF= overrides).
 # The share (served by nginx under /safespace/) holds one release, for both
-# boot paths: boot.efi root.img root.verity roothash systemd-boot.efi
-# layout.sfdisk manifest.json cmdline release SHA256SUMS.
+# boot paths: boot.efi systemd-boot.efi layout.sfdisk cmdline release
+# SHA256SUMS, per combination root-<name>.img root-<name>.verity
+# roothash-<name> manifest-<name>.json.
 # Result of the last check: $STATE/last (outside the share).
 set -Eeuo pipefail
 
@@ -103,7 +104,7 @@ status() {
 		return 0
 	fi
 	printf '%s, served since %s\n' "$(release_get "$r" BUILD)" "$(date -r "$r" '+%F %T')"
-	printf '  groups %s, built %s, snapshot %s, commit %s, %s packages\n' "$(release_get "$r" GROUPS)" \
+	printf '  combinations %s, built %s, snapshot %s, commit %s, %s packages\n' "$(release_get "$r" COMBINATIONS)" \
 		"$(release_get "$r" BUILT)" "$(release_get "$r" SNAPSHOT)" "$(release_get "$r" COMMIT)" "$(release_get "$r" PACKAGES)"
 	if [[ ! -f $STATE/last ]]; then
 		echo "  not checked yet (safespace-netboot verify)"

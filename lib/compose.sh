@@ -1,23 +1,25 @@
-# Combinations: several group sets in one build, one signed UKI for all.
-# Sourced by build.sh (without --groups); expects die(), log() and lib/groups.sh.
+# Combinations: the group sets of combinations.conf, one root each, one signed
+# UKI for all. Sourced by build.sh; expects die(), log(), lib/groups.sh and
+# lib/verify.sh.
 #
 #   combos_load FILE            read combinations.conf into COMBO_NAMES/COMBO_GROUPS
-#   compose_build DEST DIR...   one build directory per combination (same
-#                               order as COMBO_NAMES; the first is "base")
-#                               -> the combined build in DEST
-#   compose_layout OUT BASE_LAYOUT DIR   the stick's partition table: the ESP of
-#                               the base layout, then one root/verity pair per
+#                               (COMBO_NAMES[0]: the default, booted without a selection)
+#   compose_build DEST DIR...   one finalized mkosi build per combination (same
+#                               order as COMBO_NAMES) -> the build in DEST
+#   compose_check DEST DB_CERT  the composed build is what it must be (see there)
+#   compose_layout OUT FIRST_LAYOUT DIR   the stick's partition table: the ESP of
+#                               the first layout, then one root/verity pair per
 #                               combination (root-<name>.img/.verity in DIR)
 #
-# The combined build:
-#   boot.efi                 one UKI: kernel, initrd and microcode of the base
-#                            build, the command line with
+# The build:
+#   boot.efi                 one UKI: kernel, initrd and microcode of the first
+#                            combination, the command line with
 #                            safespace.root.<name>=<root hash> per combination
 #                            (instead of roothash=), signed with the db key and
 #                            with signed expected PCRs, from the image's stub
 #   systemd-boot.efi, layout.sfdisk
 #   root-<name>.img, root-<name>.verity, roothash-<name>, manifest-<name>.json
-#   vnc-password-<name>      (combinations with remotedesktop)
+#   vnc-password-<name>      (combinations with xfce4-headless-vnc)
 # The initrd picks the combination at boot (mkosi.initrd.conf/.../select).
 
 COMBO_NAMES=() COMBO_GROUPS=()
@@ -28,21 +30,19 @@ combos_load() { # FILE
 	[[ -f $1 ]] || die "no $1"
 	while IFS= read -r line; do
 		[[ $line =~ ^[[:space:]]*(#|$) ]] && continue
-		[[ $line =~ ^([a-z][a-z0-9-]{0,23})=([A-Za-z,[:space:]]+)$ ]] || die "$1: bad line: $line"
+		[[ $line =~ ^([a-z][a-z0-9-]{0,23})=([A-Za-z0-9,[:space:]-]+)$ ]] || die "$1: bad line: $line"
 		name=${BASH_REMATCH[1]} groups=${BASH_REMATCH[2]}
 		[[ " ${COMBO_NAMES[*]} " != *" $name "* ]] || die "$1: $name twice"
 		groups_parse "$groups"
 		COMBO_NAMES+=("$name")
 		COMBO_GROUPS+=("$(IFS=,; echo "${SAFESPACE_GROUPS[*]}")")
 	done <"$1"
-	[[ ${COMBO_NAMES[0]:-} == base && ${COMBO_GROUPS[0]} == base ]] ||
-		die "$1: the first combination must be base=base (what a machine boots without a selection)"
-	((${#COMBO_NAMES[@]} >= 2)) || die "$1: at least two combinations"
+	((${#COMBO_NAMES[@]})) || die "$1: no combination"
 }
 
 uki_section() { objcopy -O binary --only-section="$2" "$1" /dev/stdout 2>/dev/null | tr -d '\0'; }
 
-compose_layout() { # OUT BASE_LAYOUT DIR
+compose_layout() { # OUT FIRST_LAYOUT DIR
 	local out=$1 base=$2 dir=$3 h esp parts="" n part file start end size root half type name
 	h=$(sed -n '/^label:/p; /^label-id:/p; /^unit:/p; /^first-lba:/p' "$base")
 	esp=$(grep -i 'type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B' "$base") || die "$base: no ESP"
@@ -69,8 +69,8 @@ compose_layout() { # OUT BASE_LAYOUT DIR
 }
 
 # The common UKI, built as mkosi builds one (ukify with the same options), from
-# the base build's sections and the image's stub.
-compose_uki() { # OUT BASE_UKI STUB CMDLINE
+# the first combination's sections and the image's stub.
+compose_uki() { # OUT FIRST_UKI STUB CMDLINE
 	local out=$1 uki=$2 stub=$3 t
 	t=$(mktemp -d)
 	for s in linux initrd ucode osrel; do
@@ -92,13 +92,13 @@ compose_build() { # DEST DIR...
 	shift
 	(($# == ${#COMBO_NAMES[@]})) || die "compose_build: ${#COMBO_NAMES[@]} combinations, $# builds"
 	mkdir -p "$dest"
-	[[ -f $base/systemd-stub.efi ]] || die "$base has no systemd-stub.efi (built before mkosi.finalize kept it?)"
-	# All combinations must run the base build's kernel.
+	[[ -f $base/systemd-stub.efi ]] || die "$base has no systemd-stub.efi (mkosi.finalize keeps it)"
+	# All combinations must run the first one's kernel.
 	uname=$(uki_section "$base/boot.efi" .uname)
 	for d in "$@"; do
 		[[ $(uki_section "$d/boot.efi" .uname) == "$uname" ]] || die "$d has another kernel than $base ($uname)"
 	done
-	# The command line: base's, with one root hash per combination instead of roothash=.
+	# The command line: the first one's, with one root hash per combination instead of roothash=.
 	cmdline=$(uki_section "$base/boot.efi" .cmdline | tr ' ' '\n' | grep -v '^roothash=' | grep . | tr '\n' ' ')
 	i=0
 	for d in "$@"; do
@@ -119,4 +119,29 @@ compose_build() { # DEST DIR...
 	cp "$base/systemd-boot.efi" "$dest/systemd-boot.efi"
 	compose_layout "$dest/layout.sfdisk" "$base/layout.sfdisk" "$dest"
 	chmod 0644 "$dest"/{boot.efi,systemd-boot.efi,layout.sfdisk} "$dest"/root-* "$dest"/roothash-* "$dest"/manifest-*
+}
+
+# The composed UKI is what ships, and mkosi.postoutput only saw the
+# per-combination ones: check it again before the build counts as built.
+# Signed by exactly the exported db.pem (as systemd-boot), lockdown=integrity
+# on its signed command line, no roothash= (only the selection's), every
+# combination with its own root hash in order, signed expected PCRs, and a
+# partition table that names every pair by its hash.
+compose_check() { # DEST DB_CERT
+	local dest=$1 cert=$2 cmdline names n h pairs=()
+	verify_signature "$dest/boot.efi" "$cert" || die "the composed UKI is not signed by $cert"
+	verify_signature "$dest/systemd-boot.efi" "$cert" || die "systemd-boot.efi is not signed by $cert"
+	cmdline=$(uki_cmdline "$dest/boot.efi")
+	[[ " $cmdline " == *" lockdown=integrity "* ]] || die "the composed UKI's command line lacks lockdown=integrity"
+	[[ " $cmdline " != *" roothash="* ]] || die "the composed UKI's command line still carries roothash="
+	names=$(verify_combinations "$cmdline" | tr '\n' ' ')
+	[[ $names == "${COMBO_NAMES[*]} " ]] || die "the composed UKI names '${names% }', not the combinations ${COMBO_NAMES[*]}"
+	for n in "${COMBO_NAMES[@]}"; do
+		h=$(tr ' ' '\n' <<<"$cmdline" | sed -n "s/^safespace\.root\.$n=//p")
+		[[ $(tr -d '[:space:]' <"$dest/roothash-$n") == "$h" ]] || die "roothash-$n is not the hash on the composed UKI's command line"
+		pairs+=("$n $h")
+	done
+	objdump -h "$dest/boot.efi" | grep -q '[[:space:]]\.pcrsig[[:space:]]' || die "the composed UKI has no signed expected PCRs (.pcrsig)"
+	verify_layout "$dest" "${pairs[@]}" >/dev/null || die "layout.sfdisk does not match the roots"
+	log "composed UKI checked: signed by the exported db.pem, lockdown=integrity, ${#COMBO_NAMES[@]} roots by their signed hashes"
 }

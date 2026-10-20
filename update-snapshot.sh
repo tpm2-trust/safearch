@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Move the pinned Arch Linux Archive snapshot (SNAPSHOT= in repos.conf) to the
-# newest available day. The next `sudo ./build.sh <variant>` then installs the
+# newest available day. The next `sudo ./build.sh` then installs the
 # updated packages (only changed ones are downloaded; the incremental cache is
 # rebuilt automatically).
 #

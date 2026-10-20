@@ -35,8 +35,7 @@ msg() { echo "usb-bootdev: $*" >/dev/kmsg; }
 cmdline=$(cat /proc/cmdline)
 arg() { printf '%s\n' "$cmdline" | tr ' ' '\n' | sed -n "s/^$1=//p" | tail -n 1; }
 
-# Which root: a single build's roothash=, or the selected combination's
-# (select, next to this script).
+# Which root: the selected combination's (select, next to this script).
 . "${0%/*}/select"
 select_root || exit 1
 roothash=$SELECT_HASH
@@ -44,7 +43,7 @@ roothash=$SELECT_HASH
 case $roothash in
 	*[!0-9a-f]* | '') roothash="" ;;
 esac
-[ ${#roothash} -eq 64 ] || { msg "ERROR: no valid roothash= on the kernel command line"; exit 1; }
+[ ${#roothash} -eq 64 ] || { msg "ERROR: no valid root hash for $SELECT_NAME on the kernel command line"; exit 1; }
 uuid() { printf '%s' "$1" | sed 's/^\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)$/\1-\2-\3-\4-\5/'; }
 partuuid=$(uuid "$(printf '%s' "$roothash" | cut -c1-32)")
 hashuuid=$(uuid "$(printf '%s' "$roothash" | cut -c33-64)")

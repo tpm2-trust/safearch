@@ -4,9 +4,10 @@ A Secure-Boot-signed Arch Linux system for USB sticks, SD cards and network boot
 UEFI machines (no legacy BIOS), built with
 [mkosi](https://github.com/systemd/mkosi) (written for mkosi 27). The system is
 **read-only**: nothing is written to the boot medium at runtime. The root is protected by
-dm-verity, `/var` lives in RAM, and only disks mounted at runtime are writable. What goes
-into an image on top of the base system is chosen with **package groups**: an XFCE desktop
-over VNC (`remotedesktop`), Docker with its storage on a data disk (`docker`).
+dm-verity, `/var` lives in RAM, and only disks mounted at runtime are writable. A build holds
+several **combinations** of **package groups** on top of the base system (Docker with its
+storage on a data disk, an XFCE desktop over VNC, diagnostic tools), each a complete root of
+its own; a machine boots one of them and loads only that one.
 
 Arch Linux only: the images, the build host and the distribution servers.
 
@@ -17,12 +18,12 @@ and over the network; the initrd tells them apart at boot:
 |---|---|---|
 | How the firmware starts the UKI | systemd-boot on the stick (`\EFI\BOOT\BOOTX64.EFI`) starts it from the ESP | the firmware downloads it itself (UEFI HTTP boot, or PXE/TFTP) |
 | How the initrd knows | `LoaderDevicePartUUID` is set (started from a partition) | it is not |
-| Where the root comes from | `usb-bootdev`: the root and hash partitions on the stick, found by the UUIDs derived from the signed root hash; the stick is set read-only at block level | `netroot`: `root.img` and `root.verity` over HTTP from `safespace.netroot=` into a tmpfs |
+| Where the root comes from | `usb-bootdev`: the selected combination's root and hash partitions on the stick, found by the UUIDs derived from its signed root hash; the stick is set read-only at block level | `netroot`: the selected combination's `root-<name>.img` and `root-<name>.verity` over HTTP from `safespace.netroot=` into a tmpfs |
 | Opened as | `/dev/mapper/root` through dm-verity with the signed root hash, `--panic-on-corruption` | the same |
 | USB devices | only the path to the stick is authorized | nothing on USB is authorized (the NIC must be PCI/PCIe) |
 | Gets to the machines | `sudo ./burn.sh /dev/sdX` (on the build host, or anywhere from a distribution server) | `./release.sh` to the distribution servers |
 
-Everything else is identical: package groups, users, hardening, volatile `/var`, Secure Boot
+Everything else is identical: combinations, users, hardening, volatile `/var`, Secure Boot
 signature and `safespace-seal`. **[NETBOOT.md](NETBOOT.md)** is the in-depth reference for
 network boot (trust model, other DHCP servers, firmware, troubleshooting);
 **[AGENTS.md](AGENTS.md)** is the guide for working on this repository.
@@ -68,14 +69,14 @@ flowchart LR
 | Network | pushes out over ssh; needs no inbound access | serves HTTP (and DHCP/TFTP); accepts uploads only through the restricted upload account |
 
 **One release per server.** A distribution server serves the newest release under fixed
-names: `boot.efi` (the signed UKI), `root.img`, `root.verity`, `roothash`, `systemd-boot.efi`
-and `layout.sfdisk` (the partition table for sticks), plus `manifest.json`, `cmdline`,
-`release`, `SHA256SUMS`. No disk image is stored or shipped anywhere: `burn.sh` assembles a
+names: `boot.efi` (the signed UKI), `systemd-boot.efi`, `layout.sfdisk` (the partition table
+for sticks), per combination `root-<name>.img`, `root-<name>.verity`, `roothash-<name>`,
+`manifest-<name>.json`, plus `cmdline`, `release`, `SHA256SUMS`. No disk image is stored or shipped anywhere: `burn.sh` assembles a
 stick from the parts. `release.sh` replaces a release with `rsync --delay-updates`: the new
 files are collected in a temp directory and renamed in one go at the end, and a download
 already running finishes on the old file. There are no versions, channels or links to
-maintain on the server; all machines of a server boot the same image, and **package groups
-are the only difference between images**.
+maintain on the server; all machines of a server boot the same build, and **package groups
+are the only difference between its combinations**.
 
 **What a distribution server checks:** after every upload, `safespace-netboot verify` checks
 the release against the public `db.pem`, which was pinned when the server was set up: the
@@ -181,55 +182,59 @@ A stick from anywhere with a checkout: `sudo ./burn.sh http://<server>/safespace
 
 ## Package groups
 
-Without options `build.sh` builds the whole stack: every combination of
-`combinations.conf` in one build ([Combinations](#combinations-the-whole-stack-in-one-build)).
-`--groups LIST` (comma-separated, case-insensitive) makes a single build of exactly that
-group set instead.
+A group is what goes into a root on top of the base system:
 
 | Group | What it adds | Where it is defined |
 |---|---|---|
-| `base` (always) | kernel, firmware, microcode, systemd, openssh, sudo, nftables, usbguard, cryptsetup, efitools + openssl (`safespace-seal`), vim, tmux, qemu-guest-agent; users, ssh, hardening, volatile `/var` | `mkosi.conf`, `mkosi.extra/` |
-| `remotedesktop` | XFCE, TigerVNC on `localhost:5901` (through an ssh tunnel), firefox, vlc, gwenview, fonts, pulseaudio; VNC user and password (`safespace.env`) | `mkosi.profiles/remotedesktop/` |
+| `base` (always) | kernel, firmware, microcode, systemd, openssh, sudo, nftables, usbguard, cryptsetup, btrfs-progs, efitools + openssl (`safespace-seal`), vim, tmux, qemu-guest-agent; users, ssh, hardening, volatile `/var` | `mkosi.conf`, `mkosi.extra/` |
 | `docker` | Docker and containerd with their storage on a data disk at `/opt/docker`, the shipped images (`fetch-images.sh`) and their loader; users get the `docker` group. Docker is not started at boot (see [Docker](#docker)) | `mkosi.profiles/docker/` |
-
-```sh
-sudo ./build.sh                                            # the whole stack (combinations.conf)
-sudo ./build.sh --groups base                              # a single build: base only
-sudo ./build.sh --groups base,RemoteDesktop                # a single build: + desktop
-```
+| `xfce4-headless-vnc` | XFCE, TigerVNC on `localhost:5901` (through an ssh tunnel), firefox, vlc, gwenview, fonts, pulseaudio; VNC user and password (`safespace.env`) | `mkosi.profiles/xfce4-headless-vnc/` |
+| `debug` | diagnostic tools: ethtool, dmidecode, pciutils, usbutils, lshw, iperf3, tcpdump, kexec-tools | `mkosi.profiles/debug/` |
 
 Each group except `base` is a mkosi profile of its own name, with its packages, files
 (`mkosi.extra/`) and service presets; `lib/groups.sh` knows the names and refuses unknown
-ones. The build records the set: the build's directory name and `build.json`,
-`/usr/lib/safespace/groups` in the image, `GROUPS=` in the release, and
-`safespace-netboot status` on the servers. A new group is a new directory
-`mkosi.profiles/<name>/` plus its name in `GROUPS_KNOWN` in `lib/groups.sh`.
+ones. The image records its groups in `/usr/lib/safespace/groups`. A new group is a new
+directory `mkosi.profiles/<name>/` plus its name in `GROUPS_KNOWN` in `lib/groups.sh`.
 
-`--debug` is **not** a group and stays separate: it adds diagnostic tools (ethtool,
-dmidecode, pciutils, usbutils, lshw, iperf3, tcpdump, kexec-tools) and marks the version
-`-debug`; no security setting is changed. Under the kernel lockdown (`lockdown=integrity`,
+`debug` is a group like the others because it only adds packages: no setting of the image
+depends on it (`tests/run.sh groups` checks that its profile is a package list and nothing
+else refers to it). Under the kernel lockdown (`lockdown=integrity`,
 [SECURITY.md](SECURITY.md)) `kexec-tools` can only start signed kernels and `lshw` loses its
 `/dev/mem` fallback (less detail); `dmidecode` reads `/sys/firmware/dmi` and is unaffected.
-Debug builds are still not meant for production servers.
 
 ## Combinations: the whole stack in one build
 
-`sudo ./build.sh` (no `--groups`) builds every combination of `combinations.conf`
-(`<name>=<groups>`, the first must be `base=base`; shipped: `base` and `docker=base,docker`)
-in one run and composes them into one build, `mkosi.output/combined_<version>/`:
+`combinations.conf` lists what a build holds, `<name>=<groups>`, one per line:
 
-- one signed UKI (`boot.efi`): kernel, initrd and microcode of `base`, built with ukify from
-  the image's own systemd-stub, signed with the db key and with signed expected PCRs. Its
-  command line names every combination with its root hash, `safespace.root.<name>=<hash>`,
-  instead of `roothash=`;
+| Combination | Groups |
+|---|---|
+| `root` (the default: booted without a selection) | base |
+| `containers` | base, docker |
+| `remotedesktop` | base, xfce4-headless-vnc |
+| `remote-workstation` | base, docker, xfce4-headless-vnc |
+| `debug` | base, debug |
+
+`sudo ./build.sh` builds every combination with a mkosi run of its own (the groups as
+profiles) and composes them into one build, `mkosi.output/combined_<version>/`:
+
+- one signed UKI (`boot.efi`): kernel, initrd and microcode of the first combination, built
+  with ukify from the image's own systemd-stub, signed with the db key and with signed
+  expected PCRs. Its command line names every combination with its root hash,
+  `safespace.root.<name>=<hash>` (no `roothash=`);
 - per combination `root-<name>.img`, `root-<name>.verity`, `roothash-<name>`,
   `manifest-<name>.json`; one `layout.sfdisk` with the ESP and a root/verity pair per
   combination (partitions `root-<name>`, `root-<name>-verity`, UUIDs from each root hash).
 
-Every combination is a complete root, built and verified like a single build; nothing is
-layered at runtime. `release.sh` (or `--groups combined`) releases the newest one (`COMBINATIONS=`
-in `release`), the server checks every root against its signed hash, `burn.sh` writes all
-pairs onto the stick. Over the network a machine downloads only the root it boots.
+Every combination is a complete root; nothing is shared between roots or layered at runtime.
+Only the UKI is common (all combinations run the same kernel; the build refuses otherwise).
+Before the build counts as built, `build.sh` checks the composed UKI again, since
+`mkosi.postoutput` only saw the per-combination ones: signed by exactly the exported
+`db.pem`, `lockdown=integrity` on its command line, no `roothash=`, every combination with
+its own hash in order, signed expected PCRs, and a partition table that names every pair by
+its hash. `release.sh` releases it (`COMBINATIONS=` in `release`), the server checks every
+root against its signed hash, `burn.sh` writes all pairs onto the stick (the stick must hold
+all roots). Over the network a machine downloads only the root it boots; from a stick only
+that pair is opened.
 
 **Which root boots** is decided in the initrd (`mkosi.initrd.conf/.../select`), first match:
 
@@ -237,28 +242,31 @@ pairs onto the stick. Over the network a machine downloads only the root it boot
 2. EFI variable `SafespaceSelectOnce-8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34`: this boot only,
    the initrd deletes it before opening the root
 3. EFI variable `SafespaceSelect-8a3e6c1d-…`: the persistent preselection
-4. `base`
+4. the first combination (`root`)
+
+Without any `safespace.root.<name>=` on the command line the initrd opens nothing.
 
 On the machine (root):
 
 ```sh
-safespace-select              # combinations of this build, the booted one, the preselection
-safespace-select set docker   # boot docker from the next boot on
-safespace-select once base    # next boot only
-safespace-select clear        # back to base
+safespace-select                  # combinations of this build, the booted one, the preselection
+safespace-select set containers   # boot containers from the next boot on
+safespace-select once root        # next boot only
+safespace-select clear            # back to the first combination
 ```
 
-So a machine is sealed once on `base` (`safespace-seal`), then preselected. The variable only
-**names** a combination; its root hash always comes from the signed command line, so
+So a machine is sealed once on the default (`safespace-seal`), then preselected. The variable
+only **names** a combination; its root hash always comes from the signed command line, so
 whoever can write the variable (root on the machine, or the firmware setup without a
 password) can choose between the signed roots, never boot an unsigned one. An unknown name
-stops the boot with a message instead of falling back silently. The choice is not measured
-into a PCR yet (Open decisions).
+stops the boot with a message instead of falling back silently: renaming a combination in
+`combinations.conf` stops machines preselected to the old name (`safespace-select clear`
+before the update). The choice is not measured into a PCR yet (Open decisions).
 
-Tested by `tests/run.sh combined` (compose with ukify, release check, tampering, stick,
-selection order, netroot downloading only the selected root) and `tests/vm.sh` (default)
-(step `select` on the sealed firmware: base → `set docker` → docker → `once base` → base →
-docker).
+Tested by `tests/run.sh` (sections `compose`: the composed UKI and every check of
+`compose_check`, the selection order; `netroot`: only the selected root downloaded; `stick`,
+`server`: all pairs) and `tests/vm.sh` (step `select` on the sealed firmware: every
+combination booted once, its name and groups checked).
 
 ## Secure Boot keys
 
@@ -303,71 +311,72 @@ replacement, not for `APPEND_WRITE` (`tests/run.sh keys` has the checker).
 
 ### Builds
 
-Every build gets a directory of its own, named by its group set and its build time, so the
-builds of one group set sort together. Builds wait there until they are released (or
-pruned), any number of them:
+Every build gets a directory of its own, named by its build time. Builds wait there until
+they are released (or pruned), any number of them:
 
 ```
 mkosi.output/
-├── base-remotedesktop-docker_20261019-0930/
-│   ├── boot.efi                   the signed UKI (sticks and network)
-│   ├── root.img, root.verity      the root partition and its dm-verity hash tree
-│   ├── roothash                   the root hash (also on the UKI's signed command line)
-│   ├── systemd-boot.efi           the signed systemd-boot, \EFI\BOOT\BOOTX64.EFI on a stick
-│   ├── layout.sfdisk              a stick's partition table (UUIDs derived from the root hash)
-│   ├── manifest.json              the packages
-│   ├── vnc-password               (remotedesktop) the generated VNC password, 0600
-│   ├── build.json                 groups, start/end, snapshot + mirror, commit
-│   │                              (+ uncommitted changes?), signing certificate, packages, sizes
-│   └── released.log               one line per push: time, target
-└── base_20261019-1012/ …
+├── combined_20261019-0930/
+│   ├── boot.efi                     the signed UKI (sticks and network), all combinations
+│   ├── systemd-boot.efi             the signed systemd-boot, \EFI\BOOT\BOOTX64.EFI on a stick
+│   ├── layout.sfdisk                a stick's partition table (UUIDs derived from the root hashes)
+│   ├── root-<name>.img, .verity     per combination: the root partition and its dm-verity hash tree
+│   ├── roothash-<name>              its root hash (also on the UKI's signed command line)
+│   ├── manifest-<name>.json         its packages
+│   ├── vnc-password-<name>          (xfce4-headless-vnc) the generated VNC password, 0600
+│   ├── build.json                   combinations, start/end, snapshot + mirror, commit
+│   │                                (+ uncommitted changes?), signing certificate, packages, sizes
+│   └── released.log                 one line per push: time, target
+└── combined_20261019-1012/ …
 ```
 
 The directory name is **the build**: `list`, `release.sh --build`, the release and the
-servers' `status` show it. The image version inside stays the timestamp; a second build of
-the same group set in the same minute gets the seconds too. After the build the directory
-belongs to the user who ran `sudo`, so everything below works without root.
+servers' `status` show it. The image version inside stays the timestamp; a second build in the
+same minute gets the seconds too. After the build the directory belongs to the user who ran
+`sudo`, so everything below works without root.
 
-**The parts:** mkosi builds a disk image as usual (ESP, root, verity); right after the build,
-`build.sh` keeps only the parts above (`builds_finalize` in `lib/builds.sh`), under short
-names, uncompressed (the root is erofs, compressed already): it takes the signed systemd-boot
-and the partition table (`sfdisk -d`) out of the image, then deletes the image and mkosi's
-separate initrd copy. A build is ~2.2 GB.
+**The parts:** for each combination mkosi builds a disk image as usual (ESP, root, verity) in
+`mkosi.output/.parts-<version>/<name>/`; right after its run `build.sh` keeps only the parts
+(`builds_finalize` in `lib/builds.sh`), uncompressed (the root is erofs, compressed already):
+it takes the signed systemd-boot and the partition table (`sfdisk -d`) out of the image, then
+deletes the image and mkosi's separate initrd copy. `lib/compose.sh` then makes the build
+from them and the parts directory goes. A build is ~2 GB per combination.
 
 ```sh
-./build.sh list                       # all builds: groups, built at, snapshot, packages, size, last release
-./build.sh show base_20261019-1012    # build.json readable, the package list, where it was released
-./build.sh diff base-remotedesktop-docker_20261019-0930 base_20261019-1012   # + added, - removed, ~ upgraded
-./build.sh prune                      # keep 3 per group set (--keep N, --yes)
-sudo ./build.sh purge-cache           # drop mkosi's image cache (--packages: also the downloads)
+./build.sh list                              # all builds: built at, snapshot, packages, size, last release
+./build.sh show combined_20261019-1012       # build.json readable, the package lists, where it was released
+./build.sh diff combined_20261019-0930 combined_20261019-1012   # per combination: + added, - removed, ~ upgraded
+./build.sh prune                             # keep the newest 3 (--keep N, --yes)
+sudo ./build.sh purge-cache                  # drop mkosi's image cache (--packages: also the downloads)
 ```
+
+`build.sh` only builds; a combination's resolved configuration is mkosi's own:
+`mkosi --profile=docker --profile=xfce4-headless-vnc summary`.
 
 `prune` never deletes the build last released to a target, and removes the leftovers of
 failed builds (directories without `build.json`). **Caches:** the downloaded packages
-(`mkosi.pkgcache/`) serve every build; mkosi's image cache (`mkosi.cache/`) holds the
-installed system of one package list, so a build with another group set than the previous
-one installs again from the local packages (no downloads) and replaces it. `purge-cache`
-starts both over when they are suspect or too big.
+(`mkosi.pkgcache/`) serve every combination; mkosi's image cache (`mkosi.cache/`) holds the
+installed system of one package list, so each combination installs again from the local
+packages (no downloads). `purge-cache` starts both over when they are suspect or too big.
 
 ### Every release
 
 ```sh
 sudo ./build.sh                                   # the whole stack; -f to rebuild unchanged packages
-./release.sh --groups base,remotedesktop          # the newest single build of that group set
-./release.sh --build base_20261019-1012           # exactly this build
-./release.sh                                      # the newest build, whatever its groups
+./release.sh --build combined_20261019-1012       # exactly this build
+./release.sh                                      # the newest build
 ```
 
 Targets: `RELEASE_TARGETS=` in `release.conf`, or `--push safespace@dist1 --push …`. Before
-pushing, `release.sh` prints the build it picked (groups, built at, snapshot, commit,
-packages) and warns if a newer build of another group set was never released. Every push is
+pushing, `release.sh` prints the build it picked (combinations, built at, snapshot, commit,
+packages) and warns if a newer build was never released. Every push is
 appended to the build's `released.log`.
 
 `release.sh` stages the build's parts in `mkosi.release/` as hardlinks (nothing copied or
 unpacked) with `cmdline` (the UKI's signed command line, readable), `release` (VERSION, BUILD,
-GROUPS, BUILT, SNAPSHOT, COMMIT, PACKAGES) and `SHA256SUMS`, checks it exactly as the servers
-will (signatures against `db.pem`, root image against the signed root hash, the partition
-table; `lib/verify.sh`), and pushes it into the share of every target, the file `release`
+COMBINATIONS, BUILT, SNAPSHOT, COMMIT, PACKAGES) and `SHA256SUMS`, checks it exactly as the
+servers will (signatures against `db.pem`, `lockdown=integrity` on the signed command line,
+every root image against its signed root hash, the partition table; `lib/verify.sh`), and pushes it into the share of every target, the file `release`
 last. Machines take the new release on their next boot; a running machine is unaffected, it
 has everything in RAM.
 
@@ -375,8 +384,8 @@ has everything in RAM.
 (`./build.sh list` shows them, with their last release).
 
 **A machine that downloads during a release:** it may get the old `boot.efi` and then the new
-`root.img`. dm-verity refuses that, as it must; the initrd sees that the server now has
-another release (its `roothash`) and reboots after 10 s, and the firmware loads the new
+`root-<name>.img`. dm-verity refuses that, as it must; the initrd sees that the server now has
+another release (its `roothash-<name>`) and reboots after 10 s, and the firmware loads the new
 `boot.efi`. If no server answers with this UKI's release and the image is refused anyway, it
 stops with an error instead (no reboot loop).
 
@@ -429,7 +438,7 @@ and 4011.
 ### Every day
 
 ```sh
-safespace-netboot status                     # what is served, its groups, the last check
+safespace-netboot status                     # what is served, its combinations, the last check
 sudo safespace-netboot verify                # check again now
 journalctl -u safespace-netboot-verify       # the checks, with the reason if one failed
 systemctl --failed                           # a broken release shows up here
@@ -566,9 +575,8 @@ boots with enforced Secure Boot, and checks each boot over ssh. It touches no re
 build or server. Exit 0 only if every step passed.
 
 ```sh
-tests/vm.sh                          # build the whole stack, release, all steps (~20 min, warm cache)
+tests/vm.sh                          # build the whole stack, release, all steps
 tests/vm.sh --no-build stick net     # the last test build, two steps only
-tests/vm.sh --groups base,docker     # a single build of this group set (no step select)
 ```
 
 | Step | What | Checked |
@@ -578,11 +586,11 @@ tests/vm.sh --groups base,docker     # a single build of this group set (no step
 | `net` | UEFI HTTP boot of the share | `netroot` opened the root, no `usb-bootdev`, no `LoaderDevicePartUUID`, `verified`, `running` |
 | `seal` | Setup Mode → `safespace-seal` → the sealed firmware | Secure Boot `enabled (user)`, `verified`, `running` |
 | `net-sb` | network boot with enforced Secure Boot | Secure Boot enabled, `verified`, `running` |
-| `select` (whole stack) | on the sealed firmware: no selection, `safespace-select set docker`, `once base`, then again | `base`, `docker` (the docker command present), `base` once, `docker` again; each Secure Boot enabled and `verified` |
+| `select` | on the sealed firmware, every combination once: no selection, `safespace-select set <second>`, `once <first>`, the second again (persistent), then `once` for each further one, `clear` | the booted combination's name and groups (`/usr/lib/safespace/groups`; the docker command exactly with the docker group); `debug` has exactly the default's setuid/setgid files, file capabilities and enabled units; each Secure Boot enabled and `verified` |
 
 **Kept apart from everything real**, in `mkosi.test/vm/` (gitignored): the test user
-`tester` and its key (created on the first run), the test builds (`build.sh --users
-mkosi.test/vm/users.conf --output-root mkosi.test/vm/builds`; the newest per group set is
+`tester` and its key (created on the first run, used for nothing else), the test builds
+(`build.sh --users mkosi.test/vm/users.conf --output-root mkosi.test/vm/builds`; the newest is
 kept; `./build.sh list` and `./release.sh` never see them, so a build with the test key
 cannot reach a real server by accident), and one directory per run with the share and the
 logs. The test build loads its root from `http://10.0.2.2:8790/` (QEMU's view of the build
@@ -633,7 +641,7 @@ Common to both:
   the server's IP in `netboot.conf`, or the name plus the IP as fallback
   (`NETROOT_URL="http://arch.boot.internal/safespace/ http://10.0.0.1/safespace/"`, tried in
   order), and rebuild. Check on the VM host: `getent hosts arch.boot.internal`.
-- **RAM:** at least root.img + 2 GiB (4 GiB).
+- **RAM:** at least the booted root image + 2 GiB (4 GiB).
 - **Guest agent:** the image has `qemu-guest-agent`. It starts by itself when the VM has the
   agent channel (virtio port `org.qemu.guest_agent.0`) and reports IP addresses, OS, host
   name, users and filesystems to the VM host. It only answers those queries and
@@ -750,17 +758,19 @@ Partitions of the `usb` image (what `burn.sh` writes):
 | # | Partition | Content |
 |---|---|---|
 | 1 | ESP, 512 MiB, FAT | signed systemd-boot `\EFI\BOOT\BOOTX64.EFI`, signed UKI `\EFI\Linux\*.efi` |
-| 2 | root, erofs (zstd) | `/usr`, `/etc`, factory `/var`, shipped Docker images |
-| 3 | root-verity | dm-verity hash tree for partition 2 |
+| 2, 4, … | `root-<name>`, erofs (zstd), one per combination | `/usr`, `/etc`, factory `/var`, shipped Docker images |
+| 3, 5, … | `root-<name>-verity` | dm-verity hash tree of the partition before it |
 
-The `network` image has partitions 2 and 3 only; they are published as separate files
-(`root.img`, `root.verity`) and the UKI is served on its own. See
+Each mkosi run lays out ESP, root, verity (`mkosi.repart/`); `lib/compose.sh` writes the
+stick's table with one pair per combination. Over the network the same pairs are published as
+separate files (`root-<name>.img`, `root-<name>.verity`) and the UKI is served on its own. See
 [NETBOOT.md](NETBOOT.md).
 
 ## How the integrity protection works
 
 dm-verity itself uses **no keys**. It's a sha256 hash tree over root, and its only anchor of
-trust is the **root hash**. That hash sits in the kernel command line inside the UKI, and
+trust is the **root hash**. That hash (one per combination, `safespace.root.<name>=`) sits in
+the kernel command line inside the UKI, and
 the UKI is signed with your sbctl **`db` key**. So everything rests on the Secure Boot
 signature:
 
@@ -769,9 +779,11 @@ signature:
    uses `db.key`).
 2. The command line is part of the signed file. Under Secure Boot, systemd-stub ignores any
    command line passed from outside.
-3. The initrd (also signed) reads `roothash=`. usb: it finds the root and hash partitions by
-   the UUIDs derived from it. network: it downloads `root.img` and `root.verity` from the URL
-   on the signed command line and opens them with that hash. Either way the result is
+3. The initrd (also signed) picks the combination and reads its hash from the command line
+   (an EFI variable can only name a combination, never supply a hash). usb: it finds the root
+   and hash partitions by the UUIDs derived from it. network: it downloads
+   `root-<name>.img` and `root-<name>.verity` from the URL on the signed command line and
+   opens them with that hash. Either way the result is
    `/dev/mapper/root`, and a wrong or manipulated root is rejected before it is mounted.
 4. The kernel checks every block read from root against the tree. A mismatch stops the system
    (`panic-on-corruption`).
@@ -788,11 +800,11 @@ Those paths are closed on the signed command line:
 `diagnose.sh` checks all of this on a burned stick, including that the ESP holds nothing but
 systemd-boot and the UKI (`--db-cert`: signatures against the db certificate). For released
 images, `release.sh` and every distribution server's check do the equivalent
-(signature against `db.pem`, root hash from the signed command line, `veritysetup verify` over
-the whole root image; `lib/verify.sh`).
+(signature against `db.pem`, root hashes from the signed command line, `veritysetup verify`
+over every root image; `lib/verify.sh`).
 
 **Preconditions:** Secure Boot on and a firmware password on every machine. Without Secure Boot,
-any command line (and with it any `roothash=`) can be passed in. The `db` key decides
+any command line (and with it any root hash) can be passed in. The `db` key decides
 everything: whoever has it can sign a UKI for a manipulated root.
 
 ## Sealing a machine to these keys
@@ -837,7 +849,7 @@ volumes, networks. RAM (`/var`) would fill up quickly. So:
   Docker 29's default containerd image store is switched off on purpose, so all images live
   in `data-root` and image IDs can be checked against the shipped archives.
 - `/etc/containerd/config.toml`: containerd's data goes to `/opt/docker/containerd`.
-Only in images with the **`docker` group** (`--groups base,docker`); its files are in
+Only in combinations with the **`docker` group** (`containers`, `remote-workstation`); its files are in
 `mkosi.profiles/docker/`.
 
 - **Docker is not started at boot** (not enabled in the preset). Start it by hand once the
@@ -879,8 +891,8 @@ packages would give you. Stock Arch defaults (e.g. the nftables ruleset in
 ### Build configuration (`mkosi.conf`, `mkosi.profiles/`, `repos.conf`)
 
 `mkosi.conf` holds the whole image, for both boot paths; `mkosi.profiles/<group>/` add the
-package groups (and `debug`), which mkosi merges in when the profile is active
-(`--groups remotedesktop` = `mkosi --profile=remotedesktop`).
+package groups, which mkosi merges in when the profile is active (`build.sh` passes a
+combination's groups as `--profile=<group>`).
 
 | Setting | Why |
 |---|---|
@@ -924,7 +936,8 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 | `systemd.firstboot=off` | no first-boot questions |
 | `lockdown=integrity` | kernel lockdown: no unsigned kexec or modules, no `/dev/mem`, MSR writes, `iopl`, hibernation; the Arch kernel does not enable it under Secure Boot by itself. `mkosi.postoutput` refuses a UKI without it ([SECURITY.md](SECURITY.md)) |
 | `root=/dev/mapper/root`, `rootfstype=erofs`, `ro`, `systemd.verity=no`, `rd.systemd.verity=no` | the initrd opens the verity device itself under that name, on either path (`usb-bootdev` or `netroot`, both with `--panic-on-corruption`), so systemd's verity generator stays out of it |
-| `safespace.netroot=<url>/` | where `netroot` fetches `roothash`, `root.verity` and `root.img` (from `NETROOT_URL`); signed, so it cannot be redirected. Without it the build boots from sticks only |
+| `safespace.netroot=<url>/` | where `netroot` fetches `roothash-<name>`, `root-<name>.verity` and `root-<name>.img` (from `NETROOT_URL`); signed, so it cannot be redirected. Without it the build boots from sticks only |
+| `safespace.root.<name>=<hash>` | one per combination, set by `lib/compose.sh` instead of mkosi's `roothash=`; the initrd opens only a root named here, with this hash |
 
 ### Initrd (`mkosi.initrd.conf/`, `InitrdPackages=`, `KernelInitrdModules=`)
 
@@ -940,13 +953,13 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 - **The path is chosen at boot** by `LoaderDevicePartUUID` (`mkosi.initrd.conf/mkosi.extra/`):
   - set (systemd-boot started the UKI from a partition): `usb-bootdev.service` +
     `/usr/local/lib/safespace/usb-bootdev`: authorizes the USB path to the stick (see "USB
-    lockdown"), waits for the root and hash partitions by the UUIDs derived from the root
-    hash, sets the stick read-only and opens the root with the signed root hash as
+    lockdown"), waits for the selected combination's root and hash partitions by the UUIDs
+    derived from its root hash, sets the stick read-only and opens the root with the signed root hash as
     `/dev/mapper/root` (`--panic-on-corruption`).
   - not set (the firmware loaded the UKI over the network): `20-netboot.network` (DHCP on
     physical ethernet) and `netroot.service` + `/usr/local/lib/safespace/netroot`, which
-    waits for DHCP, checks the server's `roothash`, downloads `root.verity` and `root.img`
-    into a tmpfs under `/run/netroot` (checking `MemAvailable` first), and opens them the same
+    waits for DHCP, checks the server's `roothash-<name>`, downloads `root-<name>.verity` and
+    `root-<name>.img` of the selected combination into a tmpfs under `/run/netroot` (checking `MemAvailable` first), and opens them the same
     way. The tmpfs stays after switch-root: that file *is* the root filesystem. Several
     `safespace.netroot=` URLs are tried in order.
   - Setting the variable from outside only switches to the other path, which then finds no
@@ -956,9 +969,9 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 
 | Script | What it does |
 |---|---|
-| `mkosi.postinst` | users from `users.conf` without password (`*`) and with groups from `safespace.env`; their ssh keys into the read-only `/etc/ssh/authorized_keys/<user>`; root locked; `/home` → `/var/home`, `/root` → `/var/roothome`; sudoers check; usbguard daemon settings (block new devices, keep present ones, IPC for `wheel`); mount points `/efi`, `/var`; per group: VNC password (random per build, saved next to the image; remotedesktop), the `docker` user group, `/opt/docker` and its fstab entry (docker); records the groups |
+| `mkosi.postinst` | users from `users.conf` without password (`*`) and with groups from `safespace.env`; their ssh keys into the read-only `/etc/ssh/authorized_keys/<user>`; root locked; `/home` → `/var/home`, `/root` → `/var/roothome`; sudoers check; usbguard daemon settings (block new devices, keep present ones, IPC for `wheel`); mount points `/efi`, `/var`; per group: VNC password (random per build, saved next to the image; xfce4-headless-vnc), the `docker` user group, `/opt/docker` and its fstab entry (docker); records the groups |
 | `mkosi.finalize` | `resolv.conf` → systemd-resolved stub; moves the built `/var` to `/usr/share/factory/var` (caches and logs dropped) |
-| `mkosi.postoutput` | prints the UKI's size and parts, warns above 85 MiB (network boot on old firmware), fails above 128 MiB, fails if it is signed by another key than the exported `db.pem`, and says when there is no `safespace.netroot=` URL (sticks only) |
+| `mkosi.postoutput` | per combination: prints the UKI's size and parts, warns above 85 MiB (network boot on old firmware), fails above 128 MiB, fails if it is signed by another key than the exported `db.pem` or lacks `lockdown=integrity`, and says when there is no `safespace.netroot=` URL (sticks only). The composed UKI is checked again by `compose_check` in `lib/compose.sh` |
 
 ### Files in the system (`mkosi.extra/`)
 
@@ -969,7 +982,7 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 | Network | `20-wired.network`: DHCP on physical ethernet only (`Kind=!*` skips Docker's veth pairs). Network boot configures the same thing once more in the initrd |
 | sudo | `sudoers.d/10-wheel`: `wheel` without password |
 | USB | `usbguard.service.d/10-early.conf`: usbguard starts before `sysinit.target` |
-| Desktop (group `remotedesktop`, `mkosi.profiles/remotedesktop/mkosi.extra/`) | `tigervnc/vncserver-config-defaults` (XFCE, 1920x1080), `vncserver-config-mandatory` (`localhost` only), `20-remotedesktop.preset` (`vncserver@:1`) |
+| Desktop (group `xfce4-headless-vnc`, `mkosi.profiles/xfce4-headless-vnc/mkosi.extra/`) | `tigervnc/vncserver-config-defaults` (XFCE, 1920x1080), `vncserver-config-mandatory` (`localhost` only), `20-xfce4-headless-vnc.preset` (`vncserver@:1`) |
 | Docker (group `docker`, `mkosi.profiles/docker/mkosi.extra/`) | `docker/daemon.json` (`data-root=/opt/docker/engine`, overlay2, no containerd image store); `containerd/config.toml` (root in `/opt/docker/containerd`); drop-ins for docker, docker.socket and containerd (`RequiresMountsFor=`/`ConditionPathIsMountPoint=/opt/docker`); `safespace-docker-images.service` + `load-docker-images`, `20-docker.preset` (image loader; Docker itself is not enabled) |
 | Services | `system-preset/10-safespace.preset`: networkd, resolved, timesyncd, sshd, nftables, usbguard, var-factory; the groups add their own preset files |
 | Groups | `/usr/lib/safespace/groups`: the package groups of this image (written by `mkosi.postinst`) |
@@ -1001,25 +1014,25 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 
 | File | Purpose |
 |---|---|
-| `build.sh` | the build entry point (build host): picks the package groups, fixes the version, puts the netboot URL on the signed command line, runs mkosi, keeps the parts |
+| `build.sh` | the build entry point (build host): fixes the version, puts the netboot URL on the signed command line, runs mkosi once per combination, keeps the parts, composes and checks the build |
+| `combinations.conf`, `lib/compose.sh` | the combinations a build holds (the first is the default); composing them into one UKI and build, and checking it |
 | `release.sh`, `release.conf.example` | build host: bundles a build as a release, checks it as the servers do, pushes it to the distribution servers (`RELEASE_TARGETS=` in `release.conf`) |
 | `server/` | distribution server: `setup.sh` (preparation), `safespace-netboot` (verify, status, dnsmasq config), `server.conf.example`, `systemd/` (verify path + service, `safespace-dhcp`), `nginx/safespace.conf` |
-| `mkosi.profiles/remotedesktop/`, `mkosi.profiles/docker/` | the package groups: packages, files and presets of each |
+| `mkosi.profiles/docker/`, `mkosi.profiles/xfce4-headless-vnc/`, `mkosi.profiles/debug/` | the package groups: packages, files and presets of each |
 | `mkosi.conf` | the image: the base packages, kernel command line, UKI, Secure Boot key, verity, compression, caches |
 | `repos.conf`, `repos.local.conf.example` | package source: `SNAPSHOT=` (date or `latest`) and `MIRROR=`; per-host override in `repos.local.conf` (gitignored); parsed by `lib/repos.sh` |
 | `mkosi.repart/` | ESP, erofs root (verity data) and root-verity |
 | `mkosi.extra/` | files of the base system: sshd, sudo, networkd, usbguard drop-in, fstab, guest agent restrictions, service presets, unit masks, volatile `/var` |
 | `mkosi.initrd.conf/` | initrd configuration: unit masks, both boot paths (`usb-bootdev`, `netroot` and the initrd network config), each run only on its path |
-| `mkosi.postinst` | `/home` and `/root` into `/var`, users and ssh keys, usbguard, sudoers check, mount points; per group: VNC (remotedesktop), the docker group and data disk mount (docker); records the groups |
+| `mkosi.postinst` | `/home` and `/root` into `/var`, users and ssh keys, usbguard, sudoers check, mount points; per group: VNC (xfce4-headless-vnc), the docker group and data disk mount (docker); records the groups |
 | `mkosi.finalize` | resolv.conf, moves the built `/var` to `/usr/share/factory/var` |
 | `mkosi.postoutput` | UKI size and signature checks, netroot URL check (see above) |
 | `docker-images.txt`, `fetch-images.sh` | images to ship and their downloader |
 | `users.conf.example`, `safespace.env` | users and ssh keys (copy to `users.conf`); groups and VNC settings |
 | `netboot.conf.example` | the root URL for network boot on the distribution servers (`<SERVER_URL>/`); copy to `netboot.conf` |
 | `mkosi.local.conf.example` | per-host settings (erofs threads, key paths); copy to `mkosi.local.conf` |
-| `burn.sh`, `diagnose.sh` | write a stick from a build (the newest in `mkosi.output/`), a release directory, a share or a distribution server's URL; read-only check incl. signatures against `db.pem` (`--db-cert`), `veritysetup verify` and which build is on it |
-| `lib/` | shared shell helpers: `repos.sh` (package source), `groups.sh` (package groups), `keys.sh` (Secure Boot keys: which set, export into the image, PCR signing key), `builds.sh` (the builds in `mkosi.output/`: their parts, list, show, diff, select, prune), `stick.sh` (a usb stick assembled from the parts: `burn.sh`, `test-vm.sh`), `verify.sh` (release checks, used by `release.sh` and the servers) |
-| `mkosi.profiles/debug/` | `./build.sh --debug`: ethtool, dmidecode, pciutils, kexec-tools, tcpdump, …; the version gets a `-debug` suffix |
+| `burn.sh`, `diagnose.sh` | write a stick from a build (the newest in `mkosi.output/`), a release directory, a share or a distribution server's URL; read-only check incl. signatures against `db.pem` (`--db-cert`), `veritysetup verify` of every root and which build is on it |
+| `lib/` | shared shell helpers: `repos.sh` (package source), `groups.sh` (package groups), `keys.sh` (Secure Boot keys: which set, export into the image, PCR signing key), `builds.sh` (the builds in `mkosi.output/`: their parts, list, show, diff, prune), `stick.sh` (a usb stick assembled from the parts: `burn.sh`, `test-vm.sh`), `verify.sh` (release checks, used by `release.sh` and the servers) |
 | `SECURITY.md` | the hardening of the standard installation, each measure with where it is configured |
 | `NETBOOT.md` | network boot in depth: trust model, what the clients need, DHCP for other servers, Secure Boot enrollment, QEMU test, old firmware, troubleshooting |
 | `test-vm.sh` | optional rehearsal in QEMU: boot an image as a USB stick, or `--netboot` a released network build (DHCP + HTTP boot, no disk), optionally with enforced Secure Boot, in Setup Mode or sealed |
@@ -1032,20 +1045,20 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 
 | Task | Command |
 |---|---|
-| Build | `sudo ./build.sh` (the whole stack; `--groups base,…` for a single build; `-f` to rebuild unchanged; erofs threads: all CPUs, `--workers N` for this run) |
-| Release | `./release.sh [--groups LIST \| --build BUILD] [--push safespace@<server>]` (an older `--build` = going back) |
+| Build | `sudo ./build.sh` (every combination of `combinations.conf`; `-f` to rebuild unchanged; erofs threads: all CPUs, `--workers N` for this run) |
+| Release | `./release.sh [--build BUILD] [--push safespace@<server>]` (an older `--build` = going back) |
 | Builds on this host | `./build.sh list`, `./build.sh show BUILD`, `./build.sh diff A B`, `./build.sh prune` |
 | On a distribution server | `safespace-netboot status`, `sudo safespace-netboot verify`, `journalctl -u safespace-netboot-verify` |
 | Other mirror / newest packages | `SNAPSHOT=`/`MIRROR=` in `repos.local.conf` (["Package source"](#package-source-snapshot-and-mirror)) |
 | Update packages | `./update-snapshot.sh && sudo ./build.sh -f` |
 | Update shipped images | edit `docker-images.txt`, `./fetch-images.sh`, `sudo ./build.sh -f` |
 | Force reinstalling all packages | `sudo ./build.sh -ff` |
-| Show the resolved configuration | `./build.sh --groups … summary` |
+| Show the resolved configuration | `mkosi --profile=<group>… summary` (a combination's groups) |
 | Look inside the image | `sudo mkosi shell` (with `--profile=<group>` per group) |
 | Test in a VM (no root) | `./test-vm.sh` / `./test-vm.sh --secure-boot`, or `./test-vm.sh --netboot` (DHCP + HTTP boot, no disk; needs `qemu-desktop edk2-ovmf`, for Secure Boot `virt-firmware`) |
 | Machine does not boot the stick | `./hwtest-image.sh`, write `mkosi.test/hwtest.img` with `dd`, try the menu entries in order |
 | Burn / check (usb) | `sudo ./burn.sh [IMAGE\|URL] /dev/sdX`, `sudo ./diagnose.sh [--db-cert db.pem] /dev/sdX` |
-| Debug build with diagnostic tools | `sudo ./build.sh --debug` |
+| Diagnostic tools on a machine | `sudo safespace-select once debug`, reboot (the combination `debug`) |
 | Run the tests | `tests/run.sh` (no root; `tests/run.sh keys server` for single parts); `tests/vm.sh` (build, release, boots in QEMU) |
 | Delete old builds / the caches | `./build.sh prune` / `sudo ./build.sh purge-cache [--packages]` |
 
@@ -1054,8 +1067,8 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 limits), unless `--workers N` (this run) or `Environment=SYSTEMD_REPART_MKFS_OPTIONS_EROFS=--workers=N`
 in `mkosi.local.conf` (this host) says otherwise, e.g. to leave cores free on a shared host
 (`--workers=0` would mean single-threaded, not "all"). zstd for the initrd already uses all
-cores. Before a build it checks the free disk space where the build lands (~8 GiB: the disk
-image next to its parts) and in `/var/tmp` (mkosi's work tree, ~8 GiB), and stops if there is
+cores. Before a build it checks the free disk space where the build lands (8 GiB + 3 GiB per
+combination: each disk image next to the parts of the combinations before it) and in `/var/tmp` (mkosi's work tree, ~8 GiB), and stops if there is
 too little; with less than 2 GiB RAM available it warns. The log shows what it found
 (`resources: … CPUs, … GiB RAM …`). The host needs the same tools as listed under "Deploy
 from scratch", plus the Secure Boot keys (see [Secure Boot keys](#secure-boot-keys)).
@@ -1120,7 +1133,7 @@ sectors and a CD boot header; both are fixed (`-S512`, `ElTorito=no`).
 
 - `usbcore.authorized_default=0`: the kernel authorizes no USB device, on both boot paths.
 - From a stick: in the initrd, `usb-bootdev` authorizes hubs and mass-storage interfaces,
-  waits up to 30 s for the root partition (UUID derived from `roothash=`), revokes every USB
+  waits up to 30 s for the root partition (UUID derived from the selected root hash), revokes every USB
   device not on the path to it, and marks the medium read-only. A second stick posing as
   root is rejected by dm-verity.
 - Over the network: nothing authorizes anything, because nothing is needed from USB — every
@@ -1145,7 +1158,7 @@ sectors and a CD boot header; both are fixed (`-S512`, `ElTorito=no`).
 
 - Combinations: the selected combination is not measured into a PCR. PCR 11
   holds the UKI's signed expected values and must not be extended; a free PCR or an NvPCR
-  needs its own design. A single-root build per combination remains possible (`--groups`).
+  needs its own design.
 
 - **The single build on real hardware:** booted in QEMU from a stick and over UEFI HTTP
   (also sealed and with enforced Secure Boot), not yet on real hardware: the T450s over PXE

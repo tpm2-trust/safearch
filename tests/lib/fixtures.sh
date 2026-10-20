@@ -1,7 +1,7 @@
 # Test fixtures: throwaway Secure Boot keys, a tiny signed "UKI" and root
-# images with real dm-verity hash trees, written the way mkosi writes them and
-# turned into a build by the real builds_finalize. Sourced by tests/run.sh.
-# No root needed.
+# images with real dm-verity hash trees, written the way mkosi writes them,
+# turned into parts by the real builds_finalize and into a build by the real
+# lib/compose.sh. Sourced by tests/run.sh. No root needed.
 
 # fx_keys DIR: a dedicated sbctl key set (PK, KEK, db, GUID) and its config.
 fx_keys() {
@@ -60,44 +60,45 @@ import json, sys
 print(json.dumps({"packages": [{"name": p.split("=")[0], "version": p.split("=")[1]} for p in sys.argv[1:]]}))' "$@" >"$f"
 }
 
-# fx_info CHECKOUT GROUPS VERSION: build.json as build.sh writes it.
+# fx_info CHECKOUT VERSION COMBINATIONS: build.json as build.sh writes it
+# (COMBINATIONS: "name:group+group,...").
 fx_info() {
-	local co=$1 groups=$2 version=$3 d id
-	id="${groups//,/-}_$version"
+	local co=$1 version=$2 combos=$3 d id
+	id=combined_$version
 	d=$co/mkosi.output/$id
 	(
 		die() { echo "$*" >&2; exit 1; }
 		HERE=$co; source "$co/lib/builds.sh"
-		builds_write_info "$d" build="$id" version="$version" groups="$groups" debug=no \
+		builds_write_info "$d" build="$id" version="$version" combinations="$combos" \
 			started="${version:0:4}-${version:4:2}-${version:6:2}T00:00:00+00:00" \
 			finished="${version:0:4}-${version:4:2}-${version:6:2}T${version:9:2}:${version:11:2}:00+00:00" \
 			snapshot=2099/01/01 mirror=default commit=abc1234 uncommitted_changes=no signer=test netroot= builder=test
 	)
 }
 
-# fx_finish CHECKOUT GROUPS VERSION PACKAGES...: a bare build directory
-# (manifest + build.json only), for tests that only look at the bookkeeping.
+# fx_finish CHECKOUT VERSION PACKAGES...: a bare build directory (one
+# combination "root": manifest + build.json only), for tests that only look at
+# the bookkeeping.
 fx_finish() {
-	local d=$1/mkosi.output/${2//,/-}_$3
+	local d=$1/mkosi.output/combined_$2
 	mkdir -p "$d"
-	fx_manifest "$d/manifest.json" "${@:4}"
-	fx_info "$1" "$2" "$3"
+	fx_manifest "$d/manifest-root.json" "${@:3}"
+	fx_info "$1" "$2" root:base
 }
 
 # uuid HEX32: 8-4-4-4-12, as systemd-repart derives partition UUIDs from the root hash.
 fx_uuid() { sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12}).*/\1-\2-\3-\4-\5/' <<<"$1"; }
 
-# fx_build CHECKOUT VERSION KEYDIR GROUPS URL PACKAGES...: what mkosi leaves
-# in a build directory (the split parts and the whole disk image, partition
+# fx_part DIR VERSION KEYDIR URL PACKAGES...: what one combination's mkosi run
+# leaves in its directory (the split parts and the whole disk image, partition
 # UUIDs from the root hash as repart sets them), then builds_finalize.
-fx_build() {
-	local co=$1 v=$2 kd=$3 groups=$4 url=$5 d b tmp hash cmdline rs vs total; shift 5
-	d=$co/mkosi.output/${groups//,/-}_$v
+fx_part() {
+	local d=$1 v=$2 kd=$3 url=$4 b tmp hash cmdline rs vs total; shift 4
 	b=$d/safespace-arch_$v
 	mkdir -p "$d"
 	tmp=$(mktemp -d)
 	hash=$(fx_root "$tmp")
-	cmdline="roothash=$hash systemd.volatile=state"
+	cmdline="roothash=$hash systemd.volatile=state lockdown=integrity"
 	[[ -n $url ]] && cmdline+=" safespace.netroot=$url"
 	fx_uki "$b.efi" "$cmdline" "$kd/db/db.key" "$kd/db/db.pem"
 	cp "$tmp/root.img" "$b.root.raw"
@@ -129,10 +130,38 @@ fx_build() {
 	rm -rf "$tmp"
 	(
 		die() { echo "$*" >&2; exit 1; }
-		HERE=$co; source "$co/lib/builds.sh"
+		HERE=$d; source "$(dirname "${BASH_SOURCE[0]}")/../../lib/builds.sh"
 		builds_finalize "$d" "$v"
+	)
+}
+
+# fx_build CHECKOUT VERSION KEYDIR URL (NAME GROUPS "PACKAGES")...: a build as
+# build.sh makes it: one part per combination (fx_part, kept in
+# CHECKOUT/parts-VERSION/<name>/ for the tests), composed and checked by the
+# real lib/compose.sh (ukify, signed expected PCRs with a throwaway key) into
+# CHECKOUT/mkosi.output/combined_VERSION/, with build.json.
+fx_build() {
+	local co=$1 v=$2 kd=$3 url=$4 names=() groups=() dirs=() combos=""; shift 4
+	[[ -f $kd/pcr.key ]] || openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=pcr/ \
+		-keyout "$kd/pcr.key" -out "$kd/pcr.crt" 2>/dev/null || return 1
+	while (($# >= 3)); do
+		# shellcheck disable=SC2086 # the packages are words
+		fx_part "$co/parts-$v/$1" "$v" "$kd" "$url" $3 || return 1
+		names+=("$1") groups+=("$2") dirs+=("$co/parts-$v/$1") combos+="$1:${2//,/+},"
+		shift 3
+	done
+	(
+		set -Eeuo pipefail
+		die() { echo "DIE: $*" >&2; exit 1; }
+		log() { :; }
+		HERE=$co
+		source "$co/lib/groups.sh"; source "$co/lib/builds.sh"; source "$co/lib/verify.sh"; source "$co/lib/compose.sh"
+		COMBO_NAMES=("${names[@]}") COMBO_GROUPS=("${groups[@]}")
+		KEYS_SB_DIR=$kd KEYS_PCR_KEY=$kd/pcr.key KEYS_PCR_CERT=$kd/pcr.crt
+		compose_build "$co/mkosi.output/combined_$v" "${dirs[@]}"
+		compose_check "$co/mkosi.output/combined_$v" "$kd/db/db.pem"
 	) || return 1
-	fx_info "$co" "$groups" "$v"
+	fx_info "$co" "$v" "${combos%,}"
 }
 
 # fx_resum DIR: recompute SHA256SUMS, as someone tampering with a release would.

@@ -6,21 +6,20 @@
 # unattended; no LLM, no window, no access to real users, keys or servers.
 # Exit 0 only if every step passed.
 #
-#   tests/vm.sh [--no-build | --build BUILD] [--groups LIST] [STEP...]
+#   tests/vm.sh [--no-build | --build BUILD] [STEP...]
 #
 #   (default)       build and test the whole stack: every combination of
-#                   combinations.conf in one build, as build.sh builds it
-#                   without --groups; includes the step select
-#   --groups LIST   build and test a single build of this group set instead
-#   --no-build      test the newest existing test build (of that group set)
+#                   combinations.conf, as build.sh builds it
+#   --no-build      test the newest existing test build
 #   --build BUILD   test this existing test build (mkosi.test/vm/builds/)
-#   STEP            stick net seal net-sb select (default: all; select only
-#                   for the whole stack, it needs seal)
+#   STEP            stick net seal net-sb select (default: all; select needs
+#                   seal and runs it first)
 #
 # Kept apart from everything real, in mkosi.test/vm/ (gitignored):
-#   id_ed25519, users.conf   the test user "tester" and its key (created once)
+#   id_ed25519, users.conf   the test user "tester" and its key: created here
+#                            once, used for nothing else (build.sh --users)
 #   builds/<build>/          test builds (build.sh --users, --output-root); the
-#                            newest per group set is kept. ./build.sh list and
+#                            newest is kept. ./build.sh list and
 #                            ./release.sh never see them: a test build has the
 #                            test key and must never reach a real server.
 #   run-<time>/              one run: share/ (the release), logs
@@ -40,10 +39,16 @@
 #   seal    Setup Mode -> safespace-seal -> boot with the sealed firmware:
 #           Secure Boot enabled (user), verified, running
 #   net-sb  network boot with enforced Secure Boot: enabled, verified, running
-#   select  (whole stack) on the sealed firmware of seal: base without a
-#           selection; safespace-select set docker -> docker booted (the
-#           docker command present); once base -> base for one boot; then
-#           docker again. Every boot with Secure Boot enabled and verified.
+#   select  on the sealed firmware of seal, every combination of the build
+#           booted once, each checked for its name and its package groups
+#           (/usr/lib/safespace/groups, the docker command exactly with the
+#           docker group): the first without a selection; safespace-select
+#           set SECOND -> SECOND; once FIRST -> FIRST for one boot; SECOND
+#           again (persistent); then once for each further combination; clear.
+#           A combination that is the first plus the group debug must have the
+#           first one's setuid/setgid files, file capabilities and enabled
+#           units (debug adds packages, nothing else). Every boot with Secure
+#           Boot enabled and verified.
 #
 # Prerequisites (all checked before anything starts; the list of what is
 # missing, then exit 2):
@@ -52,10 +57,11 @@
 #     python, rsync; /dev/kvm read/write
 #   - sudo for ./build.sh (asked once at the start, or a NOPASSWD rule for
 #     unattended runs, see README.md "Integration test"); not with --no-build
-#   - the public keys of a real build (mkosi.extra/usr/share/safespace/
-#     secureboot/db.pem: build.sh writes them on every build)
+#   - with --no-build / --build: the public keys the test build was signed
+#     with (mkosi.extra/usr/share/safespace/secureboot/db.pem: every build,
+#     the test build too, exports them)
 #   - TCP port 8790 free on 127.0.0.1 (the test's HTTP server)
-#   - 4 GiB RAM available, 12 GiB free in mkosi.test/ (6 GiB with --groups)
+#   - 4 GiB RAM available, 6 GiB + 4 GiB per combination free in mkosi.test/
 set -Euo pipefail
 
 REPO=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
@@ -64,35 +70,21 @@ log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,${/^#/!q;s/^# \?//;p}' "$0"; }
 
-BUILD_MODE=build BUILD="" GROUP_LIST="" COMBINED=1 STEPS=()
+BUILD_MODE=build BUILD="" STEPS=()
 while (($#)); do
 	case $1 in
 		--no-build) BUILD_MODE=existing; shift ;;
 		--build) BUILD_MODE=given; BUILD=${2:?--build needs a build}; shift 2 ;;
-		--groups) GROUP_LIST=${2:?--groups needs a list}; COMBINED=0; shift 2 ;;
 		-h | --help) usage; exit 0 ;;
 		stick | net | seal | net-sb | select) STEPS+=("$1"); shift ;;
 		*) usage >&2; die "unknown argument $1" ;;
 	esac
 done
-if ((${#STEPS[@]} == 0)); then
-	STEPS=(stick net seal net-sb)
-	((COMBINED)) && STEPS+=(select)
-fi
+((${#STEPS[@]})) || STEPS=(stick net seal net-sb select)
 wants() { [[ " ${STEPS[*]} " == *" $1 "* ]]; }
-if wants select; then
-	((COMBINED)) || die "the step select needs the whole stack (no --groups)"
-	wants seal || STEPS=(seal "${STEPS[@]}") # select boots the firmware seal sealed
-fi
+# select boots the firmware seal sealed
+wants select && ! wants seal && STEPS=(seal "${STEPS[@]}")
 cd "$REPO"
-# shellcheck source=../lib/groups.sh
-source "$REPO/lib/groups.sh"
-if ((COMBINED)); then
-	GROUPS_CSV=combined
-else
-	groups_parse "$GROUP_LIST"
-	GROUPS_CSV=$(IFS=,; echo "${SAFESPACE_GROUPS[*]}")
-fi
 
 VM=mkosi.test/vm                  # relative: build.sh takes paths inside the checkout
 PORT_HTTP=8790
@@ -115,7 +107,8 @@ for f in OVMF_CODE.4m.fd OVMF_CODE.secboot.4m.fd OVMF_VARS.4m.fd; do
 	[[ -f /usr/share/edk2/x64/$f ]] || miss "/usr/share/edk2/x64/$f (pacman -S edk2-ovmf)"
 done
 [[ -r /dev/kvm && -w /dev/kvm ]] || miss "read/write access to /dev/kvm (group kvm)"
-[[ -f $DB ]] || miss "$DB (run a real build once: sudo ./build.sh)"
+# A test build exports the keys it is signed with; an existing one needs them.
+[[ $BUILD_MODE == build || -f $DB ]] || miss "$DB (the keys the test build was signed with: run without --no-build)"
 if [[ $BUILD_MODE == build ]]; then
 	if ! sudo -n -l "$REPO/build.sh" >/dev/null 2>&1; then
 		if [[ -t 0 ]]; then
@@ -132,7 +125,7 @@ avail=$(awk '/^MemAvailable:/ { print int($2 / 1048576) }' /proc/meminfo)
 ((avail >= 4)) || miss "4 GiB of available RAM (have $avail GiB)"
 mkdir -p "$VM/builds"
 free=$(df -BG --output=avail "$VM" | tail -1 | tr -dc 0-9)
-need_disk=$((COMBINED ? 12 : 6))
+need_disk=$((6 + 4 * $(grep -c '^[a-z]' combinations.conf)))
 ((free >= need_disk)) || miss "$need_disk GiB free disk in mkosi.test/ (have $free GiB)"
 if ((${#MISSING[@]})); then
 	printf '\e[1;31m==> missing prerequisites:\e[0m\n' >&2
@@ -158,21 +151,23 @@ result() { RESULTS+=("$1 $2${3:+  ($3)}"); printf '  \e[%sm%s\e[0m %s%s\n' "$([[
 
 case $BUILD_MODE in
 	build)
-		if ((COMBINED)); then what=(); else what=(--groups "$GROUPS_CSV"); fi
-		log "building ${what[*]:-the whole stack} (test user, root from $URL)"
-		sudo "$REPO/build.sh" ${what[@]+"${what[@]}"} --users "$VM/users.conf" --output-root "$VM/builds" --url "$URL" \
+		log "building the whole stack (test user, root from $URL)"
+		sudo "$REPO/build.sh" --users "$VM/users.conf" --output-root "$VM/builds" --url "$URL" \
 			>"$LOGS/build.log" 2>&1 || die "build failed (see ${LOGS#"$REPO"/}/build.log)"
-		BUILD=$(builds_newest "$GROUPS_CSV")
-		# Only the newest test build per group set stays.
+		BUILD=$(builds_newest)
+		# Only the newest test build stays.
 		builds_all | while IFS= read -r b; do
-			[[ $b != "$BUILD" && $(builds_groups_of "$b") == "$GROUPS_CSV" ]] && rm -rf -- "${BUILDS_ROOT:?}/$b"
+			[[ $b == "$BUILD" ]] || rm -rf -- "${BUILDS_ROOT:?}/$b"
 		done ;;
-	existing) BUILD=$(builds_newest "$GROUPS_CSV") ;;
+	existing) BUILD=$(builds_newest) ;;
 	given) BUILD=$(builds_find "$BUILD") ;;
 esac
-[[ -n $BUILD ]] || die "no test build of $GROUPS_CSV in $VM/builds (run without --no-build)"
+[[ -n $BUILD ]] || die "no test build in $VM/builds (run without --no-build)"
 DIR=$(builds_dir "$BUILD")
-log "build $BUILD"
+# The combinations of the build ("name:group+group"), the first is the default.
+mapfile -t COMBOS < <(builds_info "$DIR" combinations | tr ',' '\n')
+((${#COMBOS[@]})) || die "$BUILD names no combinations"
+log "build $BUILD: ${COMBOS[*]}"
 
 log "release into ${RUN#"$REPO"/}/share"
 "$REPO/release.sh" --builds "$BUILDS_ROOT" --build "$BUILD" --stage "$RUN/stage" --push "$RUN/share" \
@@ -243,6 +238,12 @@ echo state=$(systemctl is-system-running)
 echo failed=$(systemctl --failed --no-legend --plain | wc -l)
 echo combination=$(sudo dmesg | sed -n "s/.*\(usb-bootdev\|netroot\): combination \([a-z0-9-]*\) .*/\2/p" | tail -1)
 command -v docker >/dev/null && echo docker=yes || echo docker=no
+echo groups=$(cat /usr/lib/safespace/groups)
+# What a package can add to the attack surface besides its files: setuid/setgid
+# programs, file capabilities, enabled units (system and user), as short hashes.
+echo suid=$(sudo find / -xdev -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null | sort | sha256sum | cut -c1-16)
+echo caps=$(sudo getcap -r /usr 2>/dev/null | sort | sha256sum | cut -c1-16)
+echo enabled=$( (systemctl list-unit-files --state=enabled --no-legend; systemctl --global list-unit-files --state=enabled --no-legend) 2>/dev/null | awk "{ print \$1 }" | sort | sha256sum | cut -c1-16)
 echo lockdown=$(sudo cat /sys/kernel/security/lockdown | sed -n "s/.*\[\(.*\)\].*/\1/p")
 echo secure_boot=$(bootctl status 2>/dev/null | sed -n "s/^ *Secure Boot: *//p" | head -1 | tr " " _)
 '
@@ -327,27 +328,49 @@ if wants net-sb; then
 fi
 
 if wants select; then
-	log "step select: preselect a combination on the sealed firmware"
+	log "step select: every combination on the sealed firmware"
 	SEALED=(secure_boot=enabled* path_var=set usb_bootdev=1 "${COMMON[@]}")
-	# select-N NAME COMMAND-AFTER EXPECTATIONS...: boot sealed, check, run a command, power off
+	# What a combination must look like from inside: its name, its groups,
+	# the docker command exactly with the docker group.
+	looks() { # "name:group+group"
+		local n=${1%%:*} g=${1#*:} d=no
+		[[ +$g+ == *+docker+* ]] && d=yes
+		echo "combination=$n" "groups=${g//+/,}" "docker=$d"
+	}
+	# sel_boot NAME COMBO COMMAND-AFTER: boot sealed, check, run a command, power off
 	sel_boot() {
-		local name=$1 cmd=$2; shift 2
+		local name=$1 combo=$2 cmd=$3 want k
+		read -ra want <<<"$(looks "$combo")"
+		if [[ ${combo#*:} == "${COMBOS[0]#*:}+debug" ]]; then
+			for k in suid caps enabled; do want+=("$k=$(val select-default "$k")"); done
+		fi
 		if vm_start "$name" "$STICK" --sealed; then
 			probe "$name"
-			expect "$name" "$@" "${SEALED[@]}"
-			[[ -z $cmd ]] || vm_ssh "$cmd" >>"$LOGS/select.log" 2>&1 || result FAIL "$name" "'$cmd' failed (see ${LOGS#"$REPO"/}/select.log)"
+			expect "$name" "${want[@]}" "${SEALED[@]}"
+			vm_ssh "$cmd" >>"$LOGS/select.log" 2>&1 || result FAIL "$name" "'$cmd' failed (see ${LOGS#"$REPO"/}/select.log)"
 		else
 			result FAIL "$name" "$ERR"
 		fi
 		vm_stop "$name"
 	}
-	if [[ -f $REPO/mkosi.test/sealed-vars.fd ]]; then
-		sel_boot select-default 'sudo safespace-select list && sudo safespace-select set docker' combination=base docker=no
-		sel_boot select-docker 'sudo safespace-select list && sudo safespace-select once base' combination=docker docker=yes
-		sel_boot select-once 'sudo safespace-select list' combination=base docker=no
-		sel_boot select-persistent 'sudo safespace-select clear' combination=docker docker=yes
-	else
+	if [[ ! -f $REPO/mkosi.test/sealed-vars.fd ]]; then
 		result FAIL select "no sealed firmware variables (the step seal failed?)"
+	elif ((${#COMBOS[@]} < 2)); then
+		sel_boot select-default "${COMBOS[0]}" 'sudo safespace-select list'
+	else
+		first=${COMBOS[0]%%:*} second=${COMBOS[1]%%:*}
+		sel_boot select-default "${COMBOS[0]}" "sudo safespace-select list && sudo safespace-select set $second"
+		sel_boot "select-$second" "${COMBOS[1]}" "sudo safespace-select list && sudo safespace-select once $first"
+		sel_boot select-once "${COMBOS[0]}" 'sudo safespace-select list'
+		# Every further combination once, from the boot before it; the last clears.
+		next=clear
+		((${#COMBOS[@]} > 2)) && next="once ${COMBOS[2]%%:*}"
+		sel_boot select-persistent "${COMBOS[1]}" "sudo safespace-select $next"
+		for ((i = 2; i < ${#COMBOS[@]}; i++)); do
+			next=clear
+			((i + 1 < ${#COMBOS[@]})) && next="once ${COMBOS[i + 1]%%:*}"
+			sel_boot "select-${COMBOS[i]%%:*}" "${COMBOS[i]}" "sudo safespace-select list && sudo safespace-select $next"
+		done
 	fi
 fi
 
