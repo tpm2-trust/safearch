@@ -152,6 +152,8 @@ fx_build() {
 	local co=$1 v=$2 kd=$3 url=$4 names=() groups=() dirs=() combos=""; shift 4
 	[[ -f $kd/pcr.key ]] || openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=pcr/ \
 		-keyout "$kd/pcr.key" -out "$kd/pcr.crt" 2>/dev/null || return 1
+	[[ -f $kd/identity.key ]] || openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=identity/ \
+		-keyout "$kd/identity.key" -out "$kd/identity.crt" 2>/dev/null || return 1
 	while (($# >= 3)); do
 		# shellcheck disable=SC2086 # the packages are words
 		fx_part "$co/parts-$v/$1" "$v" "$kd" "$url" $3 || return 1
@@ -166,10 +168,32 @@ fx_build() {
 		source "$co/lib/groups.sh"; source "$co/lib/builds.sh"; source "$co/lib/verify.sh"; source "$co/lib/compose.sh"
 		COMBO_NAMES=("${names[@]}") COMBO_GROUPS=("${groups[@]}")
 		KEYS_SB_DIR=$kd KEYS_PCR_KEY=$kd/pcr.key KEYS_PCR_CERT=$kd/pcr.crt
+		KEYS_ID_KEY=$kd/identity.key KEYS_ID_CERT=$kd/identity.crt
 		compose_build "$co/mkosi.output/combined_$v" "${dirs[@]}"
 		compose_check "$co/mkosi.output/combined_$v" "$kd/db/db.pem"
 	) || return 1
 	fx_info "$co" "$v" "${combos%,}"
+}
+
+# fx_reuki DIR KEYDIR IDENTITY_PHASES: rebuild DIR/boot.efi from its own
+# sections, as lib/compose.sh does, but with the identity key signing the given
+# phases (empty: no identity signature at all).
+fx_reuki() {
+	local d=$1 kd=$2 t s all="enter-initrd enter-initrd:leave-initrd enter-initrd:leave-initrd:sysinit enter-initrd:leave-initrd:sysinit:ready" id=()
+	t=$(mktemp -d)
+	for s in linux initrd ucode osrel uname cmdline; do
+		objcopy -O binary --only-section=".$s" "$d/boot.efi" "$t/$s" || return 1
+	done
+	[[ -z $3 ]] || id=(--pcr-certificate "$kd/identity.crt" --pcr-private-key "$kd/identity.key" --phases "$3")
+	ukify build --efi-arch x64 --stub /usr/lib/systemd/boot/efi/linuxx64.efi.stub --output "$t/boot.efi" \
+		--linux "$t/linux" --initrd "$t/initrd" --microcode "$t/ucode" --os-release "@$t/osrel" \
+		--uname "$(tr -d '\0' <"$t/uname")" --cmdline "@$t/cmdline" \
+		--no-sign-kernel --signtool systemd-sbsign \
+		--secureboot-private-key "$kd/db/db.key" --secureboot-certificate "$kd/db/db.pem" \
+		--pcr-banks sha256 --pcr-certificate "$kd/pcr.crt" --pcr-private-key "$kd/pcr.key" --phases "$all" \
+		"${id[@]}" >/dev/null 2>&1 || return 1
+	mv "$t/boot.efi" "$d/boot.efi"
+	rm -rf "$t"
 }
 
 # fx_resum DIR: recompute SHA256SUMS, as someone tampering with a release would.

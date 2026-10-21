@@ -15,10 +15,21 @@
 # Without any safespace.root.* there is nothing to open: the boot stops too
 # (roothash= is never used, so no other root hash can come into play).
 #
-# SAFESPACE_EFIVARS: only for tests/run.sh (the efivarfs directory).
+# The decided name is measured into PCR 15 ("safespace-combination:<name>")
+# before it is used, and recorded in /run/safespace/combination: the machine's
+# identity is sealed to the measurement of its assigned combination (identity,
+# next to this file; SECURITY.md, "Machine identity"). The initrd is part of the
+# signed UKI (PCR 11), so the code that measures is itself measured, and a PCR
+# only extends: nothing later in this boot can turn another selection into the
+# assigned one. No TPM, or the extend fails: the boot goes on, nothing unseals.
+#
+# SAFESPACE_EFIVARS, SAFESPACE_RUN, SAFESPACE_PCREXTEND: only for tests/run.sh
+# (the efivarfs directory, /run/safespace, the measuring program).
 
 SELECT_GUID=8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34
 SELECT_VARS=${SAFESPACE_EFIVARS:-/sys/firmware/efi/efivars}
+SELECT_RUN=${SAFESPACE_RUN:-/run/safespace}
+SELECT_PCREXTEND=${SAFESPACE_PCREXTEND:-/usr/lib/systemd/systemd-pcrextend}
 
 select_arg() { printf '%s\n' "$cmdline" | tr ' ' '\n' | sed -n "s/^$1=//p" | tail -n 1; }
 
@@ -63,4 +74,17 @@ select_root() {
 	fi
 	SELECT_NAME=$want
 	msg "combination $want ($from), roothash=$(printf %.12s "$SELECT_HASH")..."
+	select_measure "$want"
+}
+
+# Exactly once per boot: a second measurement no longer matches the sealed value.
+select_measure() { # NAME
+	if [ -e "$SELECT_RUN/combination" ]; then
+		msg "WARNING: the selection was measured already this boot, not again"
+		return 0
+	fi
+	mkdir -p "$SELECT_RUN" && printf '%s\n' "$1" >"$SELECT_RUN/combination" ||
+		{ msg "WARNING: cannot record the selection"; return 0; }
+	"$SELECT_PCREXTEND" --graceful --pcr=15 "safespace-combination:$1" >/dev/null 2>&1 ||
+		msg "WARNING: could not measure the selection (no machine identity this boot)"
 }

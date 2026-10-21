@@ -218,15 +218,17 @@ else refers to it). Under the kernel lockdown (`lockdown=integrity`,
 
 ## Combinations: the whole stack in one build
 
-`combinations.conf` lists what a build holds, `<name>=<groups>`, one per line:
+`combinations.conf` lists what a build holds, `<name>=<groups>`, one per line. The
+repository ships two, which keeps builds and the integration test short; the others are
+there as comments, to enable for a real build:
 
-| Combination | Groups |
-|---|---|
-| `root` (the default: booted without a selection) | base |
-| `containers` | base, docker |
-| `remotedesktop` | base, xfce4-headless-vnc |
-| `remote-workstation` | base, docker, xfce4-headless-vnc |
-| `debug` | base, debug |
+| Combination | Groups | In `combinations.conf` |
+|---|---|---|
+| `root` (the default: booted without a selection) | base | yes |
+| `containers` | base, docker | yes |
+| `remotedesktop` | base, xfce4-headless-vnc | commented out |
+| `remote-workstation` | base, docker, xfce4-headless-vnc | commented out |
+| `debug` | base, debug | commented out |
 
 `sudo ./build.sh` builds every combination with a mkosi run of its own (the groups as
 profiles) and composes them into one build, `mkosi.output/combined_<version>/`:
@@ -284,7 +286,8 @@ whoever can write the variable (root on the machine, or the firmware setup witho
 password) can choose between the signed roots, never boot an unsigned one. An unknown name
 stops the boot with a message instead of falling back silently: renaming a combination in
 `combinations.conf` stops machines preselected to the old name (`safespace-select clear`
-before the update). The choice is not measured into a PCR yet (Open decisions).
+before the update). The choice is measured into the TPM (PCR 15): only the combination a
+sealed machine belongs to gets its identity ([Machine identity](#machine-identity)).
 
 Tested by `tests/run.sh` (sections `compose`: the composed UKI and every check of
 `compose_check`, the selection order; `netroot`: only the selected root downloaded; `stick`,
@@ -597,8 +600,10 @@ a distribution server does, boots it in QEMU from a stick and over the network, 
 boots with enforced Secure Boot, and checks each boot over ssh (in every boot also: kernel
 lockdown, and none of what the roots leave out: Wi-Fi/Bluetooth/NVIDIA drivers and firmware,
 firmware packages but the selected ones (both microcode packages present), headers, docs, man
-pages, locales but en_US). It touches no real user, key,
-build or server. Exit 0 only if every step passed.
+pages, locales but en_US), and the machine identity on a software TPM. It touches no real
+user, key, build or server. Exit 0 only if every step passed. The test build has combinations
+of its own, `tests/vm.combinations.conf` (`build.sh --combinations`): `root`, `containers`,
+`debug`, few to keep it fast and independent of what `combinations.conf` builds for real.
 
 ```sh
 tests/vm.sh                          # build the whole stack, release, all steps
@@ -614,6 +619,7 @@ tests/vm.sh --no-build --jobs 2      # at most two VMs at a time
 | `seal` | Setup Mode → `safespace-seal` → the sealed firmware | Secure Boot `enabled (user)`, `verified`, `running` |
 | `net-sb` | network boot with enforced Secure Boot | Secure Boot enabled, `verified`, `running` |
 | `select` | on the sealed firmware, one VM, one boot after the other: no selection, `safespace-select set <second>`, `once <first>`, the second again (persistent), `clear`, the first again. Side by side, every further combination in a VM of its own: `SafespaceSelectOnce=<name>` written into a copy of the sealed variables (`virt-fw-vars`) | the booted combination's name (the initrd's choice, `/usr/lib/safespace/combination`, `PRETTY_NAME`, the login banner) and groups (`/usr/lib/safespace/groups`; the docker command exactly with the docker group); a preset `SafespaceSelectOnce` deleted by the initrd; `debug` has exactly the default's setuid/setgid files, file capabilities and enabled units; each Secure Boot enabled and `verified` |
+| `identity` | on a TPM of its own (swtpm, `test-vm.sh --tpm`) and a copy of the sealed firmware, one boot after the other: the first sealed boot, `debug` once, the default again, over the network, another db certificate, `safespace-seal --assign containers`, the default afterwards | the identity created for the default and released (one ed25519 host key); `debug`: nothing released or created, its root can't unseal the slot (also not after extending PCR 15 with the default's name); the default again and over the network: the same host key and machine-id, its root can't unseal after the boot; changed db (PCR 7): nothing released; moved: a new identity in `containers`, none in the default ([Machine identity](#machine-identity)) |
 
 **Kept apart from everything real**, in `mkosi.test/vm/` (gitignored): the test user
 `tester` and its key (created on the first run, used for nothing else), the test builds
@@ -875,6 +881,29 @@ unverified UKI loads), run `sudo safespace-seal`, reboot — from then on the fi
 verifies the downloaded UKI against your `db`. See
 [NETBOOT.md](NETBOOT.md#secure-boot-on-the-clients).
 
+### Machine identity
+
+A sealed machine with a TPM 2.0 gets an identity of its own: an ssh host key and a
+machine-id that stay the same across reboots and updates. It belongs to **one
+combination**: the one the machine boots the first time with Secure Boot on (so
+`safespace-select set NAME` before that reboot chooses it). Whenever that combination boots,
+from the stick or over the network, in this build or any later one signed with the same keys,
+the TPM releases the identity in the initrd. Any other combination boots normally, but with a
+throwaway host key and machine-id, new on every boot: ssh clients that know the machine warn
+"host key changed", and nothing in that combination can reach the identity. Details,
+measures and tests: [SECURITY.md](SECURITY.md#machine-identity).
+
+| Command (on the machine) | Does |
+|---|---|
+| `safespace-seal --identity` | this boot's combination, whether the identity was released, the host key's fingerprint and `known_hosts` line, the inventory ID (the machine-id, hashed for safespace) |
+| `sudo safespace-seal --assign NAME` | move the machine to combination `NAME`: the next boot runs `NAME` and creates a **new** identity for it (new host key; the old one is gone) |
+
+The identity is lost (a new one is created on the next sealed boot) when the TPM is cleared,
+and released no more after a change of the Secure Boot keys in the firmware (PCR 7): then
+`--assign` again. Machines without Secure Boot on, or without a TPM, get no identity.
+Try it in a VM: `./test-vm.sh --setup-mode --tpm --ssh 2222`, `sudo safespace-seal`, power off,
+`./test-vm.sh --sealed --tpm --ssh 2222` twice: the same host key both times.
+
 ## Docker
 
 **Why a data disk is needed:** Docker can't run from read-only storage. Its storage
@@ -979,8 +1008,8 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 
 ### Initrd (`mkosi.initrd.conf/`, `InitrdPackages=`, `KernelInitrdModules=`)
 
-- One initrd for both paths: `coreutils`, `sed`, `kmod`, `curl`, `cryptsetup`, `iproute2`
-  for the scripts below; sysext/confext units masked in the initrd as well;
+- One initrd for both paths: `coreutils`, `sed`, `kmod`, `curl`, `cryptsetup`, `iproute2`,
+  `openssh` (`ssh-keygen`, for the machine identity) for the scripts below; sysext/confext units masked in the initrd as well;
   `CompressLevel=19`. Drivers: one explicit list instead of mkosi's default set (dm-verity,
   loop, erofs, crypto, virtio for QEMU, USB host controllers, USB storage, MMC and card
   readers, client ethernet and PHY, in `mkosi.conf`). Removed, to keep the UKI small
@@ -1002,6 +1031,12 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
     `safespace.netroot=` URLs are tried in order.
   - Setting the variable from outside only switches to the other path, which then finds no
     root: the machine does not boot, but cannot boot anything unverified either.
+- **The combination is measured** by both paths (`select`: PCR 15
+  `safespace-combination:<name>`, once), then `safespace-identity.service` +
+  `/usr/local/lib/safespace/identity` creates (first sealed boot, or `--assign`) or releases
+  the machine identity and closes PCR 15. The identity key's public part is appended to the
+  initrd by `lib/compose.sh` (`usr/local/lib/safespace/identity.pem`). See
+  [Machine identity](#machine-identity).
 
 ### Build scripts
 
@@ -1016,7 +1051,7 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 | Area | Files |
 |---|---|
 | Read-only system | `etc/fstab` (ESP never mounted, Docker data disk); `safespace-var-factory.service` fills `/var` from the factory copy on every boot; masked: `boot.mount`, `boot.automount`, `efi.mount`, `efi.automount`, `systemd-repart`, `systemd-boot-random-seed`, `systemd-boot-update`, all sysext/confext units |
-| ssh | `sshd_config.d/10-safespace.conf` (keys only, no root, group `wheel`, keys from `/etc/ssh/authorized_keys/%u`, host keys in `/var`); `sshd-hostkeys.service` + `sshd.service.d/10-hostkeys.conf` replace the masked `sshdgenkeys.service` |
+| ssh | `sshd_config.d/10-safespace.conf` (keys only, no root, group `wheel`, keys from `/etc/ssh/authorized_keys/%u`, one ed25519 host key in `/var`); `sshd-hostkeys.service` (the machine's own if the initrd released it, else a throwaway one) + `sshd.service.d/10-hostkeys.conf` replace the masked `sshdgenkeys.service` |
 | Network | `20-wired.network`: DHCP on physical ethernet only (`Kind=!*` skips Docker's veth pairs). Network boot configures the same thing once more in the initrd |
 | sudo | `sudoers.d/10-wheel`: `wheel` without password |
 | USB | `usbguard.service.d/10-early.conf`: usbguard starts before `sysinit.target` |
@@ -1040,9 +1075,9 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 | Configuration (`/etc`) | baked into the image; change `mkosi.extra/` or `mkosi.postinst` and rebuild |
 | Users, ssh keys | created at build from `users.conf`; keys in the verified `/etc/ssh/authorized_keys/<user>` |
 | Home directories | `/home` → `/var/home` in RAM, reset to the image's state on every boot (including XFCE settings) |
-| **ssh host keys** | **new on every boot** (`/var` is RAM), so clients warn "host key changed" after each reboot. See "Open decisions" |
+| **ssh host key** | ed25519 only. Sealed machine with TPM, in its combination: **the machine's own**, released by the TPM ([Machine identity](#machine-identity)); otherwise **new on every boot** (`/var` is RAM), so clients warn "host key changed" after each reboot |
 | Logs | journal in RAM only, gone after reboot |
-| machine-id | new on every boot |
+| machine-id | like the host key: the machine's own in its combination, otherwise new on every boot |
 | Packages | no `pacman` on the running system; add to `Packages=` and rebuild |
 | usbguard | only temporary `allow-device`; permanent rules go into the image |
 | System extensions | `systemd-sysext`/`confext` stay disabled |
@@ -1181,8 +1216,8 @@ sectors and a CD boot header; both are fixed (`-S512`, `ElTorito=no`).
 
 ## Open decisions
 
-- **ssh host keys.** With nothing writable on the stick, they're generated on every boot.
-  Options:
+- **ssh host keys of machines without an identity** (not sealed, no TPM, another
+  combination; [Machine identity](#machine-identity)): generated on every boot. Options:
   1. leave it like that, and connect with `StrictHostKeyChecking`/known_hosts relaxed for this
      host;
   2. bake fixed host keys into the image (every stick and every boot has the same key, but the

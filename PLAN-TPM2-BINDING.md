@@ -1,6 +1,6 @@
 # PLAN: TPM2 binding of a machine to its assigned variant
 
-Status: **proposal**, not started. Builds on the whole-stack build (combinations), the
+Status: **superseded** by PLAN.md, "PLAN: TPM2 — the machine's identity only in its assigned combination". Builds on the whole-stack build (combinations), the
 signed UKI with signed expected PCR 11 values, and `lockdown=integrity` (SECURITY.md).
 
 ## Goal

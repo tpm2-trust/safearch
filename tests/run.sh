@@ -143,7 +143,8 @@ if wanted groups; then
 		printf '%s\n' "$1" >"$W/combos.conf"; combos_load "$W/combos.conf" && [[ "${COMBO_NAMES[*]}|${COMBO_GROUPS[*]}" == "$2" ]])
 	}
 	check "combinations.conf of the repository" t_combos "$(cat "$REPO/combinations.conf")" \
-		"root containers remotedesktop remote-workstation debug|base base,docker base,xfce4-headless-vnc base,docker,xfce4-headless-vnc base,debug"
+		"root containers|base base,docker"
+	check "tests/vm.combinations.conf (the test build's)" t_combos "$(cat "$REPO/tests/vm.combinations.conf")" "root containers debug|base base,docker base,debug"
 	check "any combination may come first (it is the default)" t_combos $'x=docker\ny=base' "x y|base,docker base"
 	refuse "a name twice" t_combos $'base=base\nx=docker\nx=docker' ""
 	refuse "an invalid name" t_combos $'base=base\nX;y=docker' ""
@@ -462,7 +463,16 @@ if wanted compose && fixtures; then
 	check "the UKI names every root in order, without roothash=" \
 		bash -c '[[ " $1 " == *" safespace.root.root=$2 safespace.root.containers=$3 "* && " $1 " != *" roothash="* && " $1 " == *" safespace.netroot="* && " $1 " == *" lockdown=integrity "* ]]' _ "$ccmd" "$hr" "$hc"
 	check "... signed by the db key, with signed expected PCRs (.pcrsig)" bash -c 'sbverify --cert "$2" "$1" && objdump -h "$1" | grep -q "\.pcrsig"' _ "$B/boot.efi" "$KD/db/db.pem"
-	check "... the kernel and initrd of the first combination" bash -c 'cmp -s <(objcopy -O binary --only-section=.initrd "$1" /dev/stdout) <(objcopy -O binary --only-section=.initrd "$2" /dev/stdout)' _ "$B/boot.efi" "$CO/parts-20990101-0100/root/boot.efi"
+	t_initrd() { # COMPOSED FIRST: the first one's initrd, then only the identity key's cpio
+		local a b
+		a=$(objcopy -O binary --only-section=.initrd "$1" /dev/stdout | wc -c)
+		b=$(objcopy -O binary --only-section=.initrd "$2" /dev/stdout | wc -c)
+		cmp -s <(objcopy -O binary --only-section=.initrd "$1" /dev/stdout | head -c "$b") <(objcopy -O binary --only-section=.initrd "$2" /dev/stdout) &&
+			[[ $(objcopy -O binary --only-section=.initrd "$1" /dev/stdout | tail -c +$((b + 1)) | cpio -t --quiet 2>/dev/null | tr '\n' ' ') == "usr usr/local usr/local/lib usr/local/lib/safespace usr/local/lib/safespace/identity.pem " ]] &&
+			((a > b))
+	}
+	check "... the kernel and initrd of the first combination, plus the identity key" t_initrd "$B/boot.efi" "$CO/parts-20990101-0100/root/boot.efi"
+	check "... the identity key in the initrd is the build host's" bash -c 'cmp -s <(objcopy -O binary --only-section=.initrd "$1" /dev/stdout | tail -c 4096 | strings -n 8 | sed -n "/^-----BEGIN PUBLIC KEY/,/^-----END PUBLIC KEY/p") <(openssl x509 -in "$2" -pubkey -noout)' _ "$B/boot.efi" "$KD/identity.crt"
 	check "... named \"safespace <version>\" (.osrel), no combination: it serves all" bash -c '
 		o=$(objcopy -O binary --only-section=.osrel "$1" /dev/stdout | tr -d "\0")
 		grep -qx "PRETTY_NAME=\"safespace 20990101-0100\"" <<<"$o" && ! grep -q "^VARIANT" <<<"$o" && grep -qx "ID=arch" <<<"$o"' _ "$B/boot.efi"
@@ -491,6 +501,10 @@ if wanted compose && fixtures; then
 	R="names a combination" ctamper "a UKI named after one combination" - "$cuki '$ccmd' $KD/db/db.key $KD/db/db.pem 'PRETTY_NAME=\"safespace 20990101-0100 root\"'"
 	R="no AuthenticAMD microcode" ctamper "a UKI without AMD microcode" - "export FX_UCODE_VENDORS=GenuineIntel; $cuki '$ccmd' $KD/db/db.key $KD/db/db.pem 'PRETTY_NAME=\"safespace 20990101-0100\"'"
 	R="no signed expected PCRs" ctamper "a UKI without signed expected PCRs" - "$cuki '$ccmd' $KD/db/db.key $KD/db/db.pem 'PRETTY_NAME=\"safespace 20990101-0100\"'"
+	R="not exactly one identity signature, for enter-initrd" ctamper "a UKI without the identity key's signature" - "source $REPO/tests/lib/fixtures.sh; fx_reuki \$1 $KD ''"
+	R="not exactly one identity signature, for enter-initrd" ctamper "a UKI whose identity signature covers every phase (a root could unseal)" - "source $REPO/tests/lib/fixtures.sh; fx_reuki \$1 $KD 'enter-initrd enter-initrd:leave-initrd enter-initrd:leave-initrd:sysinit enter-initrd:leave-initrd:sysinit:ready'"
+	R="not exactly one identity signature, for enter-initrd" ctamper "a UKI whose identity signature is for leave-initrd" - "source $REPO/tests/lib/fixtures.sh; fx_reuki \$1 $KD 'enter-initrd:leave-initrd'"
+	check "compose_check passes a UKI rebuilt with the identity key for enter-initrd" bash -c 'rm -rf "$W/creuki" && cp -a "$1" "$W/creuki" && source "$REPO/tests/lib/fixtures.sh" && fx_reuki "$W/creuki" "$KD" enter-initrd && t_check "$W/creuki" >/dev/null 2>&1' _ "$B"
 	R="roothash-containers is not" ctamper "a roothash-<name> that is not the signed one" - 'echo 0000000000000000000000000000000000000000000000000000000000000000 >$1/roothash-containers'
 	R="not the combinations" ctamper "combinations in another order" - "$cuki '${ccmd/safespace.root.root=$hr safespace.root.containers=$hc/safespace.root.containers=$hc safespace.root.root=$hr}' $KD/db/db.key $KD/db/db.pem"
 	R="systemd-boot.efi is not signed" ctamper "systemd-boot signed by another key" - 'sbattach --remove $1/systemd-boot.efi >/dev/null; sbsign --key '"$KD"'/KEK/KEK.key --cert '"$KD"'/KEK/KEK.pem --output $1/systemd-boot.efi $1/systemd-boot.efi >/dev/null 2>&1'
@@ -501,12 +515,15 @@ if wanted compose && fixtures; then
 	SG=8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34 EV=$W/sel-efivars
 	H1=$(printf '1%.0s' {1..64}) H2=$(printf '2%.0s' {1..64})
 	CL="ro safespace.root.root=$H1 safespace.root.containers=$H2"
+	# The measuring program, replaced: it records its arguments (PCREXT_FAIL=1: fails).
+	PX=$W/pcrextend SR=$W/sel-run
+	printf '#!/bin/sh\necho "$*" >>"%s/pcrextend.log"\n[ -z "$PCREXT_FAIL" ]\n' "$W" >"$PX" && chmod +x "$PX"
 	t_select() { # CMDLINE ONCE PERSISTENT EXPECTED("name:hash")
-		rm -rf "$EV" && mkdir -p "$EV"
+		rm -rf "$EV" "$SR" "$W/pcrextend.log" && mkdir -p "$EV"
 		[[ -z $2 ]] || printf '\x07\x00\x00\x00%s' "$2" >"$EV/SafespaceSelectOnce-$SG"
 		[[ -z $3 ]] || printf '\x07\x00\x00\x00%s' "$3" >"$EV/SafespaceSelect-$SG"
 		local got
-		got=$(cmdline=$1 SAFESPACE_EFIVARS=$EV sh -c 'msg() { :; }; . "$0"; select_root || exit 1; echo "$SELECT_NAME:$SELECT_HASH"' "$SEL") || return 1
+		got=$(cmdline=$1 SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$SR SAFESPACE_PCREXTEND=$PX sh -c 'msg() { :; }; . "$0"; select_root || exit 1; echo "$SELECT_NAME:$SELECT_HASH"' "$SEL") || return 1
 		[[ $got == "$4" ]] || { echo "got $got"; return 1; }
 	}
 	check "select: nothing set boots the first combination" t_select "$CL" "" "" "root:$H1"
@@ -519,6 +536,101 @@ if wanted compose && fixtures; then
 	check "select: a variable that is no name is ignored" t_select "$CL" "" 'x;rm' "root:$H1"
 	refuse "select: roothash= alone stops the boot (no fallback)" t_select "ro roothash=$H1" "" "" ""
 	refuse "select: a variable cannot add a root (no hash of its own)" t_select "$CL" "" "x$H1" ""
+	t_select "$CL" "" containers "containers:$H2" >/dev/null
+	check "select: the choice is measured into PCR 15 before it is used" bash -c '[[ $(cat "$1") == "--graceful --pcr=15 safespace-combination:containers" ]]' _ "$W/pcrextend.log"
+	check "... and recorded in /run/safespace/combination" bash -c '[[ $(cat "$1/combination") == containers ]]' _ "$SR"
+	t_twice() { rm -rf "$SR" "$W/pcrextend.log"; cmdline=$CL SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$SR SAFESPACE_PCREXTEND=$PX sh -c 'msg() { :; }; . "$0"; select_root && select_root' "$SEL" && [[ $(wc -l <"$W/pcrextend.log") == 1 ]]; }
+	check "select: measured only once per boot" t_twice
+	t_failmeasure() { PCREXT_FAIL=1 t_select "$CL" "" "" "root:$H1"; }
+	check "select: a failing measurement does not stop the boot" t_failmeasure
+	t_unknown_measured() { t_select "$CL" "" nope ""; test -e "$W/pcrextend.log"; }
+	refuse "select: an unknown name is not measured" t_unknown_measured
+
+	# The machine's identity (initrd identity): systemd-creds replaced by a stub.
+	# encrypt: header type (signed for tpm2-with-public-key, else plain; STUB_TYPE=plain
+	# forces plain) + name + content, base64. decrypt: only with a signature file
+	# containing "good" (STUB_NOSIG_OK=1: also with an empty one), and the right name.
+	ID=$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/identity
+	CS=$W/creds-stub IR=$W/id-run
+	cat >"$CS" <<-'STUB'
+		#!/bin/bash
+		mode=$1; shift; key="" sig="" name="" files=()
+		for a; do case $a in --with-key=*) key=${a#*=} ;; --tpm2-signature=*) sig=${a#*=} ;; --name=*) name=${a#*=} ;; -*) ;; *) files+=("$a") ;; esac; done
+		in=${files[0]} out=${files[1]:--}
+		if [[ $mode == encrypt ]]; then
+			t=5e2d5c7603724eaf843c6fb5f64098f5
+			[[ $key == tpm2-with-public-key && -z $STUB_TYPE ]] || t=d4062dfb71ad4c86804b40ef1180f1fc
+			{ printf "$(sed 's/../\\x&/g' <<<"$t")"; printf '%s\n' "$name"; cat "$in"; } | base64 -w0 >"$out"
+		else
+			grep -q good "$sig" 2>/dev/null || { [[ -n $STUB_NOSIG_OK && $(cat "$sig") == '{}' ]]; } || exit 1
+			d=$(base64 -d <"$in" | tail -c +17)
+			[[ ${d%%$'\n'*} == "$name" ]] || exit 1
+			if [[ $out == - ]]; then printf '%s' "${d#*$'\n'}"; else printf '%s' "${d#*$'\n'}" >"$out"; fi
+		fi
+	STUB
+	chmod +x "$CS"
+	echo good >"$W/sig-good.json"; echo bad >"$W/sig-bad.json"
+	t_id() { # COMBINATION SECUREBOOT SETUPMODE SIGNATURE [ENV...]: run identity, results in $IR/
+		rm -rf "$IR" "$W/pcrextend.log" && mkdir -p "$IR/run" "$EV"
+		printf '\x06\x00\x00\x00\x0'"$2" >"$EV/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+		printf '\x06\x00\x00\x00\x0'"$3" >"$EV/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+		[[ -z $1 ]] || echo "$1" >"$IR/run/combination"
+		env "${@:5}" SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$IR/run SAFESPACE_PCREXTEND=$PX SAFESPACE_CREDS=$CS \
+			SAFESPACE_IDENTITY_KEY=/dev/null SAFESPACE_PCRSIG=$4 SAFESPACE_MACHINE_ID=$IR/machine-id \
+			sh "$ID" 2>"$IR/log"
+	}
+	slot() { tail -c +5 "$EV/$1-$SG" 2>/dev/null | sha256sum | cut -c1-16; }
+	t_id_first() {
+		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" &&
+			[[ -e $EV/SafespaceIdHostKey-$SG && -e $EV/SafespaceIdMachine-$SG ]] &&
+			[[ -s $IR/run/identity/ssh_host_ed25519_key && -s $IR/machine-id ]] &&
+			cmp -s "$IR/machine-id" "$IR/run/identity/machine-id" &&
+			[[ $(tail -1 "$W/pcrextend.log") == "--graceful --pcr=15 safespace-identity:sealed" ]]
+	}
+	check "identity: the first sealed boot creates both slots, releases them, closes PCR 15" t_id_first
+	t_id_sboff() { rm -rf "$EV"; t_id containers 0 0 "$W/sig-good.json"; [[ ! -e $EV/SafespaceIdHostKey-$SG && ! -e $IR/run/identity/ssh_host_ed25519_key ]] && grep -q 'identity:sealed' "$W/pcrextend.log"; }
+	check "identity: no identity with Secure Boot off (and PCR 15 closed)" t_id_sboff
+	t_id_setup() { rm -rf "$EV"; t_id containers 1 1 "$W/sig-good.json"; [[ ! -e $EV/SafespaceIdHostKey-$SG ]]; }
+	check "identity: no identity in Setup Mode" t_id_setup
+	t_id_other() {
+		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" || return 1
+		local h=$(slot SafespaceIdHostKey)
+		t_id root 1 0 "$W/sig-bad.json"
+		[[ ! -e $IR/run/identity/ssh_host_ed25519_key && ! -e $IR/machine-id && $(slot SafespaceIdHostKey) == "$h" ]] && grep -q 'identity:sealed' "$W/pcrextend.log"
+	}
+	check "identity: another combination: not released, no new identity, PCR 15 closed" t_id_other
+	t_id_update() { rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" && cp "$IR/machine-id" "$W/mid1" && t_id containers 1 0 "$W/sig-good.json" && cmp -s "$IR/machine-id" "$W/mid1"; }
+	check "identity: the assigned combination again: the same machine-id" t_id_update
+	t_id_mismatch() {
+		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" || return 1
+		local h=$(slot SafespaceIdHostKey)
+		printf '\x07\x00\x00\x00root' >"$EV/SafespaceAssign-$SG"
+		t_id containers 1 0 "$W/sig-good.json"
+		[[ $(slot SafespaceIdHostKey) == "$h" && ! -e $EV/SafespaceAssign-$SG ]] && grep -q "ignoring SafespaceAssign=root" "$IR/log"
+	}
+	check "identity: SafespaceAssign for another combination than measured: ignored, deleted" t_id_mismatch
+	t_id_move() {
+		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" || return 1
+		local h=$(slot SafespaceIdHostKey)
+		printf '\x07\x00\x00\x00containers' >"$EV/SafespaceAssign-$SG"
+		t_id containers 1 0 "$W/sig-good.json"
+		[[ $(slot SafespaceIdHostKey) != "$h" && -s $IR/run/identity/ssh_host_ed25519_key && ! -e $EV/SafespaceAssign-$SG ]]
+	}
+	check "identity: SafespaceAssign for the measured combination: a new identity" t_id_move
+	t_id_plain() { rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" STUB_TYPE=plain; [[ ! -e $EV/SafespaceIdHostKey-$SG ]] && grep -q "not bound to the signed policy" "$IR/log"; }
+	check "identity: a slot without the signed policy type is not written" t_id_plain
+	t_id_nosig() { rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" STUB_NOSIG_OK=1; [[ ! -e $EV/SafespaceIdHostKey-$SG ]] && grep -q "not bound to the signed policy" "$IR/log"; }
+	check "identity: a slot that unseals without a signature is not written" t_id_nosig
+	t_id_none() { rm -rf "$EV"; t_id "" 1 0 "$W/sig-good.json"; [[ ! -e $EV/SafespaceIdHostKey-$SG ]] && grep -q 'identity:sealed' "$W/pcrextend.log"; }
+	check "identity: nothing measured: no identity, PCR 15 closed" t_id_none
+	t_id_swap() {
+		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" || return 1
+		cp "$EV/SafespaceIdHostKey-$SG" "$W/hk" && cp "$EV/SafespaceIdMachine-$SG" "$EV/SafespaceIdHostKey-$SG"
+		t_id containers 1 0 "$W/sig-good.json"
+		[[ ! -e $IR/run/identity/ssh_host_ed25519_key ]]
+	}
+	check "identity: one slot passed off as the other is not released" t_id_swap
+	check "identity: every sealing uses tpm2-with-public-key" bash -c '! grep -nE "(creds|CREDS\"?) encrypt" "$@" | grep -v "with-key=tpm2-with-public-key"' _ "$ID" "$REPO/mkosi.extra/usr/local/sbin/safespace-seal"
 fi
 
 # --- dnsmasq ----------------------------------------------------------------------------------

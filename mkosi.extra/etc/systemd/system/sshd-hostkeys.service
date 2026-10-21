@@ -1,6 +1,10 @@
 # Replaces Arch's sshdgenkeys.service, which writes to the read-only /etc/ssh.
+# The host key (ed25519 only) is the machine's own if the initrd released it
+# (/run/safespace/identity/, only in the combination the machine is assigned
+# to: SECURITY.md, "Machine identity"), otherwise a throwaway key, new on every
+# boot.
 [Unit]
-Description=Generate SSH host keys in /var
+Description=SSH host key in /var (the machine's own, or a throwaway one)
 Before=sshd.service
 RequiresMountsFor=/var/lib
 ConditionPathExists=!/var/lib/sshd/etc/ssh/ssh_host_ed25519_key
@@ -9,5 +13,10 @@ ConditionPathExists=!/var/lib/sshd/etc/ssh/ssh_host_ed25519_key
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/bin/install -d -m 0755 /var/lib/sshd/etc/ssh
-# -f: prefix for the key paths, so the keys land in /var/lib/sshd/etc/ssh/.
-ExecStart=/usr/bin/ssh-keygen -A -f /var/lib/sshd
+# Moved, not copied: one plaintext copy of the key, readable by root only.
+ExecStart=/bin/sh -c 'k=/var/lib/sshd/etc/ssh/ssh_host_ed25519_key; \
+	if [ -s /run/safespace/identity/ssh_host_ed25519_key ]; then \
+		mv /run/safespace/identity/ssh_host_ed25519_key "$k" && chmod 0600 "$k" && ssh-keygen -y -f "$k" >"$k.pub" && echo "host key: the machine'"'"'s own"; \
+	else \
+		ssh-keygen -q -t ed25519 -N "" -C "" -f "$k" && echo "host key: throwaway (no identity released)"; \
+	fi'

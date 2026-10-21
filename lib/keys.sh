@@ -4,7 +4,9 @@
 #   keys_load SUMMARY_JSON   which keys this build uses (`mkosi --json summary`)
 #   keys_mkosi_args          mkosi options that point the signing at those keys
 #   keys_export OUT_DIR      public Secure Boot material for safespace-seal
-#   keys_ensure_pcr          create the PCR signing key on the first build
+#   keys_ensure_pcr          create the PCR signing keys on the first build:
+#                            mkosi's (all boot phases) and the identity key
+#                            (enter-initrd only, lib/compose.sh)
 #
 # Where the Secure Boot keys come from: an sbctl key set (PK, KEK, db in
 # <keydir>/<K>/<K>.{key,pem}, plus the GUID file).
@@ -25,6 +27,7 @@
 # anything else, and a UKI not signed by the exported db.pem.
 
 KEYS_SB_DIR="" KEYS_GUID="" KEYS_SB_CERT="" KEYS_PCR_KEY="" KEYS_PCR_CERT="" KEYS_DEDICATED=0
+KEYS_ID_KEY="" KEYS_ID_CERT=""
 
 # The value of a top-level "key: value" line of an sbctl configuration (YAML).
 keys_sbctl_conf() { # FILE KEY
@@ -44,6 +47,8 @@ print((c.get("Environment") or {}).get("SAFESPACE_SBCTL_CONFIG", ""))
 ' <"$summary") || die "cannot read the key settings from mkosi summary"
 	[[ $sb == True ]] || die "SecureBoot= is off: safespace images are always signed"
 	[[ -n $KEYS_PCR_KEY && -n $KEYS_PCR_CERT ]] || die "SignExpectedPcrKey=/SignExpectedPcrCertificate= not set (mkosi.conf)"
+	KEYS_ID_KEY=$(dirname "$KEYS_PCR_KEY")/identity.key
+	KEYS_ID_CERT=$(dirname "$KEYS_PCR_CERT")/identity.crt
 	if [[ -n $conf ]]; then
 		[[ -f $conf ]] || die "SAFESPACE_SBCTL_CONFIG=$conf does not exist (create it, see README.md, \"Secure Boot keys\")"
 		KEYS_SB_DIR=$(keys_sbctl_conf "$conf" keydir)
@@ -117,21 +122,29 @@ keys_export() { # OUT_DIR
 	done
 }
 
-# The PCR signing key binds TPM policies to "a UKI signed by this build host".
-# Nothing has it yet on the first build, so it is created here: RSA 2048 (what
-# TPM 2.0 policies support everywhere), root-only, outside the project.
+# The PCR signing keys bind TPM policies to "a UKI signed by this build host".
+# Nothing has them yet on the first build, so they are created here: RSA 2048
+# (what TPM 2.0 policies support everywhere), root-only, outside the project.
+#   - mkosi's (SignExpectedPcrKey=): signs every boot phase, for systemd's own use.
+#   - the identity key, next to it: signs the phase enter-initrd only. The
+#     machine's secrets are sealed to it (SECURITY.md, "Machine identity"): after
+#     the initrd, no signature matches PCR 11 any more, so nothing a root runs can
+#     unseal them, even if the initrd never measured the selection.
 keys_ensure_pcr() {
-	if [[ -f $KEYS_PCR_KEY && -f $KEYS_PCR_CERT ]]; then
+	keys_ensure_rsa "$KEYS_PCR_KEY" "$KEYS_PCR_CERT" "safespace expected PCR signing"
+	keys_ensure_rsa "$KEYS_ID_KEY" "$KEYS_ID_CERT" "safespace identity PCR signing (enter-initrd)"
+}
+
+keys_ensure_rsa() { # KEY CERT CN
+	if [[ -f $1 && -f $2 ]]; then
 		return 0
 	fi
-	[[ ! -e $KEYS_PCR_KEY && ! -e $KEYS_PCR_CERT ]] ||
-		die "only one of $KEYS_PCR_KEY and $KEYS_PCR_CERT exists: restore the other or remove both"
-	log "creating the PCR signing key $KEYS_PCR_KEY (first build on this host)"
-	install -d -m 0700 "$(dirname "$KEYS_PCR_KEY")" "$(dirname "$KEYS_PCR_CERT")"
+	[[ ! -e $1 && ! -e $2 ]] || die "only one of $1 and $2 exists: restore the other or remove both"
+	log "creating the signing key $1 (first build on this host)"
+	install -d -m 0700 "$(dirname "$1")" "$(dirname "$2")"
 	(
 		umask 077
-		openssl req -x509 -newkey rsa:2048 -nodes -days 36500 -subj "/CN=safespace expected PCR signing/" \
-			-keyout "$KEYS_PCR_KEY" -out "$KEYS_PCR_CERT" 2>/dev/null
-	) || die "openssl could not create the PCR signing key"
-	chmod 0644 "$KEYS_PCR_CERT"
+		openssl req -x509 -newkey rsa:2048 -nodes -days 36500 -subj "/CN=$3/" -keyout "$1" -out "$2" 2>/dev/null
+	) || die "openssl could not create the signing key $1"
+	chmod 0644 "$2"
 }

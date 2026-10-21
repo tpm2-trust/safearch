@@ -8,7 +8,7 @@
 # unless safespace-select preselects another (an EFI variable).
 #
 #   sudo ./build.sh [--url BASE_URL]... [--workers N] [--users FILE]
-#                   [--output-root DIR] [MKOSI OPTIONS...]
+#                   [--combinations FILE] [--output-root DIR] [MKOSI OPTIONS...]
 #
 #   ./build.sh list                 the builds: built at, snapshot, packages,
 #                                   size, last release
@@ -40,10 +40,11 @@
 #              sticks only.
 #
 # --users FILE    the users and ssh keys to build in (default: users.conf);
+# --combinations FILE  the combinations to build (default: combinations.conf);
 # --output-root DIR  where the build's directory goes (default: mkosi.output).
-#              Both inside this checkout. For test builds (tests/vm.sh: a
-#              throwaway user, kept apart from the real builds, so list and
-#              release.sh never offer them).
+#              All inside this checkout. For test builds (tests/vm.sh: a
+#              throwaway user, its own combinations, kept apart from the real
+#              builds, so list and release.sh never offer them).
 #
 # Package source: SNAPSHOT= and MIRROR= in repos.conf, overridden per host by
 # repos.local.conf (see repos.local.conf.example). A pinned date, or latest,
@@ -125,6 +126,7 @@ esac
 URLS=()
 NETROOT=()
 USERS_FILE=users.conf
+COMBOS_FILE=combinations.conf
 OUTPUT_ROOT=mkosi.output
 WORKERS=""
 MKOSI_ARGS=()
@@ -133,6 +135,7 @@ while (($#)); do
 		--url) URLS+=("${2:?--url needs a base URL}"); shift 2 ;;
 		--url=*) URLS+=("${1#--url=}"); shift ;;
 		--users) USERS_FILE=${2:?--users needs a file}; shift 2 ;;
+		--combinations) COMBOS_FILE=${2:?--combinations needs a file}; shift 2 ;;
 		--output-root) OUTPUT_ROOT=${2:?--output-root needs a directory}; shift 2 ;;
 		--workers) WORKERS=${2:?--workers needs a thread count}; shift 2 ;;
 		--workers=*) WORKERS=${1#--workers=}; shift ;;
@@ -167,8 +170,9 @@ command -v mkosi >/dev/null || die "mkosi not found (pacman -S mkosi)"
 inside() { # PATH: a plain relative path below the checkout
 	[[ $1 =~ ^[A-Za-z0-9._/-]+$ && $1 != /* && /$1/ != */../* ]]
 }
-USERS_FILE=${USERS_FILE#./} OUTPUT_ROOT=${OUTPUT_ROOT#./}
+USERS_FILE=${USERS_FILE#./} OUTPUT_ROOT=${OUTPUT_ROOT#./} COMBOS_FILE=${COMBOS_FILE#./}
 inside "$USERS_FILE" || die "--users: a relative path inside the checkout, got '$USERS_FILE'"
+inside "$COMBOS_FILE" || die "--combinations: a relative path inside the checkout, got '$COMBOS_FILE'"
 inside "$OUTPUT_ROOT" || die "--output-root: a relative path inside the checkout, got '$OUTPUT_ROOT'"
 [[ -f $HERE/$USERS_FILE ]] || die "$USERS_FILE missing: cp users.conf.example users.conf and add your ssh keys"
 BUILDS_ROOT=$HERE/${OUTPUT_ROOT%/}
@@ -179,7 +183,7 @@ source "$HERE/lib/groups.sh"
 source "$HERE/lib/verify.sh"
 # shellcheck source=lib/compose.sh
 source "$HERE/lib/compose.sh"
-combos_load "$HERE/combinations.conf"
+combos_load "$HERE/$COMBOS_FILE"
 # shellcheck source=lib/repos.sh
 source "$HERE/lib/repos.sh"
 repos_load "$HERE"

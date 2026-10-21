@@ -16,7 +16,10 @@
 #                            combination, the command line with
 #                            safespace.root.<name>=<root hash> per combination
 #                            (instead of roothash=), signed with the db key and
-#                            with signed expected PCRs, from the image's stub
+#                            with signed expected PCRs, from the image's stub;
+#                            the initrd carries the identity key's public part
+#                            (usr/local/lib/safespace/identity.pem), the .pcrsig
+#                            its signature for the phase enter-initrd only
 #   systemd-boot.efi, layout.sfdisk
 #   root-<name>.img, root-<name>.verity, roothash-<name>, manifest-<name>.json
 #   vnc-password-<name>      (combinations with xfce4-headless-vnc)
@@ -84,12 +87,25 @@ compose_uki() { # OUT FIRST_UKI STUB CMDLINE
 	[[ $v =~ ^[0-9]{8}-[0-9]{4,6}$ ]] || { rm -rf "$t"; die "no IMAGE_VERSION in the .osrel of $uki"; }
 	printf 'PRETTY_NAME="safespace %s"\n' "$v" >>"$t/osrel.all"
 	mv "$t/osrel.all" "$t/osrel"
+	# The identity key's public part, for sealing the machine's secrets in the
+	# initrd (mkosi.initrd.conf/.../identity): appended as a cpio of its own,
+	# the kernel unpacks every archive of the initrd in turn.
+	install -d "$t/id/usr/local/lib/safespace"
+	openssl x509 -in "$KEYS_ID_CERT" -pubkey -noout >"$t/id/usr/local/lib/safespace/identity.pem" ||
+		{ rm -rf "$t"; die "cannot read the identity key's certificate $KEYS_ID_CERT"; }
+	(cd "$t/id" && find usr | sort | cpio -o -H newc --owner=0:0 --reproducible --quiet) >>"$t/initrd" ||
+		{ rm -rf "$t"; die "cannot append the identity key to the initrd"; }
+	# Two PCR signing keys: mkosi's for every phase (first: its public key is the
+	# .pcrpkey systemd uses), the identity key for enter-initrd only.
 	ukify build --efi-arch x64 --stub "$stub" --output "$out" \
 		--linux "$t/linux" --initrd "$t/initrd" --microcode "$t/ucode" \
 		--os-release "@$t/osrel" --uname "$(uki_section "$uki" .uname)" --cmdline "@$t/cmdline" \
 		--no-sign-kernel --signtool systemd-sbsign \
 		--secureboot-private-key "$KEYS_SB_DIR/db/db.key" --secureboot-certificate "$KEYS_SB_DIR/db/db.pem" \
-		--pcr-banks sha256 --pcr-certificate "$KEYS_PCR_CERT" --pcr-private-key "$KEYS_PCR_KEY" \
+		--pcr-banks sha256 \
+		--pcr-certificate "$KEYS_PCR_CERT" --pcr-private-key "$KEYS_PCR_KEY" \
+		--phases "enter-initrd enter-initrd:leave-initrd enter-initrd:leave-initrd:sysinit enter-initrd:leave-initrd:sysinit:ready" \
+		--pcr-certificate "$KEYS_ID_CERT" --pcr-private-key "$KEYS_ID_KEY" --phases enter-initrd \
 		--sign-initrd-pcrs >"$t/ukify.log" 2>&1 || { cat "$t/ukify.log" >&2; rm -rf "$t"; die "ukify failed"; }
 	rm -rf "$t"
 }
@@ -158,6 +174,45 @@ compose_check() { # DEST DB_CERT
 		grep -qx "kernel/x86/microcode/$n.bin" <<<"$ucode" || die "the composed UKI has no $n microcode (.ucode)"
 	done
 	objdump -h "$dest/boot.efi" | grep -q '[[:space:]]\.pcrsig[[:space:]]' || die "the composed UKI has no signed expected PCRs (.pcrsig)"
+	compose_check_identity "$dest/boot.efi"
 	verify_layout "$dest" "${pairs[@]}" >/dev/null || die "layout.sfdisk does not match the roots"
 	log "composed UKI checked: signed by the exported db.pem, lockdown=integrity, ${#COMBO_NAMES[@]} roots by their signed hashes"
+}
+
+# The machine's secrets are sealed to the identity key (SECURITY.md, "Machine
+# identity"): its public part must be in the initrd, and the .pcrsig must hold
+# exactly one signature by it: for PCR 11 at enter-initrd, computed here from
+# the UKI's own sections. A signature for a later phase would let a root unseal
+# the secrets.
+compose_check_identity() { # UKI
+	local t fp s want args=()
+	t=$(mktemp -d)
+	for s in linux osrel cmdline initrd ucode splash dtb uname sbat pcrpkey profile pcrsig; do
+		objcopy -O binary --only-section=".$s" "$1" "$t/$s" 2>/dev/null && [[ -s $t/$s ]] || continue
+		[[ $s == pcrsig ]] || args+=("--$s=$t/$s")
+	done
+	[[ -s $t/initrd && -s $t/pcrsig ]] || { rm -rf "$t"; die "cannot read .initrd/.pcrsig of $1"; }
+	python3 -I - "$t/initrd" >"$t/identity.pem" <<-'EOF' || { rm -rf "$t"; die "the composed UKI's initrd carries no identity key"; }
+		import sys
+		d = open(sys.argv[1], "rb").read()
+		name = b"usr/local/lib/safespace/identity.pem\0"
+		i = d.rfind(name)
+		h = d[i - 110:i]
+		if i < 110 or h[:6] != b"070701":
+		    sys.exit(1)
+		size, namesize = int(h[54:62], 16), int(h[94:102], 16)
+		start = i + namesize + (-(110 + namesize) % 4)
+		sys.stdout.buffer.write(d[start:start + size])
+	EOF
+	fp=$(openssl rsa -pubin -in "$t/identity.pem" -RSAPublicKey_out -outform DER 2>/dev/null | sha256sum | cut -c1-64)
+	want=$(/usr/lib/systemd/systemd-measure policy-digest "${args[@]}" --phase=enter-initrd --bank=sha256 --json=short |
+		python3 -I -c 'import json, sys; print(json.load(sys.stdin)["sha256"][0]["pol"])') ||
+		{ rm -rf "$t"; die "systemd-measure cannot compute the enter-initrd policy of $1"; }
+	python3 -I - "$t/pcrsig" "$fp" "$want" <<-'EOF' || { rm -rf "$t"; die "the composed UKI's .pcrsig: not exactly one identity signature, for enter-initrd"; }
+		import json, sys
+		s = json.loads(open(sys.argv[1], "rb").read().rstrip(b"\0"))["sha256"]
+		mine = [(e["pcrs"], e["pol"]) for e in s if e["pkfp"] == sys.argv[2]]
+		sys.exit(mine != [([11], sys.argv[3])])
+	EOF
+	rm -rf "$t"
 }

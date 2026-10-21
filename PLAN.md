@@ -6,10 +6,331 @@ T450s findings with usb/network aligned.
 
 ## Still open from earlier plans
 
+- **build.sh has no lock:** a second build started while one runs deletes the first one's
+  `.parts-*` directory at its start (seen 2026-10-21: the first build failed). Proposal: `flock`
+  on the output root.
+
 - usb variant: boot the current build in QEMU (explicit `KernelInitrdModules=` list).
 - `fluidsynth.service` (user unit from vlc-plugin-fluidsynth) fails without a
   SoundFont: mask it in the image? (proposal, not decided)
 - netstick: QEMU boot of a netstick image not tested.
+
+---
+
+# PLAN: TPM2 — the machine's identity only in its assigned combination
+
+Status: **confirmed**, in progress. Replaces PLAN-TPM2-BINDING.md: that
+one needed a multi-profile UKI and lost the choice on PXE clients (the T450s); this one
+measures the selection in the initrd, so stick and network behave the same.
+
+## Goal
+
+- `debug` stays in every build. Selecting it (or any other combination than the assigned
+  one) must not give access to anything the assigned combination has: the selection is
+  **measured**, and every per-machine secret is sealed to "assigned combination selected".
+- First two secrets, each in its own slot: the **ssh host key** and the **machine-id**.
+  In the assigned combination they come back on every boot, also after updates; in any
+  other they don't (throwaway host key, transient machine-id): the machine is visibly
+  "not itself" to every ssh client and inventory.
+- Nothing per machine on the build host, nothing on the boot medium, no step on the machine
+  after an update.
+
+## Today
+
+- One UKI, one signed command line with `safespace.root.<name>=<hash>` per combination;
+  the initrd (`select`) names the root from `SafespaceSelect*` (plain EFI variables, attr
+  0x07). PCR 11 is the same for every combination: the TPM can't tell them apart.
+- Host keys generated in RAM every boot (`sshd-hostkeys.service`); machine-id transient.
+- The UKI carries signed expected PCR 11 values (`.pcrsig`/`.pcrpkey`, PCR key on the build
+  host), unused so far. TPM drivers (`tpm_tis`, `tpm_crb`) are built into the Arch kernel.
+
+## Design
+
+### 1. The selection is measured, in the initrd, before anything else can run
+
+`select_root()` (both paths: `usb-bootdev`, `netroot`) extends, right after it decided:
+
+```
+systemd-pcrextend --pcr=15 "safespace-combination:<name>"
+```
+
+- The initrd is part of the signed UKI (PCR 11), so the code that measures is itself
+  measured: a different measurement needs a different initrd, which breaks the PCR 11
+  signature (and doesn't boot on a sealed machine).
+- PCRs only extend: once the initrd measured `debug`, nothing later in the boot — not the
+  debug root, not root in it — can bring PCR 15 to the `containers` value. Only a reboot
+  resets it, and then the initrd measures again.
+- PCR 15, not 16/23 (resettable from the OS). It is systemd's "system identity" PCR; systemd
+  extends it only after switch-root (machine-id, root fs), after our unsealing.
+- No TPM, or the extend fails: the boot goes on (it never depends on the TPM), PCR 15 is not
+  at the expected value, nothing unseals. Fails closed.
+
+### 2. Two sealed secrets ("slots"), one policy
+
+Each is a systemd-creds TPM2 credential (`--with-key=tpm2-with-public-key`), created **in the
+initrd** at assignment (see 5):
+
+| Slot (EFI variable) | Content | Credential name | Size (PoC) | Consumer |
+|---|---|---|---|---|
+| `SafespaceIdHostKey` | `ssh_host_ed25519_key` | `safespace-ssh-host-key` | ~1.3 KiB | sshd (only this) |
+| `SafespaceIdMachine` | machine-id (128 bit, TPM RNG) | `safespace-machine-id` | ~1.4 KiB | PID 1 |
+
+Two slots, not one: sshd never sees the machine-id, either can be renewed alone, a third
+secret later (data-disk key, VPN) is another slot. The credential name is embedded and
+checked: one slot can't be passed off as the other (PoC: refused).
+
+Policy of both (all must hold, at unseal time):
+
+```
+PolicyAuthorize(identity.pem, PCR 11)  a safespace UKI, signed by the build host's identity
+                                       PCR key for the phase enter-initrd ONLY
+∧ PolicyPCR(7  = value at assignment)  Secure Boot on, with exactly our PK/KEK/db/dbx
+∧ PolicyPCR(15 = value at assignment)  = SHA256(0³² ‖ SHA256("safespace-combination:<assigned>")),
+                                       i.e. exactly one measurement, of the assigned name
+```
+
+- PCR 11 signed (not literal): every future build signed with the same key passes → updates
+  need nothing on the machine (PoC: build 2 unseals with its own signature).
+- **enter-initrd only**, with a key of its own (`identity.key`, next to mkosi's `pcr.key`, which
+  keeps signing all phases for systemd's own use). PoC: with an all-phase signature, a root
+  whose initrd measured nothing can extend `safespace-combination:containers` itself after
+  switch-root and unseal; with enter-initrd only it can't — after `leave-initrd` no signature
+  matches PCR 11 any more. This is the primary guard; PCR 15 is the selection.
+- PCR 7: without it, a machine with Secure Boot off could run a foreign stub that measures the
+  genuine section hashes into PCR 11 but boots something else.
+- PCR 7 and 15 are bound by their **current** values: systemd-creds 262 takes no precomputed
+  values (`--tpm2-pcrs=15:sha256=…` refused) and no policyref, so sealing has to happen where
+  PCR 15 holds the assigned value: in the initrd of a boot of that combination (see 5).
+
+### 3. Unsealing only in the initrd, then the TPM is closed
+
+`select` writes the decided name to `/run/safespace/combination` and extends PCR 15 (both paths,
+exactly once per boot: a second measurement no longer matches, PoC). A new initrd unit
+`safespace-identity` (after `usb-bootdev`/`netroot`, before `initrd-switch-root.target`):
+
+1. assignment pending (5)? then seal first;
+2. reads the two EFI variables, `systemd-creds decrypt` each into `/run/safespace/identity/`
+   (tmpfs, 0700 root; `/run` is carried over the switch-root);
+3. extends PCR 15 with `safespace-identity:sealed`: in this boot nothing unseals again, even in
+   the initrd (defence in depth, the phase restriction already covers the root);
+4. logs to kmsg which slots were released (names only).
+
+In the root: `sshd-hostkeys.service` takes `/run/safespace/identity/ssh_host_ed25519_key` if
+present, else generates throwaway keys (as today); the machine-id is applied before PID 1
+needs it (mechanism: step 1b).
+
+```mermaid
+sequenceDiagram
+  participant FW as UEFI (Secure Boot)
+  participant ST as systemd-stub
+  participant IR as initrd (select, safespace-identity)
+  participant T as TPM
+  participant R as selected root
+  FW->>T: PCR 7 = SB state, PK/KEK/db/dbx
+  FW->>ST: boot.efi (signed by db)
+  ST->>T: PCR 11 = UKI sections + "enter-initrd"
+  IR->>IR: name from cmdline / SelectOnce / Select / first
+  IR->>T: extend PCR 15 "safespace-combination:<name>"
+  IR->>T: unseal HostKey, MachineId (11 signed enter-initrd, 7, 15)
+  T-->>IR: only if <name> = assigned
+  IR->>T: extend PCR 15 "safespace-identity:sealed"
+  IR->>T: PCR 11 "leave-initrd" (systemd-pcrphase): identity signatures void
+  IR->>R: switch-root, /run/safespace/identity/ (or nothing)
+```
+
+### 4. TPM2 structure: what is public, what is private
+
+```mermaid
+flowchart TB
+  subgraph BH["build host (private keys never leave it)"]
+    DBK["db.key / KEK / PK<br/>Secure Boot"]:::priv
+    PCRK["pcr.key<br/>PCR 11, all phases (systemd)"]:::priv
+    IDK["identity.key<br/>PCR 11, enter-initrd only"]:::priv
+  end
+  subgraph PUB["public (image, release, servers)"]
+    DBP[db.pem, KEK/PK .auth]:::pub
+    PCRP["pcr.pem (.pcrpkey)"]:::pub
+    IDP["identity.pem (in the initrd)"]:::pub
+    SIG[".pcrsig: signatures of both keys"]:::pub
+  end
+  subgraph TPM["machine's TPM (T450s: Intel PTT)"]
+    EPS["endorsement seed / EK private"]:::priv
+    SRK["SRK 0x81000001 private<br/>(systemd-tpm2-setup)"]:::priv
+    EKP["EK public + vendor EK cert"]:::pub
+    SRKP["SRK public"]:::pub
+  end
+  subgraph NV["EFI variables of the machine (readable by root)"]
+    C1["SafespaceIdHostKey: TPM2B_PUBLIC (policy digest)<br/>+ TPM2B_PRIVATE (wrapped by SRK) + AES-GCM payload"]:::wrapped
+    C2["SafespaceIdMachine: same structure"]:::wrapped
+  end
+  DBK --> DBP
+  PCRK --> PCRP
+  IDK --> IDP
+  PCRK --> SIG
+  IDK --> SIG
+  SRK -. wraps .-> C1
+  SRK -. wraps .-> C2
+  IDP -. PolicyAuthorize .-> C1
+  IDP -. PolicyAuthorize .-> C2
+  classDef priv fill:#f8d7da,stroke:#a33
+  classDef pub fill:#d4edda,stroke:#383
+  classDef wrapped fill:#fff3cd,stroke:#a80
+```
+
+| Item | Where | Class | Note |
+|---|---|---|---|
+| db/KEK/PK private keys | build host | **private** | as today |
+| `pcr.key` | build host `/var/lib/safespace/pcr-signing/` | **private** | as today (mkosi), all phases; not used for the identity |
+| `identity.key` (new) | build host `/var/lib/safespace/pcr-signing/` | **private** | its holder can authorize any PCR 11 at enter-initrd — still needs a db-signed UKI to run it on a sealed machine (two keys) |
+| `db.pem`, `.auth`, `pcr.pem`, `identity.pem`, `.pcrsig` | image, release, servers | public | |
+| EK private, endorsement/storage seeds, SRK private | inside the TPM | **private**, never leaves | |
+| EK public + EK certificate | TPM NV | public | optional anchor for an inventory (later) |
+| SRK public | TPM, `/run/systemd/tpm2-srk-public-key.*` | public | systemd uses it for salted, encrypted sessions (no plaintext on a TPM bus) |
+| sealed credentials (2 slots) | EFI variables | public *ciphertext* | useless without this TPM + the policy; root can delete them (DoS, visible), not read them |
+| ssh host private key, machine-id | `/run/safespace/identity/` in RAM, assigned combination only | **private** | machine-id(5): confidential, apps get app-specific IDs |
+| ssh host public key, `systemd-id128 machine-id --app-specific=<safespace id>` | printed after assignment | public | `known_hosts` line and inventory ID |
+| assigned combination name | implicit in the policy (PCR 15 value) | public | not secret, only bound |
+
+No TPM NV indexes are used (PTT NV space is small, no wear, nothing to clean up); the
+only persistent TPM object is systemd's SRK.
+
+### 5. Assignment (one reboot)
+
+1. `safespace-seal --assign NAME` (root, any combination): refuses unless Secure Boot is on with
+   our PK and `NAME` is on this build's signed command line; writes `SafespaceAssign=NAME` and
+   `SafespaceSelectOnce=NAME`, asks for a reboot.
+2. Next boot, initrd: `select` measures `NAME`; `safespace-identity` sees `SafespaceAssign` equal
+   to the **measured** name (otherwise: ignore and delete it), generates host key and
+   machine-id in RAM, encrypts them with the current PCR 7+15 and the identity key's signed
+   PCR 11, writes both slots, deletes `SafespaceAssign`, continues as an unseal (3).
+3. `safespace-seal --identity` (in the root) prints the `known_hosts` line, the fingerprint and
+   the app-specific machine ID; `safespace-select set NAME` if NAME should stay the default.
+
+The plaintext is only ever created by the measured initrd, never by a process of a root.
+Re-assignment creates **new** secrets, never the old ones: clients and inventory notice.
+
+### 6. Why `debug` is then no security issue
+
+| Concern | With this plan (PoC result on swtpm) |
+|---|---|
+| root selects `debug`, boots it | boots; PCR 15 = debug → no host key, no machine-id (refused) |
+| `debug` root extends `containers` on top | PCR 15 = debug+containers ≠ assigned (refused) |
+| initrd measured nothing, root extends `containers` | PCR 11 is past `enter-initrd` → no identity signature matches (refused) |
+| reads the EFI variables, copies them to another machine | ciphertext bound to this TPM's SRK |
+| kernel/UKI not signed, or signed with a foreign PCR key | PCR 11 not covered by an identity signature (refused) |
+| Secure Boot keys changed | PCR 7 differs (refused) → `--assign` again |
+| `debug` has more privileges | no: `tests/vm.sh` checks it has `root`'s setuid/caps/units (exists) |
+| old signed build of the assigned combination | unseals (same identity key) — as today for booting; key rotation as remedy |
+| root in the **assigned** combination | trusted, has the keys it runs with; out of scope |
+
+**Rule** (new invariant): every per-machine secret is sealed to the measured selection with
+an enter-initrd-only signature and unsealed only in the initrd.
+
+### 7. Network boot
+
+Identical: `netroot` sources `select`, so the measurement and unsealing happen the same way
+on PXE (T450s), HTTP boot and stick. Independent of the boot-menu plan (a menu profile would
+set `safespace.select=`, which is measured the same way).
+
+## PoC results (2026-10-21, swtpm 0.10.2, systemd 262, host only)
+
+Simulated boots: PCR 7 extended with a "Secure Boot state", PCR 11 replayed exactly as
+systemd-stub + pcrphase measure (`.linux\0`, its content, `enter-initrd`; equal to
+`systemd-measure calculate`), PCR 15 by `systemd-pcrextend`. Findings:
+
+- `systemd-pcrextend` silently does nothing (exit 0) if the stub didn't measure the UKI into
+  PCR 11 (`SYSTEMD_FORCE_MEASURE=1` overrides; on a real boot the stub measures). Fails closed.
+- PCR 15 = SHA256(0³² ‖ SHA256(word)), as computed.
+- `systemd-creds --with-key=tpm2` **silently drops** `--tpm2-public-key*` ("PK PCR mask: 0x0";
+  the credential then unseals with no signature at all). `tpm2-with-public-key` is required.
+  tests/run.sh will check the key type in the scripts.
+- No precomputed PCR values, no policyref in systemd-creds 262 → sealing in the initrd (5).
+- Matrix: assigned/build 1 ✔, assigned/update build 2 ✔; refused: after close, nothing
+  measured, debug, debug+containers, measured twice, update + debug, build 2 with build 1's
+  signature, Secure Boot keys changed, unsigned kernel, foreign PCR key, no signature, the
+  late-extend attack with an enter-initrd-only signature (with an all-phase one it succeeds).
+
+## Steps
+
+- [x] 1a. **PoC on the host with swtpm** (results above; SECURITY.md).
+- [x] 1b. **PoC in QEMU + swtpm with a test build** (done, SECURITY.md: tools are all in the initrd but
+      `ssh-keygen` → `openssh` added; machine-id handed over by `/run/machine-id`; stick, network,
+      update, PCR 7, attacks from a root; T450s by you): `systemd-creds`/`systemd-pcrextend` and
+      `tpm2-tss` in mkosi's initrd (size for the network UKI); the stub's real PCR 11; ukify
+      with a second `--pcr-private-key … --phases=enter-initrd`; how PID 1 takes the machine-id
+      (`/run/machine-id` vs the `system.machine_id` credential); EFI variable writes from the
+      initrd. Then on the T450s (you, commands handed over): PTT enabled, `systemd-analyze has-tpm2`.
+- [x] 2. Build host: `identity.key`/`identity.pem` created like `pcr.key` (`build.sh`, `lib/keys.sh`),
+      never in the image; `compose_uki` signs with it for `enter-initrd` only; `compose_check`
+      and `lib/verify.sh` check both signatures are present; `identity.pem` into the initrd.
+- [x] 3. initrd: `select` records and measures the name once (both paths); `InitrdPackages=tpm2-tss`.
+- [x] 4. initrd: `safespace-identity` (pending assignment → seal; unseal both slots; close
+      PCR 15; log). After sealing, before a slot is written: its header type ID must be the
+      signed-policy one (`5e2d5c76-0372-4eaf-843c-6fb5f64098f5` in the PoC; plain `tpm2` is
+      `d4062dfb-71ad-4c86-804b-40ef1180f1fc`) and a decrypt with an empty signature must fail;
+      otherwise the slot is discarded and the assignment aborted.
+- [x] 5. root: `sshd-hostkeys.service` uses the unsealed key or generates; machine-id applied.
+- [x] 6. `safespace-seal --assign NAME` / `--identity` (`safespace-select list` not yet); `safespace-select list` shows the
+      assignment and whether the identity was released this boot.
+- [x] 7. `tests/run.sh` (the swtpm matrix as a test: not yet): PCR 15 formula; `select` measures exactly once (stubbed
+      `systemd-pcrextend`); `safespace-identity` order measure → (seal) → unseal → close;
+      `tpm2-with-public-key` everywhere; `SafespaceAssign` ≠ measured name ignored; fallback
+      without slots/TPM; `--assign` input validation; `compose_check` refuses a UKI without
+      identity signatures or with an all-phase one; the swtpm matrix above as a test when
+      `swtpm` is installed (SKIP otherwise).
+      Status 2026-10-21: tests/run.sh 199 passed (combinations.conf: the two combinations are
+      meant, test fixed); tests/vm.sh --no-build on combined_20261021-1239 (no TPM: the fallback
+      path) all 12 PASS (run-20261021-125139).
+- [x] 8. `tests/vm.sh` (new prerequisite: `swtpm`; the PoC driver's stages become its steps).
+      Done 2026-10-21: tests/vm.sh all 25 PASS (run-20261021-131418, combined_20261021-1314:
+      root, containers, debug).
+      Requested 2026-10-21, with a test-only combinations file: `build.sh --combinations FILE`
+      (default `combinations.conf`); `tests/vm.combinations.conf` = root, containers, debug
+      (debug: the case the identity must hold against, and the debug-surface check). New step
+      `identity` (after seal, own TPM and firmware copy, one boot after the other): first sealed
+      boot creates it for the default; debug once: not released, no new identity, unseal from
+      the running root refused (also after extending PCR 15 with the default's name); default
+      again: same host key and machine-id, unseal from the assigned root after boot refused;
+      network boot: same; db changed (PCR 7): not released; `--assign containers`: new identity
+      in containers; default then: not released. Not in vm.sh (one build per run): the update
+      (PoC, SECURITY.md). Original plan: seal + `--assign containers` + reboot;
+      boot containers twice → same host key and machine-id; boot `debug` (SelectOnce) → other
+      key, no machine-id; next boot containers → original key again; a **new build** released →
+      same key, no step; network boot as well.
+- [ ] 9. Docs: README (assignment, what the user sees), **SECURITY.md: every security-relevant
+      point of this plan** (the measured selection, the policy and why each PCR, the
+      enter-initrd-only identity key and the attack it closes, the `tpm2-with-public-key` trap
+      and its checks, sealing only in the initrd, the public/private table, the attack table of
+      6, the new invariant; remove "selection not measured" from known limits), NETBOOT.md (same on network), AGENTS.md
+      (new invariant). Remove PLAN-TPM2-BINDING.md.
+
+## What changes / breaks
+
+- Nothing for unassigned machines: they boot as today (throwaway host keys).
+- PCR 15 carries the selection from the initrd on; nothing here used PCR 15 before.
+- Secure Boot key or dbx changes in the firmware change PCR 7 → `--assign` again (new keys).
+- The initrd grows by `tpm2-tss` (network UKI size, step 1b measures it).
+- A new build-host key (`identity.key`); a build without it can't assign (unassigned boots
+  stay as they are).
+- Assigning takes a reboot (sealing happens in the initrd).
+
+## Decisions (2026-10-21)
+
+Changes from the PoC (OK 2026-10-21): enter-initrd-only identity key; assignment by reboot,
+sealed in the initrd. Everything security-relevant goes into SECURITY.md (done: "Machine
+identity", with every tested variant and how it was tested).
+
+**Binding (2026-10-21, decision A):** per combination, created **automatically** on the first
+boot with Secure Boot on and no slot yet, for the combination that boots; updates keep it.
+`--assign NAME` only moves a machine (new identity). Existing slots that don't unseal never
+lead to a new identity.
+
+1. Machine-id bound to the assignment, like the host key.
+2. PCR 7 in the policy (re-assign after Secure Boot key/dbx changes).
+3. Root may assign from any combination; new secrets always mean a new, printed fingerprint,
+   which you register as the anchor.
+4. ed25519 host key only (for now).
+5. No TPM PIN (for now).
 
 ---
 
@@ -1033,8 +1354,8 @@ installation, from the repository's actual configuration.
 ---
 # PLAN: TPM2 binding of a machine to its assigned variant
 
-Proposal written up in [PLAN-TPM2-BINDING.md](PLAN-TPM2-BINDING.md) (design, security
-analysis, steps, open questions). Not started; waits for the open questions there.
+Superseded by "PLAN: TPM2 — the machine's identity only in its assigned combination" at
+the top (selection measured in the initrd instead of a multi-profile UKI).
 
 ---
 # PLAN: TFTP over safespace-dhcp delivers nothing

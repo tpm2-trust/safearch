@@ -46,6 +46,9 @@
 #   are kept in sealed-vars.fd in the work directory.
 # --sealed: boot again with sealed-vars.fd of the work directory (after safespace-seal).
 # --ssh PORT: forward localhost:PORT to the VM's sshd.
+# --tpm: a TPM 2.0 (swtpm, CRB interface like Intel PTT). Its state is kept in
+#   tpm/ of the work directory, so the TPM survives reboots like a real one
+#   (the machine's identity is sealed to it). Needs swtpm (pacman -S swtpm).
 # --work DIR: the VM's files (firmware variables, serial.log, qga.sock, the
 #   stick image, the netboot docroot); default mkosi.test/. One per VM when
 #   several run at once (tests/vm.sh). Keep the path short: qga.sock is a unix
@@ -61,7 +64,7 @@ HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 
-IMAGE="" SB=0 SETUP=0 SEALED=0 SSH_PORT="" NETBOOT=0 TREE="" NBMODE=http BOOT_URL="" SERVE=1 WORK=""
+IMAGE="" SB=0 SETUP=0 SEALED=0 SSH_PORT="" NETBOOT=0 TREE="" NBMODE=http BOOT_URL="" SERVE=1 WORK="" TPM=0
 while (($#)); do
 	case $1 in
 		--netboot) NETBOOT=1; shift ;;
@@ -71,6 +74,7 @@ while (($#)); do
 		--secure-boot) SB=1; shift ;;
 		--setup-mode) SETUP=1; shift ;;
 		--sealed) SEALED=1; shift ;;
+		--tpm) TPM=1; shift ;;
 		--ssh) SSH_PORT=${2:?--ssh needs a port}; shift 2 ;;
 		--no-server) SERVE=0; shift ;;
 		--work) WORK=${2:?--work needs a directory}; shift 2 ;;
@@ -257,6 +261,19 @@ else
 		-device usb-storage,bus=xhci.0,drive=stick,removable=on
 	)
 	log "Booting $(basename "$RAW") as a USB stick (close the window to stop)"
+fi
+if ((TPM)); then
+	command -v swtpm >/dev/null || die "swtpm missing (pacman -S swtpm)"
+	((${#WORK} + 9 <= 107)) || die "--work path too long for the tpm.sock unix socket: $WORK"
+	mkdir -p "$WORK/tpm"
+	rm -f "$WORK/tpm.sock"
+	# --terminate: swtpm ends with QEMU's connection; the state stays in tpm/.
+	swtpm socket --tpm2 --tpmstate dir="$WORK/tpm" --ctrl type=unixio,path="$WORK/tpm.sock" \
+		--terminate --log file="$WORK/swtpm.log" &
+	for _ in $(seq 50); do [[ -S $WORK/tpm.sock ]] && break; sleep 0.1; done
+	[[ -S $WORK/tpm.sock ]] || die "swtpm did not start (see $WORK/swtpm.log)"
+	extra+=(-chardev socket,id=chrtpm,path="$WORK/tpm.sock" -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-crb,tpmdev=tpm0)
+	log "TPM 2.0: swtpm, state in $WORK/tpm"
 fi
 qemu-system-x86_64 -machine "$machine" "${extra[@]}" -cpu host -smp 2 -m "$MEM" \
 	-drive if=pflash,format=raw,readonly=on,file="$code" \

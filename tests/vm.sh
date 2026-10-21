@@ -14,12 +14,14 @@
 #   --build BUILD   test this existing test build (mkosi.test/vm/builds/)
 #   --jobs N        at most N VMs at a time (default: what the free RAM allows
 #                   for network boots of the largest root, at most 4)
-#   STEP            stick net seal net-sb select (default: all; select needs
-#                   seal and runs it first)
+#   STEP            stick net seal net-sb select identity (default: all;
+#                   select and identity need seal and run it first)
 #
 # Kept apart from everything real, in mkosi.test/vm/ (gitignored):
 #   id_ed25519, users.conf   the test user "tester" and its key: created here
 #                            once, used for nothing else (build.sh --users)
+# The test build's combinations: tests/vm.combinations.conf (build.sh
+# --combinations), few to keep the test fast; root, containers and debug.
 #   builds/<build>/          test builds (build.sh --users, --output-root); the
 #                            newest is kept. ./build.sh list and
 #                            ./release.sh never see them: a test build has the
@@ -58,12 +60,22 @@
 #           first one's setuid/setgid files, file capabilities and enabled
 #           units (debug adds packages, nothing else). Every boot with Secure
 #           Boot enabled and verified.
+#   identity the machine identity, on a TPM of its own (swtpm) and a copy of
+#           the sealed firmware, one boot after the other: the first sealed
+#           boot creates it for the default (both slots released, one ed25519
+#           host key); debug once: nothing released or created, and its root
+#           cannot unseal the slot (also not after extending PCR 15 with the
+#           default's name); the default again: the same host key and
+#           machine-id, and its root cannot unseal after the boot; network boot:
+#           the same; another db certificate (PCR 7): nothing released; moved
+#           with safespace-seal --assign containers: a new identity there, and
+#           the default has none afterwards.
 #
 # Prerequisites (all checked before anything starts; the list of what is
 # missing, then exit 2):
 #   - qemu-desktop, edk2-ovmf, virt-firmware (virt-fw-vars), openssh, curl,
 #     binutils, sbsigntools, cryptsetup, dosfstools, mtools, util-linux,
-#     python, rsync; /dev/kvm read/write
+#     python, rsync; /dev/kvm read/write; swtpm (step identity)
 #   - sudo for ./build.sh (asked once at the start, or a NOPASSWD rule for
 #     unattended runs, see README.md "Integration test"); not with --no-build
 #   - with --no-build / --build: the public keys the test build was signed
@@ -87,15 +99,15 @@ while (($#)); do
 		--build) BUILD_MODE=given; BUILD=${2:?--build needs a build}; shift 2 ;;
 		--jobs) JOBS=${2:?--jobs needs a number}; shift 2 ;;
 		-h | --help) usage; exit 0 ;;
-		stick | net | seal | net-sb | select) STEPS+=("$1"); shift ;;
+		stick | net | seal | net-sb | select | identity) STEPS+=("$1"); shift ;;
 		*) usage >&2; die "unknown argument $1" ;;
 	esac
 done
 [[ -z $JOBS || $JOBS =~ ^[1-9]$ ]] || die "--jobs needs a number from 1 to 9, got '$JOBS'"
-((${#STEPS[@]})) || STEPS=(stick net seal net-sb select)
+((${#STEPS[@]})) || STEPS=(stick net seal net-sb select identity)
 wants() { [[ " ${STEPS[*]} " == *" $1 "* ]]; }
-# select boots the firmware seal sealed
-wants select && ! wants seal && STEPS=(seal "${STEPS[@]}")
+# select and identity boot the firmware seal sealed
+{ wants select || wants identity; } && ! wants seal && STEPS=(seal "${STEPS[@]}")
 cd "$REPO"
 
 VM=mkosi.test/vm                  # relative: build.sh takes paths inside the checkout
@@ -119,6 +131,7 @@ for f in OVMF_CODE.4m.fd OVMF_CODE.secboot.4m.fd OVMF_VARS.4m.fd; do
 	[[ -f /usr/share/edk2/x64/$f ]] || miss "/usr/share/edk2/x64/$f (pacman -S edk2-ovmf)"
 done
 [[ -r /dev/kvm && -w /dev/kvm ]] || miss "read/write access to /dev/kvm (group kvm)"
+wants identity && ! command -v swtpm >/dev/null && miss "swtpm (pacman -S swtpm; the step identity's TPM)"
 # A test build exports the keys it is signed with; an existing one needs them.
 [[ $BUILD_MODE == build || -f $DB ]] || miss "$DB (the keys the test build was signed with: run without --no-build)"
 if [[ $BUILD_MODE == build ]]; then
@@ -137,7 +150,8 @@ avail=$(awk '/^MemAvailable:/ { print int($2 / 1048576) }' /proc/meminfo)
 ((avail >= 4)) || miss "4 GiB of available RAM (have $avail GiB)"
 mkdir -p "$VM/builds"
 free=$(df -BG --output=avail "$VM" | tail -1 | tr -dc 0-9)
-need_disk=$((6 + 4 * $(grep -c '^[a-z]' combinations.conf)))
+COMBOS_FILE=tests/vm.combinations.conf
+need_disk=$((6 + 4 * $(grep -c '^[a-z]' "$COMBOS_FILE")))
 ((free >= need_disk)) || miss "$need_disk GiB free disk in mkosi.test/ (have $free GiB)"
 if ((${#MISSING[@]})); then
 	printf '\e[1;31m==> missing prerequisites:\e[0m\n' >&2
@@ -168,7 +182,7 @@ result() {
 case $BUILD_MODE in
 	build)
 		log "building the whole stack (test user, root from $URL)"
-		sudo "$REPO/build.sh" --users "$VM/users.conf" --output-root "$VM/builds" --url "$URL" \
+		sudo "$REPO/build.sh" --users "$VM/users.conf" --combinations "$COMBOS_FILE" --output-root "$VM/builds" --url "$URL" \
 			>"$LOGS/build.log" 2>&1 || die "build failed (see ${LOGS#"$REPO"/}/build.log)"
 		BUILD=$(builds_newest)
 		# Only the newest test build stays.
@@ -302,6 +316,13 @@ for p in amd-ucode intel-ucode linux-firmware-realtek; do pacman -Qq $p >/dev/nu
 echo slim=${bad:-ok}
 echo lockdown=$(sudo cat /sys/kernel/security/lockdown | sed -n "s/.*\[\(.*\)\].*/\1/p")
 echo secure_boot=$(bootctl status 2>/dev/null | sed -n "s/^ *Secure Boot: *//p" | head -1 | tr " " _)
+# The machine identity (step identity): the host key, the machine-id, the slots the
+# initrd released ("released" list), whether it created an identity this boot.
+echo hostkey=$(ssh-keygen -lf /var/lib/sshd/etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null | cut -d" " -f2)
+echo hostkeys=$(ls /var/lib/sshd/etc/ssh/ | grep -c "_key\$")
+echo machine_id=$(cat /etc/machine-id)
+echo identity=$(sudo cat /run/safespace/identity/released 2>/dev/null | tr "\n" , | sed "s/,\$//")
+echo identity_created=$(sudo dmesg | grep -c "safespace-identity: assigned to")
 '
 probe() { vm_ssh "$PROBE" >"$LOGS/$1.probe" 2>&1; }
 val() { sed -n "s/^$2=//p" "$LOGS/$1.probe" 2>/dev/null | head -1; }
@@ -435,6 +456,85 @@ step_select_once() { # INDEX
 	sel_boot "select-$n" "$combo" "! test -e /sys/firmware/efi/efivars/SafespaceSelectOnce-$SELECT_GUID"
 }
 
+# The machine identity (SECURITY.md, "Machine identity"), on a TPM of its own (swtpm,
+# test-vm.sh --tpm: its state stays in the step's work directory, like a real TPM)
+# and a copy of the sealed firmware of seal, one boot after the other.
+ID_GUID=8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34
+# From the running root: unseal the machine-id slot with the UKI's signatures, then
+# again after extending PCR 15 with NAME (what an attacker in another combination does).
+id_attack() { # NAME
+	vm_ssh 'sudo sh -c "tail -c +5 /sys/firmware/efi/efivars/SafespaceIdMachine-'"$ID_GUID"'" >/tmp/id.cred
+		try() { sudo systemd-creds decrypt --tpm2-signature=/run/systemd/tpm2-pcr-signature.json --name=safespace-machine-id /tmp/id.cred - >/dev/null 2>&1 && echo yes || echo no; }
+		echo unsealed=$(try)
+		sudo /usr/lib/systemd/systemd-pcrextend --pcr=15 "safespace-combination:'"$1"'" >/dev/null 2>&1
+		echo unsealed_extended=$(try)'
+}
+id_boot() { # NAME TEST-VM-ARGS...: boot on the step's firmware and TPM, probe
+	local n=$1; shift
+	if vm_start "$n" "$@" --sealed --tpm; then probe "$n"; return 0; fi
+	result FAIL "$n" "$ERR"; vm_stop "$n"; return 1
+}
+# id_check NAME DESCRIPTION CONDITION...: PASS if every [[ ]] condition holds
+id_check() {
+	local n=$1 d=$2; shift 2
+	if bash -c "$*"; then result PASS "$n" "$d"; else result FAIL "$n" "$d"; fi
+}
+step_identity() {
+	local first=${COMBOS[0]%%:*} other="" move="" c hk mid a
+	for c in "${COMBOS[@]:1}"; do
+		[[ ${c#*:} == *+debug ]] && other=${c%%:*}
+		[[ ${c#*:} != *+debug && -z $move ]] && move=${c%%:*}
+	done
+	[[ -n $other ]] || other=${COMBOS[1]%%:*}
+	[[ -n $move ]] || move=$other
+	cp "$RUN/sealed-vars.fd" "$WORK/sealed-vars.fd"
+	# 1. The first sealed boot with a TPM creates the identity, for the default.
+	id_boot identity-create "$STICK" || return
+	vm_ssh "sudo safespace-select once $other" >/dev/null 2>&1
+	vm_stop identity-create
+	expect identity-create combination="$first" identity=SafespaceIdHostKey,SafespaceIdMachine identity_created=1 hostkeys=1 "${SEALED[@]}" || return
+	hk=$(val identity-create hostkey) mid=$(val identity-create machine_id)
+	# 2. Another combination: nothing released, nothing created, no unseal from its root.
+	id_boot "identity-$other" "$STICK" || return
+	id_attack "$first" >"$LOGS/identity-$other.attack" 2>&1
+	vm_stop "identity-$other"
+	cat "$LOGS/identity-$other.attack" >>"$LOGS/identity-$other.probe"
+	expect "identity-$other" combination="$other" identity= identity_created=0 unsealed=no unsealed_extended=no "${SEALED[@]}"
+	id_check "identity-$other" "another host key and machine-id" "[[ '$(val "identity-$other" hostkey)' != '$hk' && '$(val "identity-$other" machine_id)' != '$mid' ]]"
+	# 3. The default again: the same identity; no unseal from its root after the boot.
+	id_boot identity-again "$STICK" || return
+	id_attack "$first" >"$LOGS/identity-again.attack" 2>&1
+	vm_stop identity-again
+	cat "$LOGS/identity-again.attack" >>"$LOGS/identity-again.probe"
+	expect identity-again combination="$first" identity=SafespaceIdHostKey,SafespaceIdMachine identity_created=0 unsealed=no unsealed_extended=no "${SEALED[@]}"
+	id_check identity-again "the same host key and machine-id" "[[ '$(val identity-again hostkey)' == '$hk' && '$(val identity-again machine_id)' == '$mid' ]]"
+	# 4. Over the network, same firmware and TPM: the same identity.
+	id_boot identity-net --netboot --tree "$RUN/share" --no-server || return
+	vm_stop identity-net
+	expect identity-net combination="$first" netroot=1 identity=SafespaceIdHostKey,SafespaceIdMachine identity_created=0 secure_boot=enabled* "${COMMON[@]}"
+	id_check identity-net "the same host key and machine-id" "[[ '$(val identity-net hostkey)' == '$hk' && '$(val identity-net machine_id)' == '$mid' ]]"
+	# 5. Another certificate in db (PCR 7 changes): nothing released, nothing created.
+	cp "$WORK/sealed-vars.fd" "$WORK/sealed-vars.keep"
+	openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=extra-db/ -keyout "$WORK/extra.key" -out "$WORK/extra.pem" 2>/dev/null &&
+		virt-fw-vars -i "$WORK/sealed-vars.keep" -o "$WORK/sealed-vars.fd" --add-db 11111111-2222-3333-4444-555555555555 "$WORK/extra.pem" >"$LOGS/identity-pcr7.vars.log" 2>&1 ||
+		{ result FAIL identity-pcr7 "could not change db (see ${LOGS#"$REPO"/}/identity-pcr7.vars.log)"; return; }
+	id_boot identity-pcr7 "$STICK" || return
+	vm_stop identity-pcr7
+	cp "$WORK/sealed-vars.keep" "$WORK/sealed-vars.fd"
+	expect identity-pcr7 combination="$first" identity= identity_created=0 "${SEALED[@]}"
+	# 6. Moved (--assign): a new identity in that combination; the default then has none.
+	id_boot identity-assign-req "$STICK" || return
+	vm_ssh "sudo safespace-seal --assign $move --yes" >"$LOGS/identity-assign.log" 2>&1
+	vm_stop identity-assign-req
+	id_boot "identity-assigned-$move" "$STICK" || return
+	vm_stop "identity-assigned-$move"
+	expect "identity-assigned-$move" combination="$move" identity=SafespaceIdHostKey,SafespaceIdMachine identity_created=1 "${SEALED[@]}"
+	id_check "identity-assigned-$move" "a new host key and machine-id" "[[ '$(val "identity-assigned-$move" hostkey)' != '$hk' && '$(val "identity-assigned-$move" machine_id)' != '$mid' ]]"
+	id_boot identity-after-move "$STICK" || return
+	vm_stop identity-after-move
+	expect identity-after-move combination="$first" identity= identity_created=0 "${SEALED[@]}"
+}
+
 # job KEY FUNCTION ARGS...: run a step in the background, at most $JOBS at a time.
 # KEY orders the report and names the step's work directory (short: qga.sock is a
 # unix socket).
@@ -456,7 +556,7 @@ if wants stick || wants seal; then
 	(source "$REPO/lib/stick.sh"; stick_write "$STICK" "$RUN/share") >"$LOGS/stick-image.log" 2>&1 ||
 		die "could not assemble the stick image (see ${LOGS#"$REPO"/}/stick-image.log)"
 fi
-if wants net || wants net-sb; then
+if wants net || wants net-sb || wants identity; then
 	python3 -m http.server "$PORT_HTTP" --bind 127.0.0.1 --directory "$RUN/share" >"$LOGS/http.log" 2>&1 &
 	HTTP_PID=$!
 	disown "$HTTP_PID"
@@ -480,8 +580,17 @@ wants seal && { job 12-seal step_seal; SEAL_PID=$JOB_PID; }
 wants stick && job 10-stick step_stick
 wants net && job 11-net step_net
 wants net-sb && job 13-net-sb step_net_sb
-if wants select; then
+if wants select || wants identity; then
 	wait "$SEAL_PID" 2>/dev/null
+fi
+if wants identity; then
+	if [[ ! -f $RUN/sealed-vars.fd ]]; then
+		KEY=30-identity result FAIL identity "no sealed firmware variables (the step seal failed)"
+	else
+		job 30-identity step_identity
+	fi
+fi
+if wants select; then
 	if [[ ! -f $RUN/sealed-vars.fd ]]; then
 		KEY=20-select result FAIL select "no sealed firmware variables (the step seal failed)"
 	else
