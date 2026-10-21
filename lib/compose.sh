@@ -71,12 +71,19 @@ compose_layout() { # OUT FIRST_LAYOUT DIR
 # The common UKI, built as mkosi builds one (ukify with the same options), from
 # the first combination's sections and the image's stub.
 compose_uki() { # OUT FIRST_UKI STUB CMDLINE
-	local out=$1 uki=$2 stub=$3 t
+	local out=$1 uki=$2 stub=$3 t v
 	t=$(mktemp -d)
 	for s in linux initrd ucode osrel; do
 		objcopy -O binary --only-section=".$s" "$uki" "$t/$s" || { rm -rf "$t"; die "no .$s in $uki"; }
 	done
 	printf '%s\0' "$4" >"$t/cmdline"
+	# The UKI serves every combination: its name (systemd-boot's entry) must not be
+	# the first one's.
+	tr -d '\0' <"$t/osrel" | sed -E '/^(PRETTY_NAME|VARIANT|VARIANT_ID)=/d' >"$t/osrel.all"
+	v=$(sed -n 's/^IMAGE_VERSION="\{0,1\}\([0-9-]*\)"\{0,1\}$/\1/p' "$t/osrel.all")
+	[[ $v =~ ^[0-9]{8}-[0-9]{4,6}$ ]] || { rm -rf "$t"; die "no IMAGE_VERSION in the .osrel of $uki"; }
+	printf 'PRETTY_NAME="safespace %s"\n' "$v" >>"$t/osrel.all"
+	mv "$t/osrel.all" "$t/osrel"
 	ukify build --efi-arch x64 --stub "$stub" --output "$out" \
 		--linux "$t/linux" --initrd "$t/initrd" --microcode "$t/ucode" \
 		--os-release "@$t/osrel" --uname "$(uki_section "$uki" .uname)" --cmdline "@$t/cmdline" \
@@ -125,10 +132,11 @@ compose_build() { # DEST DIR...
 # per-combination ones: check it again before the build counts as built.
 # Signed by exactly the exported db.pem (as systemd-boot), lockdown=integrity
 # on its signed command line, no roothash= (only the selection's), every
-# combination with its own root hash in order, signed expected PCRs, and a
+# combination with its own root hash in order, signed expected PCRs, Intel and
+# AMD microcode, named "safespace <version>" without a combination, and a
 # partition table that names every pair by its hash.
 compose_check() { # DEST DB_CERT
-	local dest=$1 cert=$2 cmdline names n h pairs=()
+	local dest=$1 cert=$2 cmdline names n h osrel ucode pairs=()
 	verify_signature "$dest/boot.efi" "$cert" || die "the composed UKI is not signed by $cert"
 	verify_signature "$dest/systemd-boot.efi" "$cert" || die "systemd-boot.efi is not signed by $cert"
 	cmdline=$(uki_cmdline "$dest/boot.efi")
@@ -140,6 +148,14 @@ compose_check() { # DEST DB_CERT
 		h=$(tr ' ' '\n' <<<"$cmdline" | sed -n "s/^safespace\.root\.$n=//p")
 		[[ $(tr -d '[:space:]' <"$dest/roothash-$n") == "$h" ]] || die "roothash-$n is not the hash on the composed UKI's command line"
 		pairs+=("$n $h")
+	done
+	osrel=$(uki_section "$dest/boot.efi" .osrel)
+	grep -Eq '^PRETTY_NAME="safespace [0-9]{8}-[0-9]{4,6}"$' <<<"$osrel" && ! grep -q '^VARIANT_ID=' <<<"$osrel" ||
+		die "the composed UKI's .osrel names a combination (it serves all): $(grep '^PRETTY_NAME=' <<<"$osrel")"
+	# Microcode of both CPU vendors (security fixes the firmware may not have).
+	ucode=$(objcopy -O binary --only-section=.ucode "$dest/boot.efi" /dev/stdout 2>/dev/null | cpio -t --quiet 2>/dev/null) || ucode=""
+	for n in GenuineIntel AuthenticAMD; do
+		grep -qx "kernel/x86/microcode/$n.bin" <<<"$ucode" || die "the composed UKI has no $n microcode (.ucode)"
 	done
 	objdump -h "$dest/boot.efi" | grep -q '[[:space:]]\.pcrsig[[:space:]]' || die "the composed UKI has no signed expected PCRs (.pcrsig)"
 	verify_layout "$dest" "${pairs[@]}" >/dev/null || die "layout.sfdisk does not match the roots"

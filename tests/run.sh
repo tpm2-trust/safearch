@@ -72,7 +72,7 @@ die() { echo "DIE: $*" >&2; return 1; }
 # each serves sticks and network boot.
 fixtures() {
 	[[ -d $W/keys ]] && return 0
-	need sbctl sbsign sbverify veritysetup zstd objcopy objdump mcopy mkfs.vfat sfdisk openssl ukify || return 1
+	need sbctl sbsign sbverify veritysetup zstd cpio objcopy objdump mcopy mkfs.vfat sfdisk openssl ukify || return 1
 	fx_keys "$W/keys" || { fail "creating throwaway sbctl keys"; return 1; }
 	KD=$W/keys/keys
 	CO=$W/checkout
@@ -161,6 +161,9 @@ if wanted groups; then
 		check "base: no desktop, no docker, no debug tools; btrfs-progs" bash -c '[[ " $1 " != *" xfce4 "* && " $1 " != *" docker "* && " $1 " != *" tcpdump "* && " $1 " == *" openssh "* && " $1 " == *" btrfs-progs "* ]]' _ "$base"
 		check "xfce4-headless-vnc + docker add theirs" bash -c '[[ " $1 " == *" xfce4 "* && " $1 " == *" docker "* && " $1 " == *" tigervnc "* ]]' _ "$all"
 		check "debug adds its tools" bash -c '[[ " $1 " == *" tcpdump "* && " $1 " == *" kexec-tools "* && " $1 " != *" docker "* ]]' _ "$dbg"
+		check "firmware by package: Intel, AMD GPU, Realtek, both microcodes; no meta package, nothing else" bash -c '
+			for p in linux-firmware-intel linux-firmware-amdgpu linux-firmware-realtek intel-ucode amd-ucode; do [[ " $1 " == *" $p "* ]] || exit 1; done
+			! tr " " "\n" <<<"$1" | grep -E "^linux-firmware(-|$)" | grep -vxE "linux-firmware-(intel|amdgpu|realtek)" | grep -q .' _ "$all $dbg"
 		# Smaller roots: the filters as mkosi itself evaluates them (mkosi.kmod).
 		mkosi --directory "$REPO" --json summary >"$W/summary-slim.json" 2>/dev/null
 		check "root modules: no Wi-Fi, Bluetooth, NVIDIA; NICs, docker, storage, DRM stay" python3 -I -c '
@@ -177,7 +180,6 @@ kept = ["kernel/drivers/net/ethernet/realtek/r8169", "kernel/drivers/net/etherne
         "kernel/fs/overlayfs/overlay", "kernel/net/bridge/br_netfilter", "kernel/drivers/net/veth",
         "kernel/drivers/gpu/drm/amd/amdgpu/amdgpu", "kernel/drivers/gpu/drm/i915/i915", "kernel/fs/btrfs/btrfs"]
 bad = [m for m in gone if globs_match_module(m, km)] + [m for m in kept if not globs_match_module(m, km)]
-bad += [f for f in ["nvidia/tu102/gsp/booter_load-570.144.bin"] if globs_match_firmware(f, fw, match_default=True)]
 bad += [f for f in ["rtl_nic/rtl8168h-2.fw", "amdgpu/navi10_sos.bin"] if not globs_match_firmware(f, fw, match_default=True)]
 sys.exit(print("wrong:", bad) if bad else 0)' "$W/summary-slim.json" "$(python3 -I -c 'import mkosi, os; print(os.path.dirname(os.path.dirname(mkosi.__file__)))')"
 		check "root: no headers, docs, man pages; locales en_US only" bash -c '
@@ -441,12 +443,31 @@ fi
 # --- compose: the shipped UKI is checked, the initrd's choice of the root ---------------------
 if wanted compose && fixtures; then
 	section compose
+	t_fw() ( # PACKAGES...: builds_check_firmware on a manifest with these packages
+		set -Eeuo pipefail
+		die() { echo "DIE: $*" >&2; exit 1; }
+		HERE=$REPO; source "$REPO/lib/builds.sh"; source "$REPO/tests/lib/fixtures.sh"
+		fx_manifest "$W/fw-manifest.json" "$@"
+		builds_check_firmware "$W/fw-manifest.json"
+	)
+	t_fw_refused() { # PACKAGE...: refused, naming exactly the unselected ones (first argument)
+		local want=$1; shift
+		! t_fw "$@" >"$W/fw.log" 2>&1 && grep -q "outside mkosi.conf's selection were installed: $want (" "$W/fw.log"
+	}
+	check "builds_finalize: the selected firmware packages pass" t_fw linux=7 linux-firmware-intel=1 linux-firmware-amdgpu=1 linux-firmware-realtek=1 linux-firmware-whence=1
+	check "builds_finalize: the linux-firmware meta package fails the build" t_fw_refused linux-firmware linux=7 linux-firmware=1 linux-firmware-intel=1
+	check "builds_finalize: linux-firmware-nvidia pulled in fails the build" t_fw_refused linux-firmware-nvidia linux=7 linux-firmware-intel=1 linux-firmware-nvidia=1
 	ccmd=$(objcopy -O binary --only-section=.cmdline "$B/boot.efi" /dev/stdout 2>/dev/null | tr -d '\0')
 	hr=$(cat "$B/roothash-root") hc=$(cat "$B/roothash-containers")
 	check "the UKI names every root in order, without roothash=" \
 		bash -c '[[ " $1 " == *" safespace.root.root=$2 safespace.root.containers=$3 "* && " $1 " != *" roothash="* && " $1 " == *" safespace.netroot="* && " $1 " == *" lockdown=integrity "* ]]' _ "$ccmd" "$hr" "$hc"
 	check "... signed by the db key, with signed expected PCRs (.pcrsig)" bash -c 'sbverify --cert "$2" "$1" && objdump -h "$1" | grep -q "\.pcrsig"' _ "$B/boot.efi" "$KD/db/db.pem"
 	check "... the kernel and initrd of the first combination" bash -c 'cmp -s <(objcopy -O binary --only-section=.initrd "$1" /dev/stdout) <(objcopy -O binary --only-section=.initrd "$2" /dev/stdout)' _ "$B/boot.efi" "$CO/parts-20990101-0100/root/boot.efi"
+	check "... named \"safespace <version>\" (.osrel), no combination: it serves all" bash -c '
+		o=$(objcopy -O binary --only-section=.osrel "$1" /dev/stdout | tr -d "\0")
+		grep -qx "PRETTY_NAME=\"safespace 20990101-0100\"" <<<"$o" && ! grep -q "^VARIANT" <<<"$o" && grep -qx "ID=arch" <<<"$o"' _ "$B/boot.efi"
+	check "the login banner shows os-release's PRETTY_NAME" grep -qxF '\S{PRETTY_NAME} \r (\l)' "$REPO/mkosi.extra/etc/issue"
+	check "safespace-select: the booted combination is the root's own name" grep -q '^booted() { cat /usr/lib/safespace/combination' "$REPO/mkosi.extra/usr/local/sbin/safespace-select"
 	# compose_check on a changed copy: what build.sh refuses to call a build.
 	t_check() ( # DIR
 		set -Eeuo pipefail
@@ -467,7 +488,9 @@ if wanted compose && fixtures; then
 	R="not signed by" ctamper "a UKI signed by another key" - 'sbattach --remove $1/boot.efi >/dev/null; sbsign --key '"$KD"'/KEK/KEK.key --cert '"$KD"'/KEK/KEK.pem --output $1/boot.efi $1/boot.efi >/dev/null 2>&1'
 	R="lacks lockdown=integrity" ctamper "a UKI without lockdown=integrity" - "$cuki '${ccmd/ lockdown=integrity/}' $KD/db/db.key $KD/db/db.pem"
 	R="still carries roothash=" ctamper "a UKI that still carries roothash=" - "$cuki '$ccmd roothash=$hr' $KD/db/db.key $KD/db/db.pem"
-	R="no signed expected PCRs" ctamper "a UKI without signed expected PCRs" - "$cuki '$ccmd' $KD/db/db.key $KD/db/db.pem"
+	R="names a combination" ctamper "a UKI named after one combination" - "$cuki '$ccmd' $KD/db/db.key $KD/db/db.pem 'PRETTY_NAME=\"safespace 20990101-0100 root\"'"
+	R="no AuthenticAMD microcode" ctamper "a UKI without AMD microcode" - "export FX_UCODE_VENDORS=GenuineIntel; $cuki '$ccmd' $KD/db/db.key $KD/db/db.pem 'PRETTY_NAME=\"safespace 20990101-0100\"'"
+	R="no signed expected PCRs" ctamper "a UKI without signed expected PCRs" - "$cuki '$ccmd' $KD/db/db.key $KD/db/db.pem 'PRETTY_NAME=\"safespace 20990101-0100\"'"
 	R="roothash-containers is not" ctamper "a roothash-<name> that is not the signed one" - 'echo 0000000000000000000000000000000000000000000000000000000000000000 >$1/roothash-containers'
 	R="not the combinations" ctamper "combinations in another order" - "$cuki '${ccmd/safespace.root.root=$hr safespace.root.containers=$hc/safespace.root.containers=$hc safespace.root.root=$hr}' $KD/db/db.key $KD/db/db.pem"
 	R="systemd-boot.efi is not signed" ctamper "systemd-boot signed by another key" - 'sbattach --remove $1/systemd-boot.efi >/dev/null; sbsign --key '"$KD"'/KEK/KEK.key --cert '"$KD"'/KEK/KEK.pem --output $1/systemd-boot.efi $1/systemd-boot.efi >/dev/null 2>&1'

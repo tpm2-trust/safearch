@@ -179,6 +179,21 @@ builds_write_info() { # DIR, then KEY=VALUE pairs (VALUE with commas = a list fo
 # partition table and the signed systemd-boot come out of the whole disk image
 # first; then the image and mkosi's separate initrd copy go: nothing is kept
 # or shipped twice.
+# Firmware is chosen by package (mkosi.conf, Packages=): the meta package or any
+# other split package pulled back in as a dependency fails the build, instead of
+# being downloaded, installed and then filtered.
+BUILDS_FIRMWARE_ALLOWED=(linux-firmware-intel linux-firmware-amdgpu linux-firmware-realtek linux-firmware-whence)
+builds_check_firmware() { # MANIFEST
+	local extra
+	extra=$(python3 -I -c '
+import json, sys
+allowed = set(sys.argv[2:])
+names = [p["name"] for p in json.load(open(sys.argv[1]))["packages"]]
+print(" ".join(n for n in names if (n == "linux-firmware" or n.startswith("linux-firmware-")) and n not in allowed))' \
+		"$1" "${BUILDS_FIRMWARE_ALLOWED[@]}") || die "builds_check_firmware: cannot read $1"
+	[[ -z $extra ]] || die "firmware packages outside mkosi.conf's selection were installed: $extra (which package depends on them: pacman -Qi)"
+}
+
 builds_finalize() { # DIR VERSION
 	local d=$1 b f off
 	b=$d/${BUILDS_IMAGE_ID}_$2
@@ -187,6 +202,7 @@ builds_finalize() { # DIR VERSION
 		mv -f "$b.${f%%:*}" "$d/${f#*:}"
 	done
 	[[ -f $b.vnc-password ]] && mv -f "$b.vnc-password" "$d/vnc-password"
+	builds_check_firmware "$d/manifest.json"
 	[[ -f $b.systemd-stub ]] || die "builds_finalize: mkosi.finalize kept no $(basename "$b").systemd-stub"
 	mv -f "$b.systemd-stub" "$d/systemd-stub.efi"
 	[[ -f $b.raw ]] || die "builds_finalize: no disk image $(basename "$b").raw"

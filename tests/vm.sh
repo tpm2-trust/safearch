@@ -32,7 +32,8 @@
 #
 # Steps (each boot headless, checked over ssh as tester, then powered off):
 #   (always) release.sh into run-<time>/share, then server/safespace-netboot
-#           verify on it: the checks a distribution server makes
+#           verify on it: the checks a distribution server makes; the UKI's
+#           initrd carries the Realtek NIC firmware (initrd-firmware)
 #   (every boot) root verified, kernel lockdown "integrity", running, no
 #           failed units
 #   stick   usb-bootdev opened the root, netroot did not run,
@@ -44,7 +45,8 @@
 #           Secure Boot enabled (user), verified, running
 #   net-sb  network boot with enforced Secure Boot: enabled, verified, running
 #   select  on the sealed firmware of seal, every combination of the build
-#           booted, each checked for its name and its package groups
+#           booted, each checked for its name (also os-release PRETTY_NAME
+#           "safespace <version> <name>" and the login banner) and its package groups
 #           (/usr/lib/safespace/groups, the docker command exactly with the
 #           docker group). One VM, one boot after the other, safespace-select:
 #           no selection -> FIRST; set SECOND -> SECOND; once FIRST -> FIRST for
@@ -182,6 +184,7 @@ DIR=$(builds_dir "$BUILD")
 mapfile -t COMBOS < <(builds_info "$DIR" combinations | tr ',' '\n')
 ((${#COMBOS[@]})) || die "$BUILD names no combinations"
 log "build $BUILD: ${COMBOS[*]}"
+VERSION=$(builds_version_of "$BUILD")
 
 log "release into ${RUN#"$REPO"/}/share"
 KEY=01-release
@@ -193,6 +196,11 @@ chmod 0644 "$RUN/server.conf"
 KEY=02-server-verify
 SAFESPACE_SERVER_CONF=$RUN/server.conf "$REPO/server/safespace-netboot" verify >"$LOGS/server-verify.log" 2>&1 &&
 	result PASS server-verify || result FAIL server-verify "see ${LOGS#"$REPO"/}/server-verify.log"
+# The network boot needs the NIC before the root: the initrd's module archive
+# (uncompressed cpio, firmware from the root) must carry the Realtek NIC firmware.
+KEY=03-initrd-firmware
+n=$(objcopy -O binary --only-section=.initrd "$DIR/boot.efi" /dev/stdout 2>/dev/null | grep -ac 'usr/lib/firmware/rtl_nic/rtl8168') || n=0
+if ((n)); then result PASS initrd-firmware; else result FAIL initrd-firmware "no rtl_nic/ firmware in the UKI's initrd"; fi
 
 # --- booting -------------------------------------------------------------------------------
 # The boots run side by side, at most $JOBS VMs at a time. Each step has its own work
@@ -271,6 +279,10 @@ echo failed=$(systemctl --failed --no-legend --plain | wc -l)
 echo combination=$(sudo dmesg | sed -n "s/.*\(usb-bootdev\|netroot\): combination \([a-z0-9-]*\) .*/\2/p" | tail -1)
 command -v docker >/dev/null && echo docker=yes || echo docker=no
 echo groups=$(cat /usr/lib/safespace/groups)
+# The name the system shows (spaces as _): os-release, the console login banner.
+echo named=$(cat /usr/lib/safespace/combination)
+echo pretty=$(. /etc/os-release; echo "$PRETTY_NAME" | tr " " _)
+echo issue=$(script -qc "agetty --show-issue" /dev/null | head -1 | tr -d "\r" | tr " " _)
 # What a package can add to the attack surface besides its files: setuid/setgid
 # programs, file capabilities, enabled units (system and user), as short hashes.
 echo suid=$(sudo find / -xdev -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null | sort | sha256sum | cut -c1-16)
@@ -283,6 +295,10 @@ for p in /usr/lib/firmware/nvidia /usr/lib/firmware/intel/iwlwifi /usr/share/man
 find /usr/lib/modules -name "*.ko*" \( -name "cfg80211.*" -o -name "mac80211.*" -o -name "bluetooth.*" -o -name "nouveau.*" -o -path "*/drivers/net/wireless/*" \) | grep -q . && bad="$bad,modules"
 modprobe -n -q iwlwifi 2>/dev/null && bad="$bad,modules.dep"
 ls /usr/share/locale | grep -qvx -e en -e en_US -e locale.alias && bad="$bad,locale"
+# Firmware by package (mkosi.conf): nothing but the selected ones installed.
+fw=$(pacman -Qq | grep -E "^linux-firmware(-|\$)" | grep -vxE "linux-firmware-(intel|amdgpu|realtek|whence)" | tr "\n" ,)
+[ -n "$fw" ] && bad="$bad,packages:$fw"
+for p in amd-ucode intel-ucode linux-firmware-realtek; do pacman -Qq $p >/dev/null 2>&1 || bad="$bad,missing:$p"; done
 echo slim=${bad:-ok}
 echo lockdown=$(sudo cat /sys/kernel/security/lockdown | sed -n "s/.*\[\(.*\)\].*/\1/p")
 echo secure_boot=$(bootctl status 2>/dev/null | sed -n "s/^ *Secure Boot: *//p" | head -1 | tr " " _)
@@ -306,9 +322,10 @@ SEALED=(secure_boot=enabled* path_var=set usb_bootdev=1 "${COMMON[@]}")
 STICK=$RUN/stick.raw
 
 step_stick() {
+	local want; read -ra want <<<"$(looks "${COMBOS[0]}")"
 	if vm_start stick "$STICK"; then
 		probe stick
-		expect stick path_var=set usb_bootdev=1 netroot=0 stick_ro=1 "${COMMON[@]}"
+		expect stick path_var=set usb_bootdev=1 netroot=0 stick_ro=1 "${COMMON[@]}" "${want[@]}"
 	else
 		result FAIL stick "$ERR"
 	fi
@@ -316,9 +333,10 @@ step_stick() {
 }
 
 step_net() {
+	local want; read -ra want <<<"$(looks "${COMBOS[0]}")"
 	if vm_start net --netboot --tree "$RUN/share" --no-server; then
 		probe net
-		expect net path_var=unset usb_bootdev=0 netroot=1 "${COMMON[@]}"
+		expect net path_var=unset usb_bootdev=0 netroot=1 "${COMMON[@]}" "${want[@]}"
 	else
 		result FAIL net "$ERR"
 	fi
@@ -326,9 +344,10 @@ step_net() {
 }
 
 step_net_sb() {
+	local want; read -ra want <<<"$(looks "${COMBOS[0]}")"
 	if vm_start net-sb --netboot --tree "$RUN/share" --no-server --secure-boot; then
 		probe net-sb
-		expect net-sb secure_boot=enabled* path_var=unset netroot=1 "${COMMON[@]}"
+		expect net-sb secure_boot=enabled* path_var=unset netroot=1 "${COMMON[@]}" "${want[@]}"
 	else
 		result FAIL net-sb "$ERR"
 	fi
@@ -360,12 +379,13 @@ step_seal() {
 	vm_stop seal
 }
 
-# What a combination must look like from inside: its name, its groups,
-# the docker command exactly with the docker group.
+# What a combination must look like from inside: its name (the initrd's and
+# the root's own, os-release, the login banner), its groups, the docker command
+# exactly with the docker group.
 looks() { # "name:group+group"
 	local n=${1%%:*} g=${1#*:} d=no
 	[[ +$g+ == *+docker+* ]] && d=yes
-	echo "combination=$n" "groups=${g//+/,}" "docker=$d"
+	echo "combination=$n" "named=$n" "pretty=safespace_${VERSION}_$n" "issue=safespace_${VERSION}_${n}_*" "groups=${g//+/,}" "docker=$d"
 }
 # sel_boot NAME COMBO COMMAND-AFTER: boot the stick on the step's sealed
 # variables, check, run a command, power off

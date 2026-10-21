@@ -13,6 +13,164 @@ T450s findings with usb/network aligned.
 
 ---
 
+# PLAN: "safespace <build> <combination>" instead of "Arch Linux"
+
+## Goal
+
+Where the booted system names itself (systemd's "Welcome to …", the console login banner,
+`hostnamectl`), show `safespace <version> <combination>`, e.g.
+`safespace 20261020-1250 containers`. Every combination is its own root, so each root can
+carry its own name at build time; nothing is decided at runtime.
+
+## Steps
+
+- [x] 1. `build.sh`: each combination's mkosi run gets `--environment=SAFESPACE_COMBINATION=<name>`.
+- [x] 2. `mkosi.postinst`: `/usr/lib/safespace/combination`; in `/usr/lib/os-release`
+      `PRETTY_NAME="safespace $IMAGE_VERSION $SAFESPACE_COMBINATION"`,
+      `VARIANT`, `VARIANT_ID=<name>` (`ID=arch`, `NAME` untouched: pacman/tools keep working);
+      `/etc/issue` = `\S{PRETTY_NAME} \r (\l)`.
+- [x] 3. `lib/compose.sh`: the common UKI's `.osrel` comes from the first combination → would
+      say "root" for every combination; rewrite to `PRETTY_NAME="safespace <version>"`
+      (no combination: the UKI serves all). The initrd (common) keeps its own name.
+- [x] 4. `safespace-select`: `booted` from `/usr/lib/safespace/combination` (the journal
+      parse as fallback goes).
+- [x] 5. Tests: `tests/run.sh` (compose: `.osrel` without combination); `tests/vm.sh`
+      every boot checks `PRETTY_NAME` = `safespace <version> <booted combination>`.
+- [x] 6. README (Combinations / on the machine).
+
+Decided: format `safespace 20261020-1250 containers`. `tests/run.sh` 170 passed, 1 skipped
+(no real build in `mkosi.output/`); `tests/vm.sh` all 15 PASS (run 20261020-2206).
+
+---
+
+# PLAN: firmware selected by package, not installed and deleted
+
+## Goal
+
+Install only the firmware packages a standard PC needs instead of the `linux-firmware` meta
+package (all 12 split packages); what is not installed is not downloaded, not unpacked per
+combination and not listed as installed. The mkosi file filter (`KernelModules=`) stays as
+the file-level stage: `-intel` bundles iwlwifi with i915/xe and NICs.
+
+Decided (whitelist instead of blacklist): Intel and AMD only, plus what the network boot
+needs on common boards.
+
+| Package | Keep | Why |
+|---|---|---|
+| `linux-firmware-intel` (133 MiB) | yes | i915/xe GPU, ice/e100 NICs, QAT (iwlwifi in it: the filter drops it) |
+| `linux-firmware-amdgpu` (27 MiB) | yes | every AMD GPU/APU since ~2012; without it amdgpu fails after taking over the framebuffer: black local console. Note: `-amd` is *not* the GPU one |
+| `linux-firmware-realtek` (7 MiB) | yes | `rtl_nic/` for r8169/r8125, the most common onboard Ethernet; the network boot depends on it (rtw/rtl_bt dropped by the filter) |
+| `amd-ucode` | yes, new (decided) | AMD CPU microcode, missing today (only `intel-ucode`) |
+| `linux-firmware-amd` (1 MiB) | no (decided) | SEV updates for EPYC hosts (confidential VMs), XDNA NPU (Ryzen AI), AMD TEE apps incl. PMF (Ryzen laptop power policy) |
+| `linux-firmware-broadcom` (13 MiB) | no (decided) | only bnx2/bnx2x server NICs (and Wi-Fi); desktop tg3 needs none |
+| `-nvidia`, `-atheros`, `-mediatek`, `-radeon` (pre-2012 GPUs), `-cirrus`, `-ti`, `-other` | no | |
+
+## Steps
+
+- [x] 1. `mkosi.conf`: `linux-firmware` → the kept packages + `amd-ucode`, with the reasons.
+- [x] 2. Guard: the build fails if a manifest lists `linux-firmware` or a dropped split package
+      (pulled back as a dependency).
+- [x] 3. `FirmwareFiles=-nvidia/` goes; the module exclusions stay.
+- [x] 4. Check the UKI's initrd still carries `rtl_nic/` (netroot needs the NIC before the root).
+- [x] 5. Tests: `tests/run.sh` (configured packages; the guard refuses a fixture manifest);
+      `tests/vm.sh` probe: dropped packages not installed, `amd-ucode` in the UKI; full run.
+- [x] 6. README (base group row, smaller roots), SECURITY.md (AMD microcode).
+
+Done: guard in `builds_finalize` (`builds_check_firmware`, allowed list
+`BUILDS_FIRMWARE_ALLOWED`), `compose_check` refuses a UKI without Intel or AMD microcode,
+`tests/vm.sh` step `initrd-firmware` + probe `slim=` (packages). Found on the way: the
+initrd's firmware comes from the root; besides `rtl_nic/` it carried `tigon/` (tg3, from
+`-broadcom`), `ene-ub6250/`, `airoha/`, `microchip/` (from `-other`): these go (old tg3 chips,
+ENE UB6250 card readers, Airoha/Microsemi PHYs).
+
+# PLAN: boot menu — the combination visible (and choosable) at boot
+
+## Goal
+
+A systemd-boot menu that shows the combinations of a build and which one boots, on the
+stick and over the network, without weakening the selection's trust model (signed roots
+only; the menu only names a combination, like the EFI variables).
+
+## Approach: one multi-profile UKI (systemd ≥ 257, here 262)
+
+`boot.efi` gets one `.profile` per combination (`ID=<name>`, `TITLE=safespace <version>:
+<name> (<groups>)`). The base `.cmdline` stays as now (every `safespace.root.<n>=`,
+`lockdown=integrity`, no `roothash=`); each profile's `.cmdline` = base + `safespace.select=<name>`
+(a profile `.cmdline` replaces the base one, so the full line is repeated; signed like the
+rest). systemd-boot lists each profile as an entry of its own. Each profile is measured
+(PCR 11 its sections, PCR 12 its number) → the choice becomes measured, which closes the
+open point "selection not measured into a PCR". `ukify --profile/--join-profile/--sign-profile`
+builds it; signed expected PCRs per profile.
+
+Profile @0 is what a stub boots without a loader (direct network boot) → **@0 = "preselection"**
+(no `safespace.select=`: EFI variables → first combination, as today), @1..@N = the
+combinations explicitly.
+
+Network: systemd-boot loaded over HTTP has no file system, so it finds no entries (only
+`\loader\…` on a volume, or SMBIOS 11 in VMs). The only way to a menu over the network is
+UEFI HTTP boot of a small **FAT image** (firmware RAM disk) holding systemd-boot, `loader.conf`
+and Type #1 entries with `uki-url <server>/boot.efi` + `profile <n>` (systemd 258/259). PXE/TFTP
+cannot boot a RAM disk → stays direct (no menu, preselection only).
+
+```mermaid
+flowchart LR
+  S[stick: BOOTX64.EFI = systemd-boot] -->|loader.conf timeout| M[menu: boot.efi@0..N]
+  H[UEFI HTTP boot] -->|menu.img RAM disk| SB[systemd-boot] -->|uki-url + profile| M
+  P[PXE/TFTP] -->|boot.efi directly| P0["@0: preselection (EFI vars)"]
+  M --> I[initrd select: safespace.select= > SelectOnce > Select > first]
+  P0 --> I
+```
+
+## Steps
+
+- [ ] 1. Spike in QEMU (before anything is wired in): a 2-profile UKI from a test build
+      (a) on the stick: menu shows both, entry ids, `LoaderEntryDefault=boot.efi@k` honoured
+      for auto-boot (systemd 261: "never auto-boot a non-default profile"), PCRs;
+      (b) HTTP boot of a FAT image with `uki-url` + `profile`: OVMF RAM disk, the entry boots
+      the right profile, `LoaderDeviceURL`; (c) under enforced Secure Boot.
+- [ ] 2. `lib/compose.sh`: `compose_uki` builds the multi-profile UKI; `compose_check` checks
+      every profile (signer once; per profile: `lockdown=integrity`, no `roothash=`, all root
+      hashes in order, exactly its own `safespace.select=`, @0 none; `.pcrsig` per profile).
+- [ ] 3. `lib/verify.sh` (also on the servers): `uki_cmdline` reads the base `.cmdline` of a
+      multi-profile UKI (objcopy sees several `.cmdline`); profile checks as in 2.
+- [ ] 4. initrd `select`: unchanged precedence; `SafespaceSelectOnce` deleted whenever present
+      (also when a profile chose), so a once-selection cannot linger.
+- [ ] 5. Stick (`lib/stick.sh`, `mkosi.repart/00-esp.conf`): `\loader\loader.conf` with
+      `timeout <n>`, `editor no`, `auto-entries no`, `auto-firmware no`, `random-seed-mode off`;
+      read-only as before.
+- [ ] 6. `safespace-select set/once/clear`: also write `LoaderEntryDefault`/`LoaderEntryOneShot`
+      (`boot.efi@k`) so systemd-boot's highlighted/auto-booted entry follows the preselection.
+- [ ] 7. Network menu (if the spike passes and 9 is OK'd): `menu.img` per release, served
+      next to `boot.efi`; DHCP option 67 → `menu.img` for HTTP clients; server verify checks it.
+- [ ] 8. Visible after boot as well: the booted combination in `/etc/issue` (console login)
+      and the ssh banner/motd.
+- [ ] 9. Tests: `tests/run.sh` (profiles in the composed UKI, every check of 2/3, loader.conf
+      on the stick, menu image entries); `tests/vm.sh` step `select` boots through
+      `LoaderEntryOneShot=boot.efi@k` too, `menu` step for HTTP boot of the image.
+- [ ] 10. Docs: README (Combinations, stick layout, DHCP option 67), NETBOOT.md, SECURITY.md
+      (menu = selection by whoever is at the console; measured profile).
+
+## Open questions
+
+1. **Network menu needs a disk image shipped** (`menu.img`, ~1 MiB FAT: systemd-boot + entries,
+   no root, no UKI inside). That touches the invariant "no disk image stored or shipped" →
+   your OK? And the entries carry the server URL: built by `release.sh` per target (the build
+   host decides, server still alters nothing), or a fixed relative form if the spike shows
+   `uki-url` can be relative to `LoaderDeviceURL`.
+2. PXE/TFTP clients (T450s) get no menu — acceptable?
+3. Menu timeout on the stick: proposed 5 s (`timeout 0` = hidden unless a key is held).
+4. Anyone at the console can pick a combination from the menu (as with the firmware setup
+   today; still signed roots only). Fine, or a loader.conf without a menu (`timeout
+   menu-hidden`) on sealed machines?
+5. Keep `SafespaceSelect*` as the source of truth (needed for direct PXE boot), with systemd-boot's
+   `LoaderEntryDefault/OneShot` mirrored — or drop ours and use only systemd-boot's (then PXE
+   loses the preselection)? Proposed: keep ours, mirror.
+6. Breaks: UKI sections change → PCR 11 expected values change (relevant for
+   PLAN-TPM2-BINDING), servers need the new `verify.sh` (`server/setup.sh` rerun) before
+   the first multi-profile release.
+
+---
+
 # PLAN: tests/vm.sh boots in parallel
 
 ## Goal

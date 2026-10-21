@@ -18,6 +18,21 @@ log "package groups: $groups"
 install -d "$BUILDROOT/usr/lib/safespace"
 echo "$groups" >"$BUILDROOT/usr/lib/safespace/groups"
 
+# --- the name the system shows: "safespace <build> <combination>" -----------------
+# Every combination is a root of its own, so its name is fixed here, not chosen at
+# runtime. ID/NAME stay Arch's: tools key on them. /etc/issue (mkosi.extra) shows
+# PRETTY_NAME; mkosi adds IMAGE_ID/IMAGE_VERSION after this script.
+combo=${SAFESPACE_COMBINATION:-}
+[[ $combo =~ ^[a-z][a-z0-9-]{0,23}$ ]] || die "SAFESPACE_COMBINATION='$combo' is no combination name (build.sh sets it)"
+[[ ${IMAGE_VERSION:-} =~ ^[0-9]{8}-[0-9]{4,6}$ ]] || die "IMAGE_VERSION='${IMAGE_VERSION:-}' is no build version (build.sh sets it)"
+echo "$combo" >"$BUILDROOT/usr/lib/safespace/combination"
+osrel=$BUILDROOT/usr/lib/os-release
+[[ -f $osrel && ! -L $osrel ]] || die "no /usr/lib/os-release in the image"
+sed -i -E '/^(PRETTY_NAME|VARIANT|VARIANT_ID)=/d' "$osrel"
+printf 'PRETTY_NAME="safespace %s %s"\nVARIANT="%s (%s)"\nVARIANT_ID=%s\n' \
+	"$IMAGE_VERSION" "$combo" "$combo" "$groups" "$combo" >>"$osrel"
+log "system name: safespace $IMAGE_VERSION $combo"
+
 # --- users from users.conf ("username:ssh-public-key", one key per line) --------
 
 # build.sh --users picks another file (tests/vm.sh: a throwaway test user).

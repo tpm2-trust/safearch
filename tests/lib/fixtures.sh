@@ -23,17 +23,23 @@ fx_root() {
 	veritysetup format "$1/root.img" "$1/root.verity" | awk '/Root hash/ { print $3 }'
 }
 
-# fx_uki OUT CMDLINE KEY CERT: a signed PE (systemd-stub) carrying CMDLINE
+# fx_uki OUT CMDLINE KEY CERT [OSREL]: a signed PE (systemd-stub) carrying CMDLINE
 # as .cmdline (all the release checks look at), and small dummy .linux,
-# .initrd, .ucode, .osrel, .uname (what lib/compose.sh takes from a UKI).
+# .initrd, .ucode (microcode of FX_UCODE_VENDORS, default both), .osrel (OSREL,
+# default a minimal one), .uname (what lib/compose.sh takes from a UKI).
 fx_uki() {
 	local out=$1 tmp s vma=0x30000 args=()
 	tmp=$(mktemp -d)
 	printf '%s' "$2" >"$tmp/cmdline"
 	head -c 4096 /dev/urandom >"$tmp/linux"
 	head -c 2048 /dev/urandom >"$tmp/initrd"
-	head -c 512 /dev/urandom >"$tmp/ucode"
-	printf 'ID=arch\nNAME="Arch Linux"\n' >"$tmp/osrel"
+	# .ucode as mkosi builds it: an early cpio with both vendors' microcode.
+	mkdir -p "$tmp/uc/kernel/x86/microcode"
+	for s in ${FX_UCODE_VENDORS:-GenuineIntel AuthenticAMD}; do
+		head -c 256 /dev/urandom >"$tmp/uc/kernel/x86/microcode/$s.bin"
+	done
+	(cd "$tmp/uc" && find kernel | cpio -o -H newc --quiet) >"$tmp/ucode"
+	printf '%s\n' "${5:-$(printf 'ID=arch\nNAME="Arch Linux"')}" >"$tmp/osrel"
 	printf '6.0.0-fixture' >"$tmp/uname"
 	for s in cmdline linux initrd ucode osrel uname; do
 		args+=(--add-section ".$s=$tmp/$s" --change-section-vma ".$s=$vma" --set-section-flags ".$s=data,readonly")
@@ -100,7 +106,9 @@ fx_part() {
 	hash=$(fx_root "$tmp")
 	cmdline="roothash=$hash systemd.volatile=state lockdown=integrity"
 	[[ -n $url ]] && cmdline+=" safespace.netroot=$url"
-	fx_uki "$b.efi" "$cmdline" "$kd/db/db.key" "$kd/db/db.pem"
+	# .osrel as mkosi.postinst and mkosi leave it (the directory is the combination's name).
+	fx_uki "$b.efi" "$cmdline" "$kd/db/db.key" "$kd/db/db.pem" \
+		"$(printf 'ID=arch\nNAME="Arch Linux"\nPRETTY_NAME="safespace %s %s"\nVARIANT_ID=%s\nIMAGE_ID=safespace-arch\nIMAGE_VERSION=%s' "$v" "${d##*/}" "${d##*/}" "$v")"
 	cp "$tmp/root.img" "$b.root.raw"
 	cp "$tmp/root.verity" "$b.root-verity.raw"
 	printf %s "$hash" >"$b.roothash" # as mkosi writes it: no newline

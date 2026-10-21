@@ -186,7 +186,7 @@ A group is what goes into a root on top of the base system:
 
 | Group | What it adds | Where it is defined |
 |---|---|---|
-| `base` (always) | kernel (no Wi-Fi, Bluetooth or NVIDIA drivers), the firmware its drivers declare, microcode, systemd, openssh, sudo, nftables, usbguard, cryptsetup, btrfs-progs, efitools + openssl (`safespace-seal`), vim, tmux, qemu-guest-agent; users, ssh, hardening, volatile `/var` | `mkosi.conf`, `mkosi.extra/` |
+| `base` (always) | kernel (no Wi-Fi, Bluetooth or NVIDIA drivers), firmware for Intel, AMD GPUs and Realtek NICs (see below), Intel and AMD microcode, systemd, openssh, sudo, nftables, usbguard, cryptsetup, btrfs-progs, efitools + openssl (`safespace-seal`), vim, tmux, qemu-guest-agent; users, ssh, hardening, volatile `/var` | `mkosi.conf`, `mkosi.extra/` |
 | `docker` | Docker and containerd with their storage on a data disk at `/opt/docker`, the shipped images (`fetch-images.sh`) and their loader; users get the `docker` group. Docker is not started at boot (see [Docker](#docker)) | `mkosi.profiles/docker/` |
 | `xfce4-headless-vnc` | XFCE, TigerVNC on `localhost:5901` (through an ssh tunnel), firefox, vlc, gwenview, fonts, pulseaudio; VNC user and password (`safespace.env`) | `mkosi.profiles/xfce4-headless-vnc/` |
 | `debug` | diagnostic tools: ethtool, dmidecode, pciutils, usbutils, lshw, iperf3, tcpdump, kexec-tools | `mkosi.profiles/debug/` |
@@ -195,6 +195,20 @@ Each group except `base` is a mkosi profile of its own name, with its packages, 
 (`mkosi.extra/`) and service presets; `lib/groups.sh` knows the names and refuses unknown
 ones. The image records its groups in `/usr/lib/safespace/groups`. A new group is a new
 directory `mkosi.profiles/<name>/` plus its name in `GROUPS_KNOWN` in `lib/groups.sh`.
+
+**Firmware** is chosen by package, not with the `linux-firmware` meta package (all its split
+packages): `linux-firmware-intel` (i915/xe GPUs, Intel NICs), `linux-firmware-amdgpu` (AMD
+GPUs/APUs since ~2012), `linux-firmware-realtek` (`rtl_nic/` for the usual onboard Realtek
+Ethernet; the initrd carries it for the network boot). Not installed, so not downloaded
+either: NVIDIA, Broadcom (bnx2/bnx2x server NICs; desktop tg3 needs none), Atheros and
+MediaTek (Wi-Fi/Bluetooth), pre-2012 Radeon, AMD NPU/SEV/TEE (`linux-firmware-amd`), Cirrus, TI
+and `linux-firmware-other` (among others ENE UB6250 card readers, Airoha and Microsemi PHYs). Of
+the installed packages the module filter keeps only what the remaining drivers declare
+(iwlwifi, rtw88/89 and rtl_bt go). The build fails if another firmware package comes back as
+a dependency (`builds_check_firmware` in `lib/builds.sh`). A machine that needs one of the
+others: its package in `mkosi.conf`, its name in `BUILDS_FIRMWARE_ALLOWED`. Microcode for
+both vendors (`intel-ucode`, `amd-ucode`) is in the UKI; `compose_check` refuses a UKI
+without either.
 
 `debug` is a group like the others because it only adds packages: no setting of the image
 depends on it (`tests/run.sh groups` checks that its profile is a package list and nothing
@@ -220,7 +234,8 @@ profiles) and composes them into one build, `mkosi.output/combined_<version>/`:
 - one signed UKI (`boot.efi`): kernel, initrd and microcode of the first combination, built
   with ukify from the image's own systemd-stub, signed with the db key and with signed
   expected PCRs. Its command line names every combination with its root hash,
-  `safespace.root.<name>=<hash>` (no `roothash=`);
+  `safespace.root.<name>=<hash>` (no `roothash=`); its os-release is named
+  `safespace <version>`, without a combination (systemd-boot shows that name);
 - per combination `root-<name>.img`, `root-<name>.verity`, `roothash-<name>`,
   `manifest-<name>.json`; one `layout.sfdisk` with the ESP and a root/verity pair per
   combination (partitions `root-<name>`, `root-<name>-verity`, UUIDs from each root hash).
@@ -254,6 +269,14 @@ safespace-select set containers   # boot containers from the next boot on
 safespace-select once root        # next boot only
 safespace-select clear            # back to the first combination
 ```
+
+**Which root is booted** is visible on the machine: every root names itself at build time
+(`mkosi.postinst`), so the name is that of the verified root, not of the selection.
+`PRETTY_NAME` in `/usr/lib/os-release` is `safespace <version> <combination>`, e.g.
+`safespace 20261020-1250 containers` (`VARIANT_ID=<combination>`; `ID=arch` and `NAME` stay
+Arch's), shown by systemd's "Welcome to …", the console login banner (`/etc/issue`) and
+`hostnamectl`; `/usr/lib/safespace/combination` holds the name alone. The initrd is common to
+all combinations and keeps Arch's name.
 
 So a machine is sealed once on the default (`safespace-seal`), then preselected. The variable
 only **names** a combination; its root hash always comes from the signed command line, so
@@ -573,7 +596,8 @@ builds a test image with a throwaway user, releases it into a share of its own, 
 a distribution server does, boots it in QEMU from a stick and over the network, seals it,
 boots with enforced Secure Boot, and checks each boot over ssh (in every boot also: kernel
 lockdown, and none of what the roots leave out: Wi-Fi/Bluetooth/NVIDIA drivers and firmware,
-headers, docs, man pages, locales but en_US). It touches no real user, key,
+firmware packages but the selected ones (both microcode packages present), headers, docs, man
+pages, locales but en_US). It touches no real user, key,
 build or server. Exit 0 only if every step passed.
 
 ```sh
@@ -584,12 +608,12 @@ tests/vm.sh --no-build --jobs 2      # at most two VMs at a time
 
 | Step | What | Checked |
 |---|---|---|
-| `release`, `server-verify` (always) | `release.sh` into the test's share, then `server/safespace-netboot verify` on it | the checks a distribution server makes |
-| `stick` | a stick assembled from the release (`lib/stick.sh`, as `burn.sh` writes it) | `usb-bootdev` opened the root, `netroot` did not run, `LoaderDevicePartUUID` set, the stick read-only, root `verified`, `running`, no failed units |
+| `release`, `server-verify`, `initrd-firmware` (always) | `release.sh` into the test's share, then `server/safespace-netboot verify` on it; the UKI's initrd | the checks a distribution server makes; the initrd carries the Realtek NIC firmware (`rtl_nic/`) |
+| `stick` | a stick assembled from the release (`lib/stick.sh`, as `burn.sh` writes it) | the first combination by its name, `usb-bootdev` opened the root, `netroot` did not run, `LoaderDevicePartUUID` set, the stick read-only, root `verified`, `running`, no failed units |
 | `net` | UEFI HTTP boot of the share | `netroot` opened the root, no `usb-bootdev`, no `LoaderDevicePartUUID`, `verified`, `running` |
 | `seal` | Setup Mode → `safespace-seal` → the sealed firmware | Secure Boot `enabled (user)`, `verified`, `running` |
 | `net-sb` | network boot with enforced Secure Boot | Secure Boot enabled, `verified`, `running` |
-| `select` | on the sealed firmware, one VM, one boot after the other: no selection, `safespace-select set <second>`, `once <first>`, the second again (persistent), `clear`, the first again. Side by side, every further combination in a VM of its own: `SafespaceSelectOnce=<name>` written into a copy of the sealed variables (`virt-fw-vars`) | the booted combination's name and groups (`/usr/lib/safespace/groups`; the docker command exactly with the docker group); a preset `SafespaceSelectOnce` deleted by the initrd; `debug` has exactly the default's setuid/setgid files, file capabilities and enabled units; each Secure Boot enabled and `verified` |
+| `select` | on the sealed firmware, one VM, one boot after the other: no selection, `safespace-select set <second>`, `once <first>`, the second again (persistent), `clear`, the first again. Side by side, every further combination in a VM of its own: `SafespaceSelectOnce=<name>` written into a copy of the sealed variables (`virt-fw-vars`) | the booted combination's name (the initrd's choice, `/usr/lib/safespace/combination`, `PRETTY_NAME`, the login banner) and groups (`/usr/lib/safespace/groups`; the docker command exactly with the docker group); a preset `SafespaceSelectOnce` deleted by the initrd; `debug` has exactly the default's setuid/setgid files, file capabilities and enabled units; each Secure Boot enabled and `verified` |
 
 **Kept apart from everything real**, in `mkosi.test/vm/` (gitignored): the test user
 `tester` and its key (created on the first run, used for nothing else), the test builds

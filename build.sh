@@ -272,7 +272,7 @@ build_combination() { # NAME GROUPS DIR
 	log "--- combination $name (groups $groups)"
 	mkdir -p "$dir"
 	# (Called in a condition, where set -e does not apply: every step returns.)
-	(set -x; mkosi ${profiles[@]+"${profiles[@]}"} "${EXTRA[@]}" --output-directory="$dir" ${MKOSI_ARGS[@]+"${MKOSI_ARGS[@]}"} build) || return 1
+	(set -x; mkosi ${profiles[@]+"${profiles[@]}"} "${EXTRA[@]}" --environment="SAFESPACE_COMBINATION=$name" --output-directory="$dir" ${MKOSI_ARGS[@]+"${MKOSI_ARGS[@]}"} build) || return 1
 	(builds_finalize "$dir" "$VERSION")
 }
 dirs=()
