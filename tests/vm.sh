@@ -40,7 +40,9 @@
 #           failed units
 #   stick   usb-bootdev opened the root, netroot did not run,
 #           LoaderDevicePartUUID set, the stick read-only, root verified,
-#           system running without failed units
+#           system running without failed units; without a TPM (the
+#           throwaway host key; stick and seal are the boots without one,
+#           every other step boots with a TPM, as the machines do)
 #   net     UEFI HTTP boot of the share: netroot opened the root, no
 #           usb-bootdev, no LoaderDevicePartUUID, verified, running
 #   seal    Setup Mode -> safespace-seal -> boot with the sealed firmware:
@@ -380,7 +382,7 @@ step_stick() {
 
 step_net() {
 	local want; read -ra want <<<"$(looks "${COMBOS[0]}")"
-	if vm_start net --netboot --tree "$RUN/share" --no-server; then
+	if vm_start net --netboot --tree "$RUN/share" --no-server --tpm; then
 		probe net
 		expect net path_var=unset usb_bootdev=0 netroot=1 "${COMMON[@]}" "${want[@]}"
 	else
@@ -391,7 +393,7 @@ step_net() {
 
 step_net_sb() {
 	local want; read -ra want <<<"$(looks "${COMBOS[0]}")"
-	if vm_start net-sb --netboot --tree "$RUN/share" --no-server --secure-boot; then
+	if vm_start net-sb --netboot --tree "$RUN/share" --no-server --secure-boot --tpm; then
 		probe net-sb
 		expect net-sb secure_boot=enabled* path_var=unset netroot=1 "${COMMON[@]}" "${want[@]}"
 	else
@@ -401,7 +403,10 @@ step_net_sb() {
 }
 
 # Setup Mode, safespace-seal, boot sealed. The sealed variables go to
-# $RUN/sealed-vars.fd only if all of it passed: the select steps start from them.
+# $RUN/sealed-vars.fd only if all of it passed: the select and identity steps
+# start from them. Without a TPM, as the stick step: a sealed boot with one would
+# seal a machine-id to it, which no identity step's TPM could open (every other
+# step boots with a TPM, as the machines do).
 step_seal() {
 	if ! vm_start seal-setup "$STICK" --setup-mode; then
 		result FAIL seal "$ERR"
@@ -438,7 +443,7 @@ looks() { # "name:group+group"
 sel_boot() {
 	local name=$1 combo=$2 cmd=$3 want
 	read -ra want <<<"$(looks "$combo")"
-	if vm_start "$name" "$STICK" --sealed; then
+	if vm_start "$name" "$STICK" --sealed --tpm; then
 		probe "$name"
 		expect "$name" "${want[@]}" "${SEALED[@]}"
 		vm_ssh "$cmd" >"$LOGS/$name.select.log" 2>&1 || result FAIL "$name" "'$cmd' failed (see ${LOGS#"$REPO"/}/$name.select.log)"
