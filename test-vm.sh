@@ -255,10 +255,13 @@ if ((NETBOOT)); then
 	boot=(-boot order=n)
 	log "Netbooting over ${NBMODE^^} with ${MEM} MiB RAM (close the window to stop)"
 else
+	# bootindex: the firmware boots the stick first. Without it OVMF tries UEFI
+	# HTTP boot over the NIC first (IPv4 until a timeout, then IPv6), which cost
+	# about two minutes per boot on the sealed variables.
 	boot=(
 		-device qemu-xhci,id=xhci
 		-drive if=none,id=stick,format=raw,file="$RAW",snapshot=on
-		-device usb-storage,bus=xhci.0,drive=stick,removable=on
+		-device usb-storage,bus=xhci.0,drive=stick,removable=on,bootindex=1
 	)
 	log "Booting $(basename "$RAW") as a USB stick (close the window to stop)"
 fi

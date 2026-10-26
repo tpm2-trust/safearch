@@ -61,8 +61,9 @@
 #           units (debug adds packages, nothing else). Every boot with Secure
 #           Boot enabled and verified.
 #   identity the machine identity (aSSH's CA in the TPM, the machine-id), on a
-#           TPM of its own (swtpm) and a copy of the sealed firmware, one boot
-#           after the other, a client that trusts only the CA's @cert-authority
+#           TPM of its own (swtpm) and a copy of the sealed firmware: the first
+#           two boots one after the other, then every further case side by side
+#           on a copy of their TPM and variables; a client that trusts only the CA's @cert-authority
 #           line (StrictHostKeyChecking yes): the first sealed boot creates the
 #           machine-id; aSSH's temporary key, the state recorded;
 #           safespace-seal --identity-create (PIN, lockout authorization) in that
@@ -514,14 +515,25 @@ id_run() {
 	"$@" >"$LOGS/$n.log.out" 2>&1
 	if grep -q -- "$p" "$LOGS/$n.log.out"; then result PASS "$n" "$d"; else result FAIL "$n" "$d (see ${LOGS#"$REPO"/}/$n.log.out)"; fi
 }
-step_identity() {
-	local first=${COMBOS[0]%%:*} other="" move="" c mid
+# The combinations the identity step uses: the default, the debug one (another
+# combination), the one it moves to.
+id_names() {
+	local c
+	first=${COMBOS[0]%%:*} other="" move=""
 	for c in "${COMBOS[@]:1}"; do
 		[[ ${c#*:} == *+debug ]] && other=${c%%:*}
 		[[ ${c#*:} != *+debug && -z $move ]] && move=${c%%:*}
 	done
 	[[ -n $other ]] || other=${COMBOS[1]%%:*}
 	[[ -n $move ]] || move=$other
+}
+# The identity step's first part (30-identity): the first sealed boot and the
+# creation, then the certified boot. What it leaves - the TPM, the firmware
+# variables, the client's @cert-authority line, the machine-id - is where every
+# further part starts from, each on a copy of its own, side by side (id_branch).
+step_identity() {
+	local first other move mid
+	id_names
 	cp "$RUN/sealed-vars.fd" "$WORK/sealed-vars.fd"
 	: >"$WORK/ca_known_hosts"
 	# 1. The first sealed boot with a TPM: the machine-id is created; no CA yet, so
@@ -550,6 +562,20 @@ step_identity() {
 	expect identity-certified combination="$first" identity=SafespaceIdMachine identity_created=0 hostkey_src=assh hostcert=yes assh_slot=0 ca_login=yes unsealed=no unsealed_extended=no "${SEALED[@]}"
 	id_check identity-certified "the same machine-id" "[[ '$(val identity-certified machine_id)' == '$mid' ]]"
 	id_check identity-restart "an agent restart in the same boot: temporary (window closed), sshd with it, the first start's state kept" "grep -q 'TEMPORARY' '$LOGS/identity-restart.log' && grep -q 'PCR 15 not as approved' '$LOGS/identity-restart.log' && grep -q 'stays in /run/assh/agent.pcrs.json' '$LOGS/identity-restart.log' && [[ \$(grep -E '^[0-9a-f]{64}' '$LOGS/identity-restart.log' | wc -l) == 2 && \$(grep -E '^[0-9a-f]{64}' '$LOGS/identity-restart.log' | sort -u | wc -l) == 1 ]] && grep -qx ssh_after_restart=yes '$LOGS/identity-restart.probe' && grep -qx restart_ca_login=no '$LOGS/identity-restart.probe'"
+	echo "$mid" >"$WORK/mid"
+}
+# A further part of the identity step: a copy of what the first part left.
+ID_BASE_KEY=30
+id_branch() {
+	local base=$RUN/w/$ID_BASE_KEY
+	[[ -s $base/mid ]] || { result FAIL "${KEY#*-}" "the identity's first boots failed: nothing to start from"; return 1; }
+	cp -r "$base/tpm" "$WORK/" && cp "$base/sealed-vars.fd" "$base/ca_known_hosts" "$WORK/" || return 1
+	mid=$(cat "$base/mid")
+}
+step_identity_other() {
+	local first other move mid
+	id_names
+	id_branch || return
 	# 3. Another combination: temporary key, nothing released, --approve refused.
 	id_boot_once "identity-$other" "$other" || return
 	id_run "identity-$other-approve" "--approve in another combination: refused (--move)" "safespace-seal --move" id_seal --approve --pin-fd 3
@@ -558,6 +584,11 @@ step_identity() {
 	cat "$LOGS/identity-$other.attack" >>"$LOGS/identity-$other.probe"
 	expect "identity-$other" combination="$other" identity= identity_created=0 hostkey_src=assh hostcert=no assh_slot= ca_login=no unsealed=no unsealed_extended=no "${SEALED[@]}"
 	id_check "identity-$other" "another machine-id" "[[ '$(val "identity-$other" machine_id)' != '$mid' ]]"
+}
+step_identity_net() {
+	local first other move mid
+	id_names
+	id_branch || return
 	# 4. Over the network, same firmware and TPM. test-vm.sh starts OVMF with other
 	# settings for it (fw_cfg: HTTP boot only, the boot order), and PCR 0 differs
 	# (seen: 0 alone, 2/7/11/15 equal): slot 1 certifies; --approve (PIN) gives it
@@ -566,18 +597,27 @@ step_identity() {
 	id_run identity-net-approve "--approve the network boot (PIN)" "next boot certifies through slot 0" id_seal --approve --pin-fd 3
 	vm_stop identity-net
 	expect identity-net combination="$first" netroot=1 identity=SafespaceIdMachine hostcert=yes assh_slot=1 ca_login=yes secure_boot=enabled* "${COMMON[@]}"
+}
+step_identity_pcr2() {
+	local first other move mid
+	id_names
+	id_branch || return
 	# 5. An option ROM more (PCR 2): slot 1 certifies; --approve (PIN): slot 0 again.
 	# The NIC that brings the ROM is on a network of its own without DHCP (a hub port):
-	# a second user network would give the guest a second default route, and the
-	# firmware tries to boot from it first (hence the longer wait).
+	# a second user network would give the guest a second default route.
 	local rom="-netdev hubport,id=rom,hubid=9 -device e1000e,netdev=rom"
-	VM_QEMU_EXTRA=$rom VM_WAIT=900 id_boot identity-pcr2 "$STICK" || return
+	VM_QEMU_EXTRA=$rom id_boot identity-pcr2 "$STICK" || return
 	id_run identity-pcr2-approve "--approve after slot 1 (PIN)" "next boot certifies through slot 0" id_seal --approve --pin-fd 3
 	vm_stop identity-pcr2
 	expect identity-pcr2 combination="$first" identity=SafespaceIdMachine hostcert=yes assh_slot=1 ca_login=yes "${SEALED[@]}"
-	VM_QEMU_EXTRA=$rom VM_WAIT=900 id_boot identity-pcr2-approved "$STICK" || return
+	VM_QEMU_EXTRA=$rom id_boot identity-pcr2-approved "$STICK" || return
 	vm_stop identity-pcr2-approved
 	expect identity-pcr2-approved combination="$first" hostcert=yes assh_slot=0 ca_login=yes "${SEALED[@]}"
+}
+step_identity_pcr7() {
+	local first other move mid
+	id_names
+	id_branch || return
 	# 6. Another certificate in db (PCR 7, every slot reads it): temporary, nothing released.
 	cp "$WORK/sealed-vars.fd" "$WORK/sealed-vars.keep"
 	openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=extra-db/ -keyout "$WORK/extra.key" -out "$WORK/extra.pem" 2>/dev/null &&
@@ -585,8 +625,12 @@ step_identity() {
 		{ result FAIL identity-pcr7 "could not change db (see ${LOGS#"$REPO"/}/identity-pcr7.vars.log)"; return; }
 	id_boot identity-pcr7 "$STICK" || return
 	vm_stop identity-pcr7
-	cp "$WORK/sealed-vars.keep" "$WORK/sealed-vars.fd"
 	expect identity-pcr7 combination="$first" identity= hostcert=no ca_login=no "${SEALED[@]}"
+}
+step_identity_move() {
+	local first other move mid
+	id_names
+	id_branch || return
 	# 7. Moved: in $move (temporary key), --move (PIN, a new generation); the next boot
 	# there certified, with a new machine-id; wrong PINs lock out.
 	id_boot_once identity-move-req "$move" || return
@@ -601,12 +645,21 @@ step_identity() {
 	id_check identity-lockout "3 wrong PINs: the right one is locked out too" "grep -q 'wrong PIN' '$LOGS/identity-lockout.log' && tail -1 '$LOGS/identity-lockout.log' | grep -q 'locked out after too many wrong PINs'"
 	# 8. The default afterwards: its approvals are revoked.
 	id_boot_once identity-after-move "$first" || return
-	# 9. The agent fails (SAFEasshCA damaged): sshd still comes up, with the throwaway
-	# key, and the console says why.
-	vm_ssh 'v=/sys/firmware/efi/efivars/SAFEasshCA-24415b90-39be-45c0-a9a3-d547ebe28ea0; sudo chattr -i $v; printf "\007\000\000\000{broken" | sudo tee $v >/dev/null' >"$LOGS/identity-broken.log" 2>&1
 	vm_stop identity-after-move
 	expect identity-after-move combination="$first" identity= hostcert=no ca_login=no "${SEALED[@]}"
-	id_boot_once identity-agent-fails "$first" || return
+}
+step_identity_fails() {
+	local first other move mid
+	id_names
+	id_branch || return
+	# 9. The agent fails (SAFEasshCA damaged, written into the firmware variables):
+	# sshd still comes up, with the throwaway key, and says why.
+	printf '{"version":2,"variables":[{"name":"SAFEasshCA","guid":"24415b90-39be-45c0-a9a3-d547ebe28ea0","attr":7,"data":"%s"}]}\n' \
+		"$(printf %s '{broken' | od -An -tx1 | tr -d ' \n')" >"$WORK/broken.json"
+	cp "$WORK/sealed-vars.fd" "$WORK/sealed-vars.ok"
+	virt-fw-vars -i "$WORK/sealed-vars.ok" -o "$WORK/sealed-vars.fd" --set-json "$WORK/broken.json" >"$LOGS/identity-broken.vars.log" 2>&1 ||
+		{ result FAIL identity-agent-fails "could not damage SAFEasshCA (see ${LOGS#"$REPO"/}/identity-broken.vars.log)"; return; }
+	id_boot identity-agent-fails "$STICK" || return
 	vm_ssh 'sudo journalctl -b -u sshd-hostkeys -u assh-agent -o cat' >"$LOGS/identity-agent-fails.journal" 2>&1
 	vm_stop identity-agent-fails
 	# assh-agent failed: the one failed unit, the system degraded.
@@ -615,6 +668,7 @@ step_identity() {
 	# StandardOutput=journal+console: the journal here (the VM's /dev/console is its screen).
 	id_check identity-agent-fails "the fallback says the host key is a throwaway one, and why" "grep -q 'ssh host key: THROWAWAY (aSSH did not start' '$LOGS/identity-agent-fails.journal' && grep -q 'SAFEasshCA' '$LOGS/identity-agent-fails.journal'"
 }
+
 # Boot NAME once in COMBINATION: the selection written into the step's firmware
 # variables (virt-fw-vars), as select does it; the initrd deletes it.
 id_boot_once() { # NAME COMBINATION
@@ -680,6 +734,7 @@ if wants identity; then
 		KEY=30-identity result FAIL identity "no sealed firmware variables (the step seal failed)"
 	else
 		job 30-identity step_identity
+		ID_PID=$JOB_PID
 	fi
 fi
 if wants select; then
@@ -691,6 +746,16 @@ if wants select; then
 			job "$((19 + i))-select-${COMBOS[i]%%:*}" step_select_once "$i"
 		done
 	fi
+fi
+# The identity's further parts start from what its first part left, side by side.
+if [[ -n ${ID_PID:-} ]]; then
+	wait "$ID_PID"
+	job 31-identity-other step_identity_other
+	job 32-identity-net step_identity_net
+	job 33-identity-pcr2 step_identity_pcr2
+	job 34-identity-pcr7 step_identity_pcr7
+	job 35-identity-move step_identity_move
+	job 36-identity-fails step_identity_fails
 fi
 wait
 
