@@ -777,6 +777,10 @@ if wanted assh && need go; then
 	A=$REPO/mkosi.extra/usr/lib/systemd/system/assh-agent.service
 	check "the agent starts before systemd's PCR 15 units and sysinit (PCR 11 and 15 as the initrd left them)" \
 		bash -c 'grep -q "^Before=.*sysinit.target" "$1" && grep -q "^Before=.*systemd-pcrmachine.service" "$1" && grep -q "^Before=.*systemd-pcrfs-root.service" "$1"' _ "$A"
+	# Wants=tpm2.target made a machine without a TPM wait 90 s for /dev/tpmrm0
+	# (systemd-tpm2-generator pulls it in where the firmware found one).
+	check "no unit of the image wants tpm2.target, the agent is ordered after it" \
+		bash -c '! grep -rqE "^(Wants|Requires)=.*tpm2\.target" "$1" "$2" && grep -q "^After=.*tpm2.target" "$3"' _ "$REPO/mkosi.extra" "$REPO/mkosi.initrd.conf" "$A"
 	check "the agent is enabled, sshd includes the host key file it writes; the fallback runs after it, whatever came of it" \
 		bash -c 'grep -qx "enable assh-agent.service" "$1" && grep -qx "Include /run/safespace/sshd-hostkey.conf" "$2" && grep -qx "After=assh-agent.service" "$3" && ! grep -q "^Condition" "$3" && grep -q "\[ -s \"\$c\" \] && exit 0" "$3"' _ \
 		"$REPO/mkosi.extra/usr/lib/systemd/system-preset/10-safespace.preset" "$REPO/mkosi.extra/etc/ssh/sshd_config.d/10-safespace.conf" "$REPO/mkosi.extra/etc/systemd/system/sshd-hostkeys.service"

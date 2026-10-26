@@ -10,7 +10,9 @@
 [Unit]
 Description=aSSH: the host key in the TPM, certified by the machine's CA
 DefaultDependencies=no
-Wants=tpm2.target
+# After the TPM, not wanting it: systemd-tpm2-generator pulls tpm2.target in where
+# the firmware found a TPM the kernel does not show yet. Wanting it here made a
+# machine without a TPM wait 90 s for /dev/tpmrm0 before sysinit.target.
 After=tpm2.target sys-firmware-efi-efivars.mount
 Before=sysinit.target sshd.service systemd-pcrmachine.service systemd-pcrfs-root.service
 ConditionPathExists=/dev/tpmrm0
