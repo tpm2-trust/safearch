@@ -30,7 +30,12 @@
 # lib/compose.sh), build.json (what, when, from which package snapshot and
 # commit); release.sh adds released.log. BUILD in the commands above is that
 # directory name. While building, each combination's mkosi run has its own
-# directory under mkosi.output/.parts-<version>/ (removed when composed).
+# directory under mkosi.output/.parts-<version>/ (removed when composed). The
+# first combination is built first, alone: its initrd is every combination's
+# (the composed UKI carries it). The others then run side by side - as many as
+# /var/tmp has room for (~8 GiB each) - each with its log in .parts-<version>/,
+# printed when it ends; a combination with no cached image yet (or -f) runs on
+# its own, as it installs packages into the shared package cache.
 #
 # --url BASE_URL  where a network-booted machine loads its root from: the
 #              distribution servers' share, e.g. http://10.0.0.1/safespace/
@@ -275,23 +280,65 @@ find "$BUILDS_ROOT" -mindepth 1 -maxdepth 1 -type d -name '.parts-*' -exec rm -r
 STARTED=$(date -Is)
 
 # One combination: its own complete mkosi run with its groups as profiles,
-# finalized into its parts (lib/builds.sh).
-build_combination() { # NAME GROUPS DIR
-	local name=$1 groups=$2 dir=$3 profiles
+# finalized into its parts (lib/builds.sh). INITRD: the first combination's
+# initrd, given to the others instead of building the same one again.
+build_combination() { # NAME GROUPS DIR [INITRD]
+	local name=$1 groups=$2 dir=$3 initrd=${4:-} profiles
 	groups_parse "$groups"
 	mapfile -t profiles < <(groups_profiles)
 	log "--- combination $name (groups $groups)"
 	mkdir -p "$dir"
+	# Its own cache key: each combination keeps its installed image (Incremental=)
+	# and finds it unchanged at the next build. With one key for all, every run
+	# found the previous combination's image, re-synced the package metadata and
+	# dropped every cache: each build installed every package three times.
 	# (Called in a condition, where set -e does not apply: every step returns.)
-	(set -x; mkosi ${profiles[@]+"${profiles[@]}"} "${EXTRA[@]}" --environment="SAFESPACE_COMBINATION=$name" --output-directory="$dir" ${MKOSI_ARGS[@]+"${MKOSI_ARGS[@]}"} build) || return 1
+	(set -x; mkosi ${profiles[@]+"${profiles[@]}"} "${EXTRA[@]}" --cache-key="&d~&r~&a~&I~$name" ${initrd:+--initrd="$initrd"} \
+		--environment="SAFESPACE_COMBINATION=$name" --output-directory="$dir" ${MKOSI_ARGS[@]+"${MKOSI_ARGS[@]}"} build) || return 1
+	[[ -n $initrd ]] || cp "$dir/initrd.cpio.zst" "$PARTS/initrd.cpio.zst" || return 1
 	(builds_finalize "$dir" "$VERSION")
 }
-dirs=()
+# Whether NAME has an installed image in mkosi's cache (and no -f asks for a new one).
+cached() { # NAME
+	compgen -G "$HERE/mkosi.cache/*~main~$1.manifest" >/dev/null || return 1
+	local a
+	for a in ${MKOSI_ARGS[@]+"${MKOSI_ARGS[@]}"}; do [[ $a == -f* || $a == --force ]] && return 1; done
+	return 0
+}
+first=${COMBO_NAMES[0]}
+build_combination "$first" "${COMBO_GROUPS[0]}" "$PARTS/$first" ||
+	die "the build of $first failed (parts in ${PARTS#"$HERE"/})"
+# The others: those without a cached image one after the other, then the
+# rest side by side.
+JOBS=$(($(free_gib /var/tmp) / 8))
+((JOBS >= 1)) || JOBS=1
+pids=() names=()
 for i in "${!COMBO_NAMES[@]}"; do
-	build_combination "${COMBO_NAMES[i]}" "${COMBO_GROUPS[i]}" "$PARTS/${COMBO_NAMES[i]}" ||
-		die "the build of ${COMBO_NAMES[i]} failed (parts in ${PARTS#"$HERE"/})"
-	dirs+=("$PARTS/${COMBO_NAMES[i]}")
+	((i > 0)) || continue
+	n=${COMBO_NAMES[i]}
+	if ! cached "$n"; then
+		build_combination "$n" "${COMBO_GROUPS[i]}" "$PARTS/$n" "$PARTS/initrd.cpio.zst" ||
+			die "the build of $n failed (parts in ${PARTS#"$HERE"/})"
+	fi
 done
+for i in "${!COMBO_NAMES[@]}"; do
+	((i > 0)) || continue
+	n=${COMBO_NAMES[i]}
+	[[ ! -d $PARTS/$n ]] || continue
+	while (($(jobs -rp | wc -l) >= JOBS)); do wait -n || true; done
+	build_combination "$n" "${COMBO_GROUPS[i]}" "$PARTS/$n" "$PARTS/initrd.cpio.zst" >"$PARTS/$n.log" 2>&1 &
+	pids+=($!) names+=("$n")
+done
+((${#pids[@]} == 0)) || log "building ${names[*]} side by side (up to $JOBS at a time; logs in ${PARTS#"$HERE"/}/NAME.log)"
+failed=()
+for i in "${!pids[@]}"; do
+	wait "${pids[i]}" || failed+=("${names[i]}")
+	cat "$PARTS/${names[i]}.log"
+done
+((${#failed[@]} == 0)) || die "the build of ${failed[*]} failed (parts and logs in ${PARTS#"$HERE"/})"
+dirs=()
+for n in "${COMBO_NAMES[@]}"; do dirs+=("$PARTS/$n"); done
+rm -f "$PARTS/initrd.cpio.zst"
 
 log "composing $BUILD"
 compose_build "$OUTDIR" "${dirs[@]}"
