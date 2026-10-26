@@ -80,10 +80,10 @@ the network-boot reference, SECURITY.md the applied hardening. Arch Linux only, 
 | build host (has the keys) | `build.sh` (entry point), `release.sh`, `fetch-images.sh`, `update-snapshot.sh`, `burn.sh`, `diagnose.sh`, `test-vm.sh`, `hwtest-image.sh` |
 | image configuration | `mkosi.conf` (the image, both boot paths), `mkosi.profiles/{docker,xfce4-headless-vnc,debug}/` (groups), `mkosi.repart/`, `mkosi.extra/`, `mkosi.postinst`, `mkosi.finalize`, `mkosi.postoutput` |
 | initrd | `mkosi.initrd.conf/`: `usb-bootdev` (root from the stick) and `netroot` (root over HTTP), chosen at boot by `LoaderDevicePartUUID`; `select` (sourced by both: which root of a combined build) |
-| combinations | `combinations.conf` (the first is the default), `lib/compose.sh` (one mkosi run per combination → one UKI for all roots; `compose_check`), `mkosi.extra/usr/local/sbin/safespace-select` |
+| combinations | `combinations.conf` (the first is the default), `lib/compose.sh` (one mkosi run per combination → one UKI for all roots; `compose_check`), `mkosi.extra/usr/local/sbin/safespace select` |
 | distribution server | `server/` (`setup.sh`, `safespace-netboot`, units, nginx site, `server.conf.example`) |
 | shared shell code | `lib/repos.sh`, `lib/groups.sh`, `lib/keys.sh`, `lib/builds.sh` (the builds in `mkosi.output/combined_<version>/`: their parts, list, prune), `lib/stick.sh` (a stick assembled from the parts), `lib/verify.sh` (also installed on the servers), `lib/assh.sh` (builds aSSH) |
-| machine identity | `assh/` (submodule, [aSSH](assh/README.md), Go: the host key in the TPM, its CA; built by `lib/assh.sh` with the build host's Go into `mkosi.extra/usr/bin/assh`), `mkosi.extra/etc/assh/assh.conf`, `assh-agent.service`, `safespace-seal` (`--identity-create`, `--approve`, `--move`), the initrd's `identity` (the machine-id); SECURITY.md "Machine identity" |
+| machine identity | `assh/` (submodule, [aSSH](assh/README.md), Go: the host key in the TPM, its CA; built by `lib/assh.sh` with the build host's Go into `mkosi.extra/usr/bin/assh`), `mkosi.extra/etc/assh/assh.conf`, `assh-agent.service`, `safespace seal` (`safespace identity create`, `safespace identity approve`, `safespace identity move`), the initrd's `identity` (the machine-id); SECURITY.md "Machine identity" |
 | tests | `tests/run.sh` (no root), `tests/vm.sh` (integration in QEMU), `tests/lib/` |
 | per-host files (gitignored, templates `*.example`) | `users.conf`, `netboot.conf`, `release.conf`, `mkosi.local.conf`, `repos.local.conf`, `server/server.conf` |
 

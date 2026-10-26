@@ -5,7 +5,7 @@
 # signed UKI that names them all (lib/compose.sh). The same build boots from a
 # USB stick / SD card (./burn.sh) and over the network (./release.sh to the
 # distribution servers, NETBOOT.md); a machine boots the first combination
-# unless safespace-select preselects another (an EFI variable).
+# unless safespace select preselects another (an EFI variable).
 #
 #   sudo ./build.sh [--url BASE_URL]... [--workers N] [--users FILE]
 #                   [--combinations FILE] [--output-root DIR] [MKOSI OPTIONS...]
@@ -80,7 +80,7 @@
 # is mkosi.cache/go.
 #
 # Every build exports the public Secure Boot keys it signs with into the image
-# (mkosi.extra/usr/share/safespace/secureboot/), so safespace-seal works, and
+# (mkosi.extra/usr/share/safespace/secureboot/), so safespace seal works, and
 # creates the expected-PCR signing key on the first build (lib/keys.sh). The
 # keys: the host's sbctl (/var/lib/sbctl), or a dedicated sbctl key set,
 # SAFESPACE_SBCTL_CONFIG= in mkosi.local.conf (README.md, "Secure Boot keys").

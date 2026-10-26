@@ -42,9 +42,9 @@
 #   certificate in db (taken from the signature, so no root needed). Needs
 #   virt-fw-vars (pacman -S virt-firmware).
 # --setup-mode: Secure Boot firmware with no keys (Setup Mode), as after
-#   "Reset to Setup Mode". Run safespace-seal inside; the firmware variables
+#   "Reset to Setup Mode". Run safespace seal inside; the firmware variables
 #   are kept in sealed-vars.fd in the work directory.
-# --sealed: boot again with sealed-vars.fd of the work directory (after safespace-seal).
+# --sealed: boot again with sealed-vars.fd of the work directory (after safespace seal).
 # --ssh PORT: forward localhost:PORT to the VM's sshd.
 # --tpm: a TPM 2.0 (swtpm, CRB interface like Intel PTT). Its state is kept in
 #   tpm/ of the work directory, so the TPM survives reboots like a real one
@@ -225,10 +225,10 @@ if ((SETUP || SEALED)); then
 	vars=$WORK/sealed-vars.fd
 	if ((SETUP)); then
 		cp "$OVMF/OVMF_VARS.4m.fd" "$vars"
-		log "Setup Mode: no Secure Boot keys enrolled (run safespace-seal in the VM)"
+		log "Setup Mode: no Secure Boot keys enrolled (run safespace seal in the VM)"
 	else
-		[[ -f $vars ]] || die "no $vars (run --setup-mode and safespace-seal first)"
-		log "Using the firmware variables written by safespace-seal"
+		[[ -f $vars ]] || die "no $vars (run --setup-mode and safespace seal first)"
+		log "Using the firmware variables written by safespace seal"
 	fi
 	machine+=,smm=on
 	code=$OVMF/OVMF_CODE.secboot.4m.fd

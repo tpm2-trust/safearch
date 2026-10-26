@@ -8,7 +8,7 @@
 #   2. EFI variable SafespaceSelectOnce-<GUID>: for this boot only, deleted here
 #   3. EFI variable SafespaceSelect-<GUID>: the persistent preselection
 #   4. the first combination on the command line (combinations.conf's first)
-# (set with safespace-select on the running system). The variables only name a
+# (set with safespace select on the running system). The variables only name a
 # combination; its root hash always comes from the signed command line, so a
 # changed variable can select another signed root, never an unsigned one. An
 # unknown name stops the boot: a wrong preselection must not go unnoticed.

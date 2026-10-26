@@ -196,6 +196,13 @@ fx_reuki() {
 	rm -rf "$t"
 }
 
+# fx_flip FILE OFFSET: invert one byte in place - it always changes (writing a
+# fixed value does not, where the byte already has it).
+fx_flip() {
+	local b; b=$(od -An -tu1 -j "$2" -N1 "$1" | tr -d ' ') && [[ -n $b ]] || return 1
+	printf "\\x$(printf %02x $((b ^ 0xff)))" | dd of="$1" bs=1 seek="$2" conv=notrunc status=none
+}
+
 # fx_resum DIR: recompute SHA256SUMS, as someone tampering with a release would.
 fx_resum() {
 	(cd "$1" && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | sort | xargs sha256sum >SHA256SUMS)

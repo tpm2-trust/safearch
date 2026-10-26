@@ -118,7 +118,7 @@ if wanted syntax; then
 		head -1 "$f" | grep -q '^#!/bin/sh' && check "sh -n $f" sh -n "$f" || check "bash -n ${f#"$REPO"/}" bash -n "$f"
 	done < <(cd "$REPO" && find . -path ./mkosi.output -prune -o -path ./mkosi.cache -prune -o -path ./.git -prune -o \
 		-type f \( -name '*.sh' -o -name 'mkosi.postinst' -o -name 'mkosi.finalize' -o -name 'mkosi.postoutput' \
-		-o -name netroot -o -name usb-bootdev -o -name select -o -name safespace-seal -o -name safespace-select -o -name safespace-netboot -o -name load-docker-images \) -print |
+		-o -name netroot -o -name usb-bootdev -o -name select -o -name safespace -o -name safespace-netboot -o -name load-docker-images \) -print |
 		sed "s|^\.|$REPO|")
 fi
 
@@ -143,8 +143,8 @@ if wanted groups; then
 		printf '%s\n' "$1" >"$W/combos.conf"; combos_load "$W/combos.conf" && [[ "${COMBO_NAMES[*]}|${COMBO_GROUPS[*]}" == "$2" ]])
 	}
 	check "combinations.conf of the repository" t_combos "$(cat "$REPO/combinations.conf")" \
-		"root containers|base base,docker"
-	check "tests/vm.combinations.conf (the test build's)" t_combos "$(cat "$REPO/tests/vm.combinations.conf")" "root containers debug|base base,docker base,debug"
+		"root containers debug|base base,docker base,debug"
+	check "tests/vm.combinations.conf (the test build's)" t_combos "$(cat "$REPO/tests/vm.combinations.conf")" "root containers|base base,docker"
 	check "any combination may come first (it is the default)" t_combos $'x=docker\ny=base' "x y|base,docker base"
 	refuse "a name twice" t_combos $'base=base\nx=docker\nx=docker' ""
 	refuse "an invalid name" t_combos $'base=base\nX;y=docker' ""
@@ -277,9 +277,9 @@ if wanted server && shared; then
 		refuse "verify detects: $1" "$NB" verify
 	}
 	resum="source $REPO/tests/lib/fixtures.sh; fx_resum \$1"
-	tamper "a manipulated hash tree (SHA256SUMS recomputed)" 'printf "\xff" | dd of=$1/root-root.verity bs=1 seek=8192 conv=notrunc status=none; '"$resum"
-	tamper "a manipulated root image" 'printf "\xff" | dd of=$1/root-root.img bs=1 seek=4096 conv=notrunc status=none; '"$resum"
-	tamper "a manipulated root image of another combination" 'printf "\xff" | dd of=$1/root-containers.img bs=1 seek=4096 conv=notrunc status=none; '"$resum"
+	tamper "a manipulated hash tree (SHA256SUMS recomputed)" 'source '"$REPO"'/tests/lib/fixtures.sh; fx_flip $1/root-root.verity 8192; '"$resum"
+	tamper "a manipulated root image" 'source '"$REPO"'/tests/lib/fixtures.sh; fx_flip $1/root-root.img 4096; '"$resum"
+	tamper "a manipulated root image of another combination" 'source '"$REPO"'/tests/lib/fixtures.sh; fx_flip $1/root-containers.img 4096; '"$resum"
 	tamper "a UKI signed by another key" 'sbattach --remove $1/boot.efi >/dev/null; sbsign --key '"$KD"'/KEK/KEK.key --cert '"$KD"'/KEK/KEK.pem --output $1/boot.efi $1/boot.efi >/dev/null 2>&1; '"$resum"
 	tamper "an unsigned UKI" 'sbattach --remove $1/boot.efi >/dev/null; '"$resum"
 	tamper "systemd-boot signed by another key" 'sbattach --remove $1/systemd-boot.efi >/dev/null; sbsign --key '"$KD"'/KEK/KEK.key --cert '"$KD"'/KEK/KEK.pem --output $1/systemd-boot.efi $1/systemd-boot.efi >/dev/null 2>&1; '"$resum"
@@ -477,7 +477,7 @@ if wanted compose && fixtures; then
 		o=$(objcopy -O binary --only-section=.osrel "$1" /dev/stdout | tr -d "\0")
 		grep -qx "PRETTY_NAME=\"safespace 20990101-0100\"" <<<"$o" && ! grep -q "^VARIANT" <<<"$o" && grep -qx "ID=arch" <<<"$o"' _ "$B/boot.efi"
 	check "the login banner shows os-release's PRETTY_NAME" grep -qxF '\S{PRETTY_NAME} \r (\l)' "$REPO/mkosi.extra/etc/issue"
-	check "safespace-select: the booted combination is the root's own name" grep -q '^booted() { cat /usr/lib/safespace/combination' "$REPO/mkosi.extra/usr/local/sbin/safespace-select"
+	check "safespace: the booted combination is the root's own name" grep -q '^booted() { cat /usr/lib/safespace/combination' "$REPO/mkosi.extra/usr/local/sbin/safespace"
 	# compose_check on a changed copy: what build.sh refuses to call a build.
 	t_check() ( # DIR
 		set -Eeuo pipefail
@@ -629,7 +629,7 @@ if wanted compose && fixtures; then
 		t_id containers 1 0 "$W/sig-good.json"
 		[[ $(slot SafespaceIdMachine) != "$h" && -s $IR/machine-id && $(cat "$IR/machine-id") != "$m" && ! -e $EV/SafespaceAssign-$SG ]]
 	}
-	check "identity: SafespaceAssign for the measured combination (safespace-seal --move): a new machine-id" t_id_move
+	check "identity: SafespaceAssign for the measured combination (safespace identity move): a new machine-id" t_id_move
 	t_id_carry() { # ID WANT: the move carries ID; the machine-id is ID (WANT=same) or a new one (new)
 		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" || return 1
 		local m=$(cat "$IR/machine-id")
@@ -640,7 +640,7 @@ if wanted compose && fixtures; then
 		if [[ $2 == same ]]; then [[ $(cat "$IR/machine-id") == "$1" ]] && grep -q "its machine-id moves here" "$IR/log"
 		else [[ $(cat "$IR/machine-id") != "$1" && $(cat "$IR/machine-id") != "$m" ]] && grep -q "ignoring SafespaceAssignId" "$IR/log"; fi
 	}
-	check "identity: --move NAME carries the machine-id: sealed in NAME instead of a new one" t_id_carry 0123456789abcdef0123456789abcdef same
+	check "identity: safespace identity move NAME carries the machine-id: sealed in NAME instead of a new one" t_id_carry 0123456789abcdef0123456789abcdef same
 	check "identity: a carried machine-id that is not one (too short) is ignored: a new one" t_id_carry 0123456789abcdef new
 	check "identity: a carried machine-id that is not one (upper case) is ignored: a new one" t_id_carry 0123456789ABCDEF0123456789ABCDEF new
 	check "identity: a carried machine-id of zeros is ignored: a new one" t_id_carry 00000000000000000000000000000000 new
@@ -675,7 +675,7 @@ if wanted compose && fixtures; then
 		rm -rf "$EV" "$W/sha1-flag"; mkdir -p "$EV"; printf '\x07\x00\x00\x00containers' >"$EV/SafespaceAssign-$SG"
 		t_id containers 1 0 "$W/sig-good.json" SAFESPACE_TPM_SYSFS="$W/tpm-sha1"
 		[[ ! -e $EV/SafespaceIdMachine-$SG && ! -e $IR/machine-id && ! -e $EV/SafespaceAssign-$SG ]] &&
-			grep -q "SHA-1 is not allowed: no identity this boot (sudo safespace-seal --sha1 on)" "$IR/log" && grep -q 'identity:sealed' "$W/pcrextend.log"
+			grep -q "SHA-1 is not allowed: no identity this boot (sudo safespace tpm sha1 on)" "$IR/log" && grep -q 'identity:sealed' "$W/pcrextend.log"
 	}
 	check "identity: a TPM with SHA-1 only, not allowed: no identity, PCR 15 closed" t_id_sha1_off
 	t_id_sha1_on() {
@@ -687,7 +687,7 @@ if wanted compose && fixtures; then
 		rm -f "$W/sha1-flag"; t_id containers 1 0 "$W/sig-good.json" SAFESPACE_TPM_SYSFS="$W/tpm-sha1"
 		[[ -e $EV/SafespaceIdMachine-$SG && ! -e $IR/machine-id ]]
 	}
-	check "identity: SHA-1 only, allowed (safespace-seal --sha1 on): the machine-id, the same at the next boot; off again: not released" t_id_sha1_on
+	check "identity: SHA-1 only, allowed (safespace tpm sha1 on): the machine-id, the same at the next boot; off again: not released" t_id_sha1_on
 	t_id_sha1_other() {
 		rm -rf "$EV"; echo 0x22020006 >"$W/sha1-flag"
 		t_id containers 1 0 "$W/sig-good.json" SAFESPACE_TPM_SYSFS="$W/tpm-sha1"; rm -f "$W/sha1-flag"
@@ -698,7 +698,7 @@ if wanted compose && fixtures; then
 	check "identity: SHA-256 active: the flag is not asked" t_id_sha1_both
 	# The initrd has no grep (mkosi's Arch initrd): its scripts use sed.
 	check "identity, select: no grep (the initrd has none)" bash -c '! grep -nE "(^|[|;&(]|then|do)[[:space:]]*grep[[:space:]]" "$@"' _ "$ID" "$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/select"
-	check "identity: every sealing uses tpm2-with-public-key" bash -c '! grep -nE "(creds|CREDS\"?) encrypt" "$@" | grep -v "with-key=tpm2-with-public-key"' _ "$ID" "$REPO/mkosi.extra/usr/local/sbin/safespace-seal"
+	check "identity: every sealing uses tpm2-with-public-key" bash -c '! grep -nE "(creds|CREDS\"?) encrypt" "$@" | grep -v "with-key=tpm2-with-public-key"' _ "$ID" "$REPO/mkosi.extra/usr/local/sbin/safespace"
 fi
 
 # --- dnsmasq ----------------------------------------------------------------------------------

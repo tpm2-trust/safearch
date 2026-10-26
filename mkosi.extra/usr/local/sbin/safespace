@@ -1,0 +1,552 @@
+#!/usr/bin/env bash
+# The machine's own command: which combination it boots, its Secure Boot seal,
+# its identity and its TPM.
+#
+#   safespace                        the overview: combinations, Secure Boot, TPM, identity
+#   safespace select                 the combinations of this build, the booted one, the
+#                                    preselection
+#   sudo safespace select NAME       NAME from the next boot on
+#   sudo safespace select NAME --once    NAME on the next boot only
+#   sudo safespace select --default  no preselection: the first combination
+#   sudo safespace seal [--replace]  enroll this stick's Secure Boot keys (Setup Mode)
+#   safespace identity               the CA, its approvals, the known_hosts line, this boot's
+#                                    host key
+#   sudo safespace identity create|approve|move [NAME]|clear|pin
+#   safespace tpm                    the PCR banks, SHA-1, the dictionary attack state
+#   sudo safespace tpm sha1 on|off
+#   sudo safespace tpm unlock        end a PIN lockout (the lockout authorization)
+#
+# Options where they apply: --yes (no YES asked), --pin-fd N, --new-pin-fd N,
+# --lockout-auth-fd N: a secret from a file descriptor (every byte; tests). A
+# secret is never taken from the command line or the environment.
+#
+# select: the initrd reads the choice from an EFI variable (SafespaceSelect, once:
+#   SafespaceSelectOnce; vendor GUID 8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34); the root
+#   hash of every combination is on the UKI's signed command line, so only the names
+#   offered there can be selected. With a machine identity, select NAME and --default
+#   move it along when NAME is not the combination booted (identity move NAME, the
+#   PIN), and only then is NAME selected: a move that fails (a wrong PIN, a lockout)
+#   selects nothing - try again, or remove the identity first (identity clear).
+#   --once moves nothing: NAME boots once with aSSH's temporary host key (debug, say).
+#
+# seal: the machine must be in Setup Mode (firmware setup: "Reset to Setup Mode" /
+#   "Clear Secure Boot keys"). Adds this stick's KEK and db to what the firmware
+#   has (vendor and Microsoft certificates stay: option ROMs keep working), then
+#   its PK; afterwards the firmware boots only what these keys signed. --replace:
+#   db and KEK hold ONLY these keys - option ROMs signed by Microsoft (many GPUs,
+#   NICs, storage controllers) no longer load: no display in the firmware setup,
+#   or no boot at all; only for machines known to have none. Then switch Secure
+#   Boot on in the firmware setup if it is not, and set a firmware password.
+#
+# identity (SECURITY.md, "Machine identity"): the ssh host key is aSSH's
+#   (assh-agent.service, /etc/assh/assh.conf), made in the TPM at every boot and
+#   certified by the machine's CA - a key in the TPM whose file is the EFI variable
+#   SAFEasshCA - only while the PCRs hold a state approved with the PIN, the
+#   combination (PCR 15) included: updates keep it, another combination gets aSSH's
+#   temporary key (made in the TPM, not certified). The machine-id is sealed in the
+#   initrd to the combination too (the first boot with Secure Boot on creates it).
+#   Clients trust the CA once: '@cert-authority <names> <key>' in known_hosts.
+#   create   the first identity, in the combination booted (Secure Boot on, this
+#            stick's keys): the TPM's lockout authorization if it has none (asked
+#            twice; it ends a PIN lockout and clears the TPM: keep it off the
+#            machine), a new PIN (twice), the CA, this boot's recorded state approved.
+#            sshd serves the temporary key until the reboot; the next boot certifies.
+#   approve  after an update this boot was certified through slot 1 (the firmware,
+#            an option ROM or the UKI changed): this state approved in every slot.
+#   move NAME   to the combination NAME from this boot, without booting it first:
+#            NAME's state approved - this boot's PCR 0, 2, 7, 11 (one UKI for every
+#            combination) and PCR 15 as NAME's initrd leaves it - with a new
+#            generation of the PIN's counter, which revokes every approval before;
+#            NAME gets the machine-id (where it is released in this boot) and is
+#            selected. What select NAME does with an identity.
+#   move     in a certified boot: to the preselected combination, when that is
+#            another one. Otherwise to the combination booted (its temporary key),
+#            or kept here after a Secure Boot change (PCR 7: no slot met): this
+#            boot's state approved with a new generation; a new machine-id at the
+#            next boot.
+#   clear    removes it: the CA, its PIN index and counter in the TPM, the
+#            machine-id slot, a pending move. The lockout authorization and SHA-1
+#            stay. Clients that trust the CA refuse the machine from then on.
+#   pin      changes the PIN (the old one, then the new one twice).
+#
+# tpm sha1 on|off: allows SHA-1 on this TPM, or forbids it again: aSSH's NV index
+#   0x01802914, not signed. It counts only on a TPM whose firmware activates no
+#   SHA-256 PCR bank (ThinkPad T450s): there the machine-id and the host key are
+#   bound to SHA-1, from the next boot on and only while it is on. SHA-1 is the
+#   weaker hash (SECURITY.md, "The SHA-1 bank").
+set -Eeuo pipefail
+
+KEYS=/usr/share/safespace/secureboot
+EFIVARS=/sys/firmware/efi/efivars
+GLOBAL=8be4df61-93ca-11d2-aa0d-00e098032b8c
+IMGSEC=d719b2cb-3d3a-4596-a3bc-dad00e67656f
+# The selection's variables (the initrd's select), and the identity's.
+SELECT_GUID=8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34
+# The machine's inventory ID: its machine-id, hashed for this application
+# (machine-id(5): the machine-id itself stays confidential).
+APP_ID=eda1fc8c35e94e2087addff88d0b4e91
+ASSH=/usr/bin/assh
+ASSH_CONF=/etc/assh/assh.conf
+# The CA's file: the EFI variable of assh.conf's ASSH_CA (aSSH's vendor GUID).
+CA_VAR=$EFIVARS/SAFEasshCA-24415b90-39be-45c0-a9a3-d547ebe28ea0
+# What the agent recorded at its start (ASSH_STATE), and its files.
+STATE=/run/assh/agent.pcrs.json
+CERT=/run/assh/host-cert.pub HOSTPUB=/run/assh/host.pub
+
+die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
+log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
+warn() { printf '\e[1;33m==> WARNING:\e[0m %s\n' "$*" >&2; }
+usage() { sed -n '2,${/^#/!q;s/^# \?//;p}' "$0"; }
+
+ARGS=() CONFIRM=1 REPLACE=0 ONCE=0 DEFAULT_SEL=0 PIN_FD="" NEW_PIN_FD="" LOCKOUT_FD=""
+fd_arg() { [[ ${1:-} =~ ^[0-9]+$ ]] || die "$2 needs a file descriptor number"; echo "$1"; }
+while (($#)); do
+	case $1 in
+		--yes) CONFIRM=0; shift ;;
+		--replace) REPLACE=1; shift ;;
+		--once) ONCE=1; shift ;;
+		--default) DEFAULT_SEL=1; shift ;;
+		--pin-fd) PIN_FD=$(fd_arg "${2:-}" --pin-fd); shift 2 ;;
+		--new-pin-fd) NEW_PIN_FD=$(fd_arg "${2:-}" --new-pin-fd); shift 2 ;;
+		--lockout-auth-fd) LOCKOUT_FD=$(fd_arg "${2:-}" --lockout-auth-fd); shift 2 ;;
+		-h | --help) usage; exit 0 ;;
+		-*) die "unknown option $1 (safespace --help)" ;;
+		*) ARGS+=("$1"); shift ;;
+	esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
+# --- common ------------------------------------------------------------------------
+# The combinations on the signed command line; the first is the default.
+mapfile -t NAMES < <(tr ' ' '\n' </proc/cmdline | sed -n 's/^safespace\.root\.\([a-z][a-z0-9-]*\)=[0-9a-f]\{64\}$/\1/p')
+FIRST=${NAMES[0]:-}
+# The root names itself (mkosi.postinst): the verified root, so what booted.
+booted() { cat /usr/lib/safespace/combination 2>/dev/null || echo "?"; }
+check_name() {
+	((${#NAMES[@]})) || die "no safespace.root.<name>= on the command line"
+	[[ " ${NAMES[*]} " == *" $1 "* ]] || die "'$1' is not a combination of this build (it has: ${NAMES[*]})"
+}
+need_root() { [[ $EUID -eq 0 ]] || die "${1:-this} needs root: sudo safespace $*"; }
+need_assh() {
+	[[ -x $ASSH && -r $ASSH_CONF ]] || die "this image has no aSSH ($ASSH, $ASSH_CONF)"
+	[[ -e /dev/tpmrm0 ]] || die "no TPM 2.0 (/dev/tpmrm0): the identity is the TPM's"
+}
+# efivarfs writable (it may be mounted read-only).
+efivars_rw() {
+	[[ -d $EFIVARS ]] || die "not booted in UEFI mode"
+	mountpoint -q "$EFIVARS" || mount -t efivarfs efivarfs "$EFIVARS"
+	grep -q " $EFIVARS efivarfs rw" /proc/mounts || mount -o remount,rw "$EFIVARS"
+}
+# A variable of the selection's vendor GUID: read, removed (efivarfs makes them
+# immutable: chattr -i first), written (the attributes NV, BS, RT, then the value,
+# in one write).
+sel_var() { [[ -r $EFIVARS/$1-$SELECT_GUID ]] && tail -c +5 "$EFIVARS/$1-$SELECT_GUID" | tr -d '\000\n' || true; }
+sel_var_rm() { local f=$EFIVARS/$1-$SELECT_GUID; [[ -e $f ]] || return 0; chattr -i "$f" 2>/dev/null || true; rm -f "$f"; }
+sel_var_write() { sel_var_rm "$1"; printf '\x07\x00\x00\x00%s' "$2" >"$EFIVARS/$1-$SELECT_GUID"; }
+# Value byte of a global UEFI variable (after the 4-byte attribute header).
+var_byte() { od -An -tu1 -j4 -N1 "$EFIVARS/$1-$GLOBAL" 2>/dev/null | tr -d ' '; }
+confirm() { # QUESTION
+	((CONFIRM)) || return 0
+	local answer
+	read -rp "$1 Type YES: " answer
+	[[ $answer == YES ]] || die "aborted"
+}
+
+# A secret into the variable named $1: from the file descriptor $2 (every byte),
+# else asked on the terminal ($3, twice when $4 is "new"). It stays in this
+# shell's memory: assh gets it on a pipe (assh_with), never on a command line,
+# in the environment or on disk.
+read_secret() { # VAR FD PROMPT [new]
+	local v="" again=""
+	if [[ -n $2 ]]; then
+		IFS= read -r -d '' -u "$2" v || true
+	else
+		[[ -r /dev/tty ]] || die "no terminal to ask the $3 on (or: --pin-fd / --lockout-auth-fd)"
+		IFS= read -rsp "$3: " v </dev/tty; echo >/dev/tty
+		if [[ ${4:-} == new ]]; then
+			IFS= read -rsp "$3 again: " again </dev/tty; echo >/dev/tty
+			[[ $v == "$again" ]] || die "the two entries differ"
+		fi
+	fi
+	[[ -n $v ]] || die "the $3 is empty"
+	printf -v "$1" '%s' "$v"
+}
+# assh with the secret in $1 on file descriptor 3 (printf is a builtin: the
+# secret is in no process's arguments).
+assh_with() { # VAR ASSH-ARGS...
+	local var=$1; shift
+	"$ASSH" "$@" 3< <(printf '%s' "${!var}")
+}
+
+# --- select ------------------------------------------------------------------------
+select_show() {
+	echo "combinations:  ${NAMES[*]}"
+	echo "booted:        $(booted)"
+	local p o
+	p=$(sel_var SafespaceSelect) o=$(sel_var SafespaceSelectOnce)
+	echo "preselected:   ${p:-$FIRST (none set)}"
+	[[ -z $o ]] || echo "next boot:     $o (once)"
+}
+
+# The persistent selection, written as it is (the first: none).
+select_write() { # NAME
+	if [[ $1 == "$FIRST" ]]; then
+		sel_var_rm SafespaceSelect
+	else
+		sel_var_write SafespaceSelect "$1"
+	fi || die "could not write the selection (efivarfs read-only?)"
+}
+
+select_cmd() {
+	(($# == 0 && !DEFAULT_SEL)) && { select_show; return; }
+	local to
+	if ((DEFAULT_SEL)); then
+		to=$FIRST
+	else
+		to=$1
+	fi
+	check_name "$to"
+	need_root select
+	efivars_rw
+	if ((ONCE)); then
+		sel_var_write SafespaceSelectOnce "$to" || die "could not write SafespaceSelectOnce"
+		echo "next boot only: $to"
+		[[ ! -e $CA_VAR || $to == "$(booted)" ]] ||
+			echo "(the machine's identity stays where it is: $to boots with aSSH's temporary host key)"
+		return
+	fi
+	# With an identity elsewhere than NAME: it moves along, or nothing is selected.
+	if [[ -e $CA_VAR && $to != "$(booted)" ]]; then
+		echo "the machine's identity moves to $to with the selection (PIN)"
+		(CONFIRM=0; identity_prepare; move_to "$to") ||
+			die "nothing selected: the identity did not move to $to. Try again, or remove the identity first (sudo safespace identity clear) and select $to without it"
+		return
+	fi
+	select_write "$to"
+	((DEFAULT_SEL)) && sel_var_rm SafespaceSelectOnce
+	echo "from the next boot on: $to"
+}
+
+# --- seal --------------------------------------------------------------------------
+# Certificate subjects in a signature-database variable.
+list_var() { # name guid
+	local f=$EFIVARS/$1-$2 t
+	[[ -s $f ]] || { echo "    (empty)"; return; }
+	t=$(mktemp -d)
+	tail -c +5 "$f" >"$t/esl"
+	sig-list-to-certs "$t/esl" "$t/c" >/dev/null 2>&1 || true
+	local found=0 c
+	for c in "$t"/c-*.der; do
+		[[ -e $c ]] || continue
+		found=1
+		echo "    $(openssl x509 -inform der -in "$c" -noout -subject -nameopt oneline 2>/dev/null | sed 's/^subject=//')"
+	done
+	((found)) || echo "    (entries without certificate, e.g. hashes)"
+	rm -rf "$t"
+}
+
+seal_cmd() {
+	need_root seal
+	[[ -f $KEYS/PK.auth ]] || die "this image contains no Secure Boot keys (build it with build.sh, which exports them)"
+	efivars_rw
+	local setup v k suffix=-append args=(-a)
+	setup=$(var_byte SetupMode)
+	log "SetupMode=${setup:-?} SecureBoot=$(var_byte SecureBoot)"
+	[[ $setup == 1 ]] || die "the machine is not in Setup Mode. In the firmware setup choose \"Reset to Setup Mode\" or \"Clear Secure Boot keys\", then boot this stick again."
+	echo "Currently enrolled:"
+	for v in PK KEK; do echo "  $v:"; list_var $v $GLOBAL; done
+	for v in db dbx; do echo "  $v:"; list_var $v $IMGSEC; done
+	echo "Will enroll (signed by the keys of this stick):"
+	for k in PK KEK db; do
+		printf '  %-4s %s\n' "$k" "$(openssl x509 -in "$KEYS/$k.pem" -noout -subject -nameopt oneline | sed 's/^subject=//')"
+	done
+	if ((REPLACE)); then
+		warn "--replace: db and KEK will contain ONLY these keys. Devices with option ROMs signed by Microsoft (GPUs, NICs, RAID controllers) will stop working in firmware, which can leave the machine without display or unbootable."
+		suffix="" args=()
+	else
+		echo "Mode: append (certificates already in KEK/db are kept)"
+	fi
+	confirm "Enroll these keys?"
+	# Existing variables are immutable in efivarfs.
+	for v in KEK-$GLOBAL db-$IMGSEC PK-$GLOBAL; do
+		[[ -e $EFIVARS/$v ]] && chattr -i "$EFIVARS/$v"
+	done
+	# db and KEK first: writing PK ends Setup Mode, after which only signed
+	# updates verified against the new PK/KEK are accepted.
+	log "Enrolling db";  efi-updatevar ${args[@]+"${args[@]}"} -f "$KEYS/db$suffix.auth" db
+	log "Enrolling KEK"; efi-updatevar ${args[@]+"${args[@]}"} -f "$KEYS/KEK$suffix.auth" KEK
+	log "Enrolling PK";  efi-updatevar -f "$KEYS/PK.auth" PK
+	setup=$(var_byte SetupMode)
+	[[ $setup == 0 ]] || die "SetupMode is still ${setup:-?}: the firmware did not accept PK"
+	log "Sealed. The firmware is in User Mode with this stick's keys."
+	echo "Next: reboot, make sure Secure Boot is ENABLED in the firmware setup, and set a firmware password."
+	echo "The first boot with Secure Boot on gives this machine its machine-id, bound to the combination that boots"
+	echo "(sudo safespace select NAME before rebooting chooses it). Then, in that boot: sudo safespace identity create"
+	echo "(the ssh host key's CA in the TPM, PIN)."
+}
+
+# --- the TPM -----------------------------------------------------------------------
+# The PCR banks the TPM has active (sysfs: the kernel lists allocated banks).
+banks() { local d; for d in /sys/class/tpm/tpm0/pcr-*; do [[ -d $d ]] && printf '%s ' "${d##*/pcr-}"; done; return 0; }
+# SHA-1 on (aSSH's flag in the TPM), as aSSH reads it; "" where it cannot.
+sha1_allowed() { { "$ASSH" tpm sha1 --config "$ASSH_CONF" 2>/dev/null || true; } | sed -n 's/^sha1 allowed: \([a-z]*\).*/\1/p'; }
+
+bank_line() {
+	local b a
+	b=$(banks) a=$(sha1_allowed)
+	if [[ -n $b && " $b" != *" sha256 "* ]]; then
+		case $a in
+			yes) echo "PCR bank:      sha1 (the TPM has no SHA-256 bank; allowed: safespace tpm sha1 on)" ;;
+			no) echo "PCR bank:      none: the TPM has the SHA-1 bank only, and SHA-1 is not allowed (sudo safespace tpm sha1 on)" ;;
+			*) echo "PCR bank:      sha1 only (run as root to see whether SHA-1 is allowed)" ;;
+		esac
+	elif [[ -n $b ]]; then
+		echo "PCR bank:      sha256"
+	else
+		echo "PCR bank:      no TPM 2.0"
+	fi
+}
+
+tpm_cmd() {
+	case ${1:-} in
+		'')
+			bank_line
+			[[ -e /dev/tpmrm0 && -x $ASSH ]] || return 0
+			"$ASSH" tpm sha1 --config "$ASSH_CONF" 2>/dev/null | sed 's/^/  /' || true
+			"$ASSH" tpm da --config "$ASSH_CONF" 2>/dev/null | sed 's/^/  /' || echo "  (the dictionary attack state: as root)"
+			;;
+		sha1)
+			[[ ${2:-} == on || ${2:-} == off ]] || die "tpm sha1 needs on or off"
+			need_root tpm sha1 "$2"
+			need_assh
+			local b
+			b=$(banks)
+			if [[ $2 == on ]]; then
+				"$ASSH" tpm sha1 --config "$ASSH_CONF" --allow || die "allowing SHA-1 failed"
+				if [[ " $b" == *" sha256 "* ]]; then
+					log "SHA-1 is allowed, and changes nothing here: this TPM has the SHA-256 bank active (${b% })"
+				else
+					warn "SHA-1 is the weaker hash: the machine-id and the host key are bound to SHA-1 PCR values"
+					log "SHA-1 is allowed: from the next boot the machine-id and the host key use it (the first boot with Secure Boot on gives the machine-id; then sudo safespace identity create)"
+				fi
+			else
+				"$ASSH" tpm sha1 --config "$ASSH_CONF" --forbid || die "forbidding SHA-1 failed"
+				[[ " $b" == *" sha256 "* ]] || log "SHA-1 is forbidden: from the next boot this machine has no identity (its TPM has the SHA-1 bank only)"
+			fi
+			;;
+		unlock)
+			need_root tpm unlock
+			need_assh
+			local lockout=""
+			read_secret lockout "$LOCKOUT_FD" "lockout authorization"
+			assh_with lockout tpm da --config "$ASSH_CONF" --lockout-auth-fd 3 --reset || die "ending the lockout failed"
+			lockout=""
+			;;
+		*) die "unknown: tpm $1 (sha1 on|off, unlock)" ;;
+	esac
+}
+
+# --- the identity --------------------------------------------------------------------
+# The slot that certified this boot's host key ("" for none), from the agent's
+# status (readable without root).
+STATUS=/run/assh/status
+certified_slot() {
+	[[ -s $CERT ]] || return 0
+	sed -n 's/^slot=\([0-9]*\)$/\1/p' "$STATUS" 2>/dev/null
+}
+
+identity_show() {
+	if [[ -e $EFIVARS/SafespaceIdMachine-$SELECT_GUID ]]; then
+		if grep -qx SafespaceIdMachine /run/safespace/identity/released 2>/dev/null; then
+			echo "machine-id:    the machine's (released in this combination); inventory ID $(systemd-id128 machine-id --app-specific=$APP_ID)"
+		else
+			echo "machine-id:    throwaway (the machine's is sealed to another combination)"
+		fi
+	else
+		echo "machine-id:    throwaway (none sealed yet: the first boot with Secure Boot on creates it)"
+	fi
+	if [[ ! -e $CA_VAR ]]; then
+		echo "identity:      none yet: sudo safespace identity create"
+	else
+		echo "identity:      the CA in this TPM (SAFEasshCA):"
+		"$ASSH" ca show --config "$ASSH_CONF" 2>&1 | sed 's/^/  /'
+	fi
+	local slot fp
+	fp=$(ssh-keygen -lf "$HOSTPUB" 2>/dev/null | cut -d' ' -f2) || true
+	slot=$(certified_slot)
+	if [[ -n $slot ]]; then
+		echo "this boot:     host key ${fp:-?}, certified by the CA through slot $slot"
+		[[ $slot == 0 ]] || echo "               (slot 0 is not met: after an update, sudo safespace identity approve)"
+	elif [[ -s $HOSTPUB ]]; then
+		echo "this boot:     host key ${fp:-?} TEMPORARY (not certified: compare its fingerprint before trusting it)"
+		if [[ -e $CA_VAR ]]; then
+			echo "               (another combination, or Secure Boot changed: sudo safespace identity move to have the identity here)"
+		fi
+	else
+		echo "this boot:     no host key of aSSH (no TPM 2.0: a throwaway key)"
+	fi
+}
+
+# What every change of the identity needs: root, aSSH, the TPM, the variables
+# writable; Secure Boot on (the approved state holds PCR 7) and this boot's state
+# recorded by the agent.
+identity_prepare() {
+	need_root identity
+	need_assh
+	efivars_rw
+	local setup sb
+	setup=$(var_byte SetupMode) sb=$(var_byte SecureBoot)
+	[[ $setup == 0 && $sb == 1 ]] ||
+		die "Secure Boot is not on (SetupMode=${setup:-?} SecureBoot=${sb:-?}): seal first, switch it on, boot again"
+	[[ -s $STATE ]] || die "the agent recorded no state this boot ($STATE: systemctl status assh-agent)"
+}
+
+identity_create() {
+	local name pin="" lockout=""
+	name=$(booted)
+	[[ ! -e $CA_VAR ]] || die "this machine has an identity already (safespace identity); sudo safespace identity move moves it here"
+	if "$ASSH" tpm da --config "$ASSH_CONF" 2>&1 | grep -q "no lockout authorization"; then
+		log "the TPM has no lockout authorization: set one now. It ends a PIN lockout and clears the TPM: keep it off this machine"
+		read_secret lockout "$LOCKOUT_FD" "new lockout authorization" new
+		assh_with lockout tpm da --config "$ASSH_CONF" --new-lockout-auth-fd 3 \
+			--max-tries 3 --recovery 1800 --lockout-recovery 1800 || die "setting the lockout authorization failed"
+		lockout=""
+	else
+		log "the TPM's lockout authorization is set already: kept"
+	fi
+	log "the identity's PIN: 3 wrong entries lock it for 30 minutes"
+	read_secret pin "$PIN_FD" "new PIN" new
+	assh_with pin ca create --config "$ASSH_CONF" --pin-fd 3 >/dev/null || die "creating the CA failed"
+	assh_with pin ca approve --config "$ASSH_CONF" --values "$STATE" --pin-fd 3 || die "approving this state failed"
+	pin=""
+	log "this machine's identity is created, for $name. The next boot certifies its host key; until then sshd serves the temporary one."
+	"$ASSH" ca show --config "$ASSH_CONF" | sed -n '/known_hosts line/,+1p'
+}
+
+identity_approve() {
+	local slot pin=""
+	[[ -e $CA_VAR ]] || die "no identity yet: sudo safespace identity create"
+	slot=$(certified_slot)
+	[[ -n $slot ]] || die "this boot was not certified: another combination, or a Secure Boot change - sudo safespace identity move"
+	[[ $slot != 0 ]] || { log "this boot was certified through slot 0: nothing to approve"; return; }
+	read_secret pin "$PIN_FD" "PIN"
+	assh_with pin ca approve --config "$ASSH_CONF" --values "$STATE" --pin-fd 3 || die "approving this state failed"
+	pin=""
+	log "this state of $(booted) is approved: the next boot certifies through slot 0"
+}
+
+# NAME from this boot: NAME's state approved ahead, the machine-id carried, NAME
+# selected (identity_prepare checked the rest).
+move_to() { # NAME
+	local to=$1 name mid="" pin=""
+	name=$(booted)
+	check_name "$to"
+	confirm "Move this machine's identity to '$to'? Every other combination loses it, $name too."
+	read_secret pin "$PIN_FD" "PIN"
+	assh_with pin ca approve --config "$ASSH_CONF" --values "$STATE" \
+		--events "15:safespace-combination:$to" --events "15:safespace-identity:sealed" --next-generation --pin-fd 3 ||
+		die "approving $to's state failed"
+	pin=""
+	# The machine-id moves with it, where it is released in this boot.
+	if grep -qx SafespaceIdMachine /run/safespace/identity/released 2>/dev/null; then
+		mid=$(cat /run/safespace/identity/machine-id)
+	fi
+	sel_var_rm SafespaceAssignId
+	[[ -z $mid ]] || sel_var_write SafespaceAssignId "$mid" || die "could not write SafespaceAssignId"
+	sel_var_write SafespaceAssign "$to" || die "could not write SafespaceAssign"
+	select_write "$to"
+	if [[ -n $mid ]]; then
+		log "the identity is $to's: every approval before is revoked. Reboot: $to's next boot is certified and keeps this machine-id"
+	else
+		log "the identity is $to's: every approval before is revoked. Reboot: $to's next boot is certified, with a new machine-id (the machine's is not released in this boot)"
+	fi
+}
+
+identity_move() { # [NAME]
+	local to=${1:-} name pin=""
+	name=$(booted)
+	[[ -e $CA_VAR ]] || die "no identity yet: sudo safespace identity create"
+	# Certified here, no name: the preselected combination.
+	if [[ -z $to && -n $(certified_slot) ]]; then
+		to=$(sel_var SafespaceSelect)
+		[[ -n $to ]] || to=$FIRST
+	fi
+	if [[ -n $to && $to != "$name" ]]; then
+		move_to "$to"
+		return
+	fi
+	[[ -z $(certified_slot) ]] || die "this boot was certified: $name holds the identity already (after an update: sudo safespace identity approve; to another combination: sudo safespace select NAME)"
+	confirm "Move this machine's identity to '$name'? Every other combination loses it."
+	read_secret pin "$PIN_FD" "PIN"
+	assh_with pin ca approve --config "$ASSH_CONF" --values "$STATE" --next-generation --pin-fd 3 || die "approving this state failed"
+	pin=""
+	# The machine-id follows, at the next boot (the initrd seals a new one for
+	# $name), and $name stays the combination booted.
+	sel_var_rm SafespaceAssignId
+	sel_var_write SafespaceAssign "$name" || die "could not write SafespaceAssign"
+	select_write "$name"
+	log "the identity is $name's: every approval before is revoked. Reboot: the next boot certifies, and gets the machine-id"
+}
+
+identity_clear() {
+	need_root identity clear
+	need_assh
+	efivars_rw
+	confirm "Remove this machine's identity (the CA, its PIN, the machine-id)? Clients that trust the CA will refuse it."
+	"$ASSH" ca remove --config "$ASSH_CONF" || die "removing the CA failed"
+	local v
+	for v in SafespaceIdMachine SafespaceAssign SafespaceAssignId; do
+		sel_var_rm "$v" || die "could not remove $v"
+	done
+	log "the identity is removed. sshd serves the temporary key; from the next boot with Secure Boot on the machine has a new machine-id. A new identity: sudo safespace identity create"
+}
+
+identity_pin() {
+	need_root identity pin
+	need_assh
+	[[ -e $CA_VAR ]] || die "no identity yet: sudo safespace identity create"
+	local old="" new=""
+	read_secret old "$PIN_FD" "PIN"
+	read_secret new "$NEW_PIN_FD" "new PIN" new
+	"$ASSH" ca pin --config "$ASSH_CONF" --pin-fd 3 --new-pin-fd 4 3< <(printf '%s' "$old") 4< <(printf '%s' "$new") ||
+		die "changing the PIN failed"
+	old="" new=""
+	log "the PIN is changed: the old one opens nothing any more"
+}
+
+identity_cmd() {
+	case ${1:-} in
+		'') identity_show ;;
+		create) identity_prepare; identity_create ;;
+		approve) identity_prepare; identity_approve ;;
+		move) identity_prepare; identity_move "${2:-}" ;;
+		clear) identity_clear ;;
+		pin) identity_pin ;;
+		*) die "unknown: identity $1 (create, approve, move [NAME], clear, pin)" ;;
+	esac
+}
+
+# --- the overview --------------------------------------------------------------------
+overview() {
+	select_show
+	local setup sb
+	setup=$(var_byte SetupMode) sb=$(var_byte SecureBoot)
+	if [[ $setup == 1 ]]; then
+		echo "Secure Boot:   Setup Mode: not sealed (sudo safespace seal)"
+	elif [[ $sb == 1 ]]; then
+		echo "Secure Boot:   on (sealed)"
+	else
+		echo "Secure Boot:   off"
+	fi
+	bank_line
+	identity_show
+}
+
+case ${1:-} in
+	'') overview ;;
+	select) shift; select_cmd "$@" ;;
+	seal) seal_cmd ;;
+	identity) shift; identity_cmd "$@" ;;
+	tpm) shift; tpm_cmd "$@" ;;
+	*) die "unknown command $1 (safespace --help)" ;;
+esac

@@ -24,18 +24,18 @@ and over the network; the initrd tells them apart at boot:
 | Gets to the machines | `sudo ./burn.sh /dev/sdX` (on the build host, or anywhere from a distribution server) | `./release.sh` to the distribution servers |
 
 Everything else is identical: combinations, users, hardening, volatile `/var`, Secure Boot
-signature and `safespace-seal`. **[NETBOOT.md](NETBOOT.md)** is the in-depth reference for
+signature and `safespace seal`. **[NETBOOT.md](NETBOOT.md)** is the in-depth reference for
 network boot (trust model, other DHCP servers, firmware, troubleshooting);
 **[AGENTS.md](AGENTS.md)** is the guide for working on this repository.
 
 > **Status:** stick boot tested in QEMU (OVMF, stick on emulated USB): boots with and without
 > enforced Secure Boot; dm-verity verified, stick read-only at block level; sealing with
-> `safespace-seal` (append and `--replace`) and booting the sealed VM. Boots on one real
+> `safespace seal` (append and `--replace`) and booting the sealed VM. Boots on one real
 > machine (Secure Boot in Setup Mode). Network boot tested end to end in QEMU and libvirt
 > (OVMF, no disk attached) and on a ThinkPad T450s over PXE/TFTP (Intel AMT disabled); UEFI
 > HTTP boot on real hardware is not tested yet. The single build that serves both paths is
 > booted in QEMU both ways (stick, UEFI HTTP from a distribution server), sealed with
-> `safespace-seal` and with enforced Secure Boot; not yet on real hardware (see "Known open
+> `safespace seal` and with enforced Secure Boot; not yet on real hardware (see "Known open
 > points"). Everything that runs without root is covered by `tests/run.sh`.
 
 ## Two roles: build host and distribution servers
@@ -171,7 +171,7 @@ Firmware setup: UEFI only, network stack and HTTP boot on, Secure Boot in Setup 
 log in with an ssh key from `users.conf`, then:
 
 ```sh
-sudo safespace-seal          # enrolls the keys the image is signed with; then reboot
+sudo safespace seal          # enrolls the keys the image is signed with; then reboot
 ```
 
 From then on it boots only images signed with your keys. Details:
@@ -186,7 +186,7 @@ A group is what goes into a root on top of the base system:
 
 | Group | What it adds | Where it is defined |
 |---|---|---|
-| `base` (always) | kernel (no Wi-Fi, Bluetooth or NVIDIA drivers), firmware for Intel, AMD GPUs and Realtek NICs (see below), Intel and AMD microcode, systemd, openssh, sudo, nftables, usbguard, cryptsetup, btrfs-progs, efitools + openssl (`safespace-seal`), vim, tmux, qemu-guest-agent; users, ssh, hardening, volatile `/var` | `mkosi.conf`, `mkosi.extra/` |
+| `base` (always) | kernel (no Wi-Fi, Bluetooth or NVIDIA drivers), firmware for Intel, AMD GPUs and Realtek NICs (see below), Intel and AMD microcode, systemd, openssh, sudo, nftables, usbguard, cryptsetup, btrfs-progs, efitools + openssl (`safespace seal`), vim, tmux, qemu-guest-agent; users, ssh, hardening, volatile `/var` | `mkosi.conf`, `mkosi.extra/` |
 | `docker` | Docker and containerd with their storage on a data disk at `/opt/docker`, the shipped images (`fetch-images.sh`) and their loader; users get the `docker` group. Docker is not started at boot (see [Docker](#docker)) | `mkosi.profiles/docker/` |
 | `xfce4-headless-vnc` | XFCE, TigerVNC on `localhost:5901` (through an ssh tunnel), firefox, vlc, gwenview, fonts, pulseaudio; VNC user and password (`safespace.env`) | `mkosi.profiles/xfce4-headless-vnc/` |
 | `debug` | diagnostic tools: ethtool, dmidecode, pciutils, usbutils, lshw, iperf3, tcpdump, kexec-tools | `mkosi.profiles/debug/` |
@@ -263,14 +263,21 @@ that pair is opened.
 
 Without any `safespace.root.<name>=` on the command line the initrd opens nothing.
 
-On the machine (root):
+On the machine, one command, `safespace` (`safespace --help`):
 
 ```sh
-safespace-select                  # combinations of this build, the booted one, the preselection
-safespace-select set containers   # boot containers from the next boot on
-safespace-select once root        # next boot only
-safespace-select clear            # back to the first combination
+safespace                              # the overview: combinations, Secure Boot, TPM, identity
+safespace select                       # combinations of this build, the booted one, the preselection
+sudo safespace select containers       # boot containers from the next boot on
+sudo safespace select root --once      # next boot only
+sudo safespace select --default        # back to the first combination
 ```
+
+With a machine identity, `select NAME` and `--default` move it along to the combination
+chosen (`safespace identity move NAME`, the PIN): only when the move succeeds is it selected.
+A wrong PIN or a lockout selects nothing - try again, or remove the identity first
+(`safespace identity clear`). `--once` moves nothing: that boot gets aSSH's temporary
+host key (`debug` for a look around, say).
 
 **Which root is booted** is visible on the machine: every root names itself at build time
 (`mkosi.postinst`), so the name is that of the verified root, not of the selection.
@@ -280,12 +287,12 @@ Arch's), shown by systemd's "Welcome to …", the console login banner (`/etc/is
 `hostnamectl`; `/usr/lib/safespace/combination` holds the name alone. The initrd is common to
 all combinations and keeps Arch's name.
 
-So a machine is sealed once on the default (`safespace-seal`), then preselected. The variable
+So a machine is sealed once on the default (`safespace seal`), then preselected. The variable
 only **names** a combination; its root hash always comes from the signed command line, so
 whoever can write the variable (root on the machine, or the firmware setup without a
 password) can choose between the signed roots, never boot an unsigned one. An unknown name
 stops the boot with a message instead of falling back silently: renaming a combination in
-`combinations.conf` stops machines preselected to the old name (`safespace-select clear`
+`combinations.conf` stops machines preselected to the old name (`safespace select --default`
 before the update). The choice is measured into the TPM (PCR 15): only the combination a
 sealed machine belongs to gets its identity ([Machine identity](#machine-identity)).
 
@@ -316,7 +323,7 @@ echo 'Environment=SAFESPACE_SBCTL_CONFIG=/var/lib/safespace/sbctl/sbctl.conf' >>
 
 `build.sh` then signs the UKI and systemd-boot with that set's db key, and **exports the
 public part into every image** (`mkosi.extra/usr/share/safespace/secureboot/`, gitignored):
-the PK, KEK and db certificates, the GUID, and the signed updates `safespace-seal` writes into
+the PK, KEK and db certificates, the GUID, and the signed updates `safespace seal` writes into
 the firmware — `PK.auth`, `KEK.auth`, `db.auth` (replace) and `KEK-append.auth`,
 `db-append.auth` (append; signed with `APPEND_WRITE`). The private keys are only used to sign
 those (PK signs PK and KEK, KEK signs db) and never leave the key directory.
@@ -602,8 +609,9 @@ lockdown, and none of what the roots leave out: Wi-Fi/Bluetooth/NVIDIA drivers a
 firmware packages but the selected ones (both microcode packages present), headers, docs, man
 pages, locales but en_US), and the machine identity on a software TPM. It touches no real
 user, key, build or server. Exit 0 only if every step passed. The test build has combinations
-of its own, `tests/vm.combinations.conf` (`build.sh --combinations`): `root`, `containers`,
-`debug`, few to keep it fast and independent of what `combinations.conf` builds for real.
+of its own, `tests/vm.combinations.conf` (`build.sh --combinations`): `root` (base) and
+`containers` (base, docker), few to keep it fast and independent of what `combinations.conf`
+builds for real.
 
 ```sh
 tests/vm.sh                          # build the whole stack, release, all steps
@@ -616,10 +624,10 @@ tests/vm.sh --no-build --jobs 2      # at most two VMs at a time
 | `release`, `server-verify`, `initrd-firmware` (always) | `release.sh` into the test's share, then `server/safespace-netboot verify` on it; the UKI's initrd | the checks a distribution server makes; the initrd carries the Realtek NIC firmware (`rtl_nic/`) |
 | `stick` | a stick assembled from the release (`lib/stick.sh`, as `burn.sh` writes it) | the first combination by its name, `usb-bootdev` opened the root, `netroot` did not run, `LoaderDevicePartUUID` set, the stick read-only, root `verified`, `running`, no failed units |
 | `net` | UEFI HTTP boot of the share | `netroot` opened the root, no `usb-bootdev`, no `LoaderDevicePartUUID`, `verified`, `running` |
-| `seal` | Setup Mode → `safespace-seal` → the sealed firmware | Secure Boot `enabled (user)`, `verified`, `running` |
+| `seal` | Setup Mode → `safespace seal` → the sealed firmware | Secure Boot `enabled (user)`, `verified`, `running` |
 | `net-sb` | network boot with enforced Secure Boot | Secure Boot enabled, `verified`, `running` |
-| `select` | on the sealed firmware, one VM, one boot after the other: no selection, `safespace-select set <second>`, `once <first>`, the second again (persistent), `clear`, the first again. Side by side, every further combination in a VM of its own: `SafespaceSelectOnce=<name>` written into a copy of the sealed variables (`virt-fw-vars`) | the booted combination's name (the initrd's choice, `/usr/lib/safespace/combination`, `PRETTY_NAME`, the login banner) and groups (`/usr/lib/safespace/groups`; the docker command exactly with the docker group); a preset `SafespaceSelectOnce` deleted by the initrd; `debug` has exactly the default's setuid/setgid files, file capabilities and enabled units; each Secure Boot enabled and `verified` |
-| `identity` | on a TPM of its own (swtpm, `test-vm.sh --tpm`) and a copy of the sealed firmware, the creation and the certified boot first, then each further case side by side on a copy of their TPM and variables, with a client that trusts only the CA (`@cert-authority`, `StrictHostKeyChecking yes`): the first sealed boot and `safespace-seal --identity-create` in it, the default again, `debug` once, over the network, an option ROM more (PCR 2), another db certificate (PCR 7), `--move` to `containers`, the default afterwards, the agent failing; beside them a new TPM with the SHA-1 bank only (`--tpm-banks sha1`): not allowed, `--sha1 on`, the creation, certified, `--sha1 off` | first boot: machine-id created, aSSH's temporary key, the client refused, the identity created; the default again: certified through slot 0, the client logs in, `--identity` says so, an agent restart gets no certificate (window closed; sshd restarts with it, the first state is kept), its root can't unseal the machine-id (also not after extending PCR 15); `debug`: temporary key, nothing released, `--approve` refused; network: slot 1 (PCR 0 differs in QEMU), `--approve`; PCR 2: slot 1, `--approve`, slot 0; PCR 7: temporary; moved: certified in `containers` with a new machine-id, 3 wrong PINs lock out, the default then temporary; the agent failing: the throwaway key, the reason on the console; SHA-1 only: without `--sha1 on` no machine-id and the temporary key (nothing recorded), with it the machine-id, the creation and slot 0, after `--sha1 off` neither ([Machine identity](#machine-identity)) |
+| `select` | on the sealed firmware, one VM, one boot after the other: no selection, `safespace select <second>`, `once <first>`, the second again (persistent), `clear`, the first again. Side by side, every further combination in a VM of its own: `SafespaceSelectOnce=<name>` written into a copy of the sealed variables (`virt-fw-vars`) | the booted combination's name (the initrd's choice, `/usr/lib/safespace/combination`, `PRETTY_NAME`, the login banner) and groups (`/usr/lib/safespace/groups`; the docker command exactly with the docker group); a preset `SafespaceSelectOnce` deleted by the initrd; `debug` has exactly the default's setuid/setgid files, file capabilities and enabled units; each Secure Boot enabled and `verified` |
+| `identity` | on a TPM of its own (swtpm, `test-vm.sh --tpm`) and a copy of the sealed firmware, the creation and the certified boot first, then each further case side by side on a copy of their TPM and variables, with a client that trusts only the CA (`@cert-authority`, `StrictHostKeyChecking yes`): the first sealed boot and `safespace identity create` in it, the default again, `containers` once, over the network, an option ROM more (PCR 2), another db certificate (PCR 7), `safespace identity move` to `containers`, the default afterwards, the agent failing; beside them a new TPM with the SHA-1 bank only (`--tpm-banks sha1`): not allowed, `safespace tpm sha1 on`, the creation, certified, `safespace tpm sha1 off` | first boot: machine-id created, aSSH's temporary key, the client refused, the identity created; the default again: certified through slot 0, the client logs in, `safespace identity` says so, an agent restart gets no certificate (window closed; sshd restarts with it, the first state is kept), its root can't unseal the machine-id (also not after extending PCR 15); `containers`: temporary key, nothing released, `safespace identity approve` refused; network: slot 1 (PCR 0 differs in QEMU), `safespace identity approve`; PCR 2: slot 1, `safespace identity approve`, slot 0; PCR 7: temporary; moved: certified in `containers` with a new machine-id, 3 wrong PINs lock out, the default then temporary; the agent failing: the throwaway key, the reason on the console; SHA-1 only: without `safespace tpm sha1 on` no machine-id and the temporary key (nothing recorded), with it the machine-id, the creation and slot 0, after `safespace tpm sha1 off` neither ([Machine identity](#machine-identity)) |
 
 **Kept apart from everything real**, in `mkosi.test/vm/` (gitignored): the test user
 `tester` and its key (created on the first run, used for nothing else), the test builds
@@ -668,7 +676,7 @@ the signed UKI from the server, no disk, no iPXE. Two forms, both tested: a plai
 Common to both:
 
 - **Firmware:** OVMF with Secure Boot and **no** enrolled keys, so the VM starts in Setup
-  Mode; `sudo safespace-seal` inside seals it, and from the next start on it boots the UKI only
+  Mode; `sudo safespace seal` inside seals it, and from the next start on it boots the UKI only
   with enforced Secure Boot. Its NVRAM (a file of its own) keeps that state. With enrolled
   keys, libvirt's Secure Boot firmware would trust only Microsoft's and refuse the UKI.
 - **PXE off in the firmware:** OVMF creates PXEv4, PXEv6, HTTPv4 and HTTPv6 boot entries for
@@ -705,7 +713,7 @@ echo '{"execute":"guest-network-get-interfaces"}' | socat - UNIX-CONNECT:safespa
 | Part | Why |
 |---|---|
 | `OVMF_CODE.secboot.4m.fd` (read-only pflash) | the UEFI firmware, shared by all VMs; the build with Secure Boot |
-| `safespace-vm-vars.fd` (writable pflash) | this VM's NVRAM: boot entries and the Secure Boot keys `safespace-seal` writes. A fresh copy = Setup Mode again |
+| `safespace-vm-vars.fd` (writable pflash) | this VM's NVRAM: boot entries and the Secure Boot keys `safespace seal` writes. A fresh copy = Setup Mode again |
 | `smm=on`, `cfi.pflash01,property=secure` | only the firmware (in SMM) may write the keys, not the guest |
 | `-fw_cfg name=opt/org.tianocore/IPv4PXESupport,string=n` (and IPv6) | no PXE boot entries: HTTP boot right away |
 | `-nic user,…,bootfile=` | QEMU's user network is the DHCP server, `bootfile=` is its option 67 (the server's IP, so the firmware needs no DNS) |
@@ -862,7 +870,7 @@ network alike), see [Secure Boot keys](#secure-boot-keys).
 
 1. Firmware setup: "Reset to Setup Mode" or "Clear Secure Boot keys". Boot the stick (Secure
    Boot can't be enforced without keys, so it boots).
-2. `sudo safespace-seal`: shows what's enrolled now and what will be enrolled, asks for YES,
+2. `sudo safespace seal`: shows what's enrolled now and what will be enrolled, asks for YES,
    writes db, KEK and finally PK (writing PK ends Setup Mode).
 3. Reboot, check that Secure Boot is enabled in the firmware setup, and set a firmware
    password.
@@ -870,14 +878,14 @@ network alike), see [Secure Boot keys](#secure-boot-keys).
 By default our KEK and db are **added** to whatever the firmware still has, so Microsoft or
 vendor certificates stay if present. Option ROMs of GPUs, NICs or RAID controllers are usually
 signed by Microsoft, and without that certificate in db they don't load: no picture in the
-firmware setup, or a machine that doesn't boot. `safespace-seal --replace` enrolls **only**
+firmware setup, or a machine that doesn't boot. `safespace seal --replace` enrolls **only**
 our keys. Use it only on machines without such devices, e.g. integrated graphics only.
 
-Try it in a VM: `./test-vm.sh --setup-mode --ssh 2222`, log in, `sudo safespace-seal`, power
+Try it in a VM: `./test-vm.sh --setup-mode --ssh 2222`, log in, `sudo safespace seal`, power
 off, then `./test-vm.sh --sealed`.
 
 A netbooted machine can seal itself the same way: boot it in Setup Mode (no keys, so the
-unverified UKI loads), run `sudo safespace-seal`, reboot — from then on the firmware
+unverified UKI loads), run `sudo safespace seal`, reboot — from then on the firmware
 verifies the downloaded UKI against your `db`. See
 [NETBOOT.md](NETBOOT.md#secure-boot-on-the-clients).
 
@@ -896,30 +904,42 @@ same across reboots and updates of that combination. The host key is
 
 - **Updates** of the combination keep the identity. After one (or a firmware update, a new
   option ROM) the CA still certifies through its second slot (Secure Boot state and the
-  combination); `sudo safespace-seal --approve` (PIN) approves the new state in the first.
+  combination); `sudo safespace identity approve` (PIN) approves the new state in the first.
   The same for a second boot path: in QEMU a network boot differs from the stick boot in PCR
-  0, so a machine that boots both ways runs `--approve` once in each.
+  0, so a machine that boots both ways runs `safespace identity approve` once in each.
 - **Another combination** boots normally, with aSSH's temporary host key (made in the TPM,
   not certified, its fingerprint in the journal) and a throwaway machine-id: clients that
   trust only the CA refuse it. Moving the identity there takes the PIN, and takes it from
-  the old combination: `sudo safespace-seal --move NAME` from a boot of the current one.
+  the old combination: `sudo safespace identity move NAME` from a boot of the current one.
 - **The PIN** opens a key in the TPM that approves states; 3 wrong entries lock it for 30
   minutes. The TPM's **lockout authorization** (set at the creation, asked twice) resets a
   lockout and clears the TPM: keep it off the machine, in your password manager.
 
 | Command (on the machine) | Does |
 |---|---|
-| `sudo safespace-seal --identity-create` | the first identity, for the combination booted (Secure Boot on): sets the lockout authorization if the TPM has none, asks a new PIN, creates the CA, approves this boot's state, prints the `@cert-authority` line. sshd serves the temporary key until the reboot; the next boot certifies |
-| `safespace-seal --identity` | the combination, the machine-id, the CA with its approvals and the `@cert-authority` line, this boot's host key: certified through which slot, or temporary |
-| `sudo safespace-seal --approve` | after an update (certified through slot 1): approves this state in every slot (PIN) |
-| `sudo safespace-seal --sha1 on\|off` | allows SHA-1 on a TPM whose firmware activates no SHA-256 PCR bank (T450s), or forbids it again: the machine-id and the host key use it from the next boot, only while it is on. Elsewhere it changes nothing ([SECURITY.md](SECURITY.md#the-sha-1-bank)) |
-| `sudo safespace-seal --move NAME` | from the current boot, without booting NAME first: approves NAME's state (this boot's PCR 0, 2, 7, 11; PCR 15 as NAME's initrd leaves it) with the PIN, revokes every approval before, carries the machine-id (when it is released in this boot) and selects NAME. The next boot is NAME's, certified, with the same machine-id |
-| `sudo safespace-seal --move` | in a boot with the temporary key: moves the identity to the combination booted (PIN), revokes every approval before; a new machine-id at the next boot. For a Secure Boot key change (PCR 7) in the same combination, or a boot `--move NAME` was not run from |
-| `sudo safespace-seal --identity-clear` | removes the identity (YES): the CA, its PIN index and counter in the TPM, the machine-id slot; the lockout authorization and `--sha1` stay. `--identity-create` makes a new one, with a new `@cert-authority` line |
+| `sudo safespace identity create` | the first identity, for the combination booted (Secure Boot on): sets the lockout authorization if the TPM has none, asks a new PIN, creates the CA, approves this boot's state, prints the `@cert-authority` line. sshd serves the temporary key until the reboot; the next boot certifies |
+| `safespace identity` | the combination, the machine-id, the CA with its approvals and the `@cert-authority` line, this boot's host key: certified through which slot, or temporary |
+| `sudo safespace identity approve` | after an update (certified through slot 1): approves this state in every slot (PIN) |
+| `sudo safespace tpm sha1 on\|off` | allows SHA-1 on a TPM whose firmware activates no SHA-256 PCR bank (T450s), or forbids it again: the machine-id and the host key use it from the next boot, only while it is on. Elsewhere it changes nothing ([SECURITY.md](SECURITY.md#the-sha-1-bank)) |
+| `sudo safespace select NAME` | with an identity, `identity move NAME` below: NAME selected only when the move succeeded |
+| `sudo safespace identity move NAME` | from the current boot, without booting NAME first: approves NAME's state (this boot's PCR 0, 2, 7, 11; PCR 15 as NAME's initrd leaves it) with the PIN, revokes every approval before, carries the machine-id (when it is released in this boot) and selects NAME. The next boot is NAME's, certified, with the same machine-id |
+| `sudo safespace identity move` | in a boot with the temporary key: moves the identity to the combination booted (PIN), revokes every approval before; a new machine-id at the next boot. For a Secure Boot key change (PCR 7) in the same combination, or a boot `safespace identity move NAME` was not run from |
+| `sudo safespace identity clear` | removes the identity (YES): the CA, its PIN index and counter in the TPM, the machine-id slot; the lockout authorization and SHA-1 stay. `safespace identity create` makes a new one, with a new `@cert-authority` line |
+| `sudo safespace identity pin` | changes the PIN: the old one, then the new one twice |
+| `safespace tpm` | the PCR banks, SHA-1, the dictionary attack state (as root) |
+| `sudo safespace tpm unlock` | ends a PIN lockout, with the lockout authorization |
+
+**What a boot's identity is**, shown, never decided by: after a login, a line in the
+identity's colour, and the prompt `pix@safespace[containers]:~$` with the hostname in it -
+green certified through slot 0 (approved exactly), yellow through slot 1 (firmware or system
+changed since the approval: `safespace identity approve`), red with a temporary or
+throwaway key (`/etc/profile.d/safespace-status.sh`, from aSSH's `/run/assh/status`). A
+client sees the slot in the certificate's key ID (`ssh -v`: `ID "safespace slot=1
+pcrs=7,15"`). Whatever must rely on the state checks it itself (an unlock the TPM binds).
 
 The CA's file is the EFI variable `SAFEasshCA` (nothing secret in it: the TPM checks every
 approval). The identity is lost when the TPM is cleared or the firmware's variables are wiped:
-`--identity-create` again, and the clients need the new line. Machines without a TPM 2.0,
+`safespace identity create` again, and the clients need the new line. Machines without a TPM 2.0,
 and any boot where aSSH can't start, get a throwaway ed25519 host key (new on every boot):
 ssh stays reachable, and the console says `ssh host key: THROWAWAY (...)` with the reason
 (`journalctl -b -u assh-agent`). Details, measures and tests:
@@ -930,24 +950,24 @@ ssh stays reachable, and the console says `ssh host key: THROWAWAY (...)` with t
 In QEMU, with a stick image of a build (`tests/vm.sh` makes one; `./burn.sh` for a real stick):
 
 ```bash
-./test-vm.sh --setup-mode --tpm --ssh 2222   # sudo safespace-seal, power off
+./test-vm.sh --setup-mode --tpm --ssh 2222   # sudo safespace seal, power off
 ./test-vm.sh --sealed --tpm --ssh 2222       # first sealed boot: machine-id created
-ssh -p 2222 you@127.0.0.1 sudo safespace-seal --identity-create   # PIN, lockout auth.; prints the line
+ssh -p 2222 you@127.0.0.1 sudo safespace identity create   # PIN, lockout auth.; prints the line
 #   put the line into ~/.ssh/known_hosts as "@cert-authority [127.0.0.1]:2222 ecdsa-sha2-nistp256 AAAA..."
 #   power off, boot again (--sealed --tpm): ssh -o StrictHostKeyChecking=yes -p 2222 you@127.0.0.1
 ```
 
 A TPM like the T450s's, with the SHA-1 bank only: `--tpm-banks sha1` instead of `--tpm` (on
-a new work directory); `sudo safespace-seal --sha1 on` and a reboot before `--identity-create`.
+a new work directory); `sudo safespace tpm sha1 on` and a reboot before `safespace identity create`.
 
 On a T450s: the security chip must be a TPM 2.0 (booted, `ls /dev/tpmrm0`; if not, look at
-the firmware setup's security chip settings), seal with the stick (`sudo safespace-seal` in Setup Mode, then Secure Boot
-on), boot it once sealed, then `sudo safespace-seal --identity-create` and reboot. Its firmware
-activates the TPM's SHA-1 bank only (`safespace-seal --identity`: "PCR bank: none ..."): first
-`sudo safespace-seal --sha1 on` and a reboot, which also gives it the machine-id. Check:
-`safespace-seal --identity` says "certified by the CA through slot 0", and a client with only
-the `@cert-authority` line logs in. Then: another combination (`safespace-select once NAME`) is
-refused by that client; an update keeps the login (slot 1 until `--approve`).
+the firmware setup's security chip settings), seal with the stick (`sudo safespace seal` in Setup Mode, then Secure Boot
+on), boot it once sealed, then `sudo safespace identity create` and reboot. Its firmware
+activates the TPM's SHA-1 bank only (`safespace identity`: "PCR bank: none ..."): first
+`sudo safespace tpm sha1 on` and a reboot, which also gives it the machine-id. Check:
+`safespace identity` says "certified by the CA through slot 0", and a client with only
+the `@cert-authority` line logs in. Then: another combination (`safespace select NAME --once`) is
+refused by that client; an update keeps the login (slot 1 until `safespace identity approve`).
 
 ## Docker
 
@@ -1010,7 +1030,7 @@ combination's groups as `--profile=<group>`).
 | `Format=disk`, `Bootable=yes` | bootable GPT image |
 | `Bootloader=systemd-boot` | mkosi's default for this setup would be a bare UKI as `\EFI\BOOT\BOOTX64.EFI`. Some firmware resets when its boot manager starts a 90 MiB UKI directly, but loads it fine for systemd-boot (see "Troubleshooting") |
 | `ElTorito=no` | mkosi 27 adds an ISO9660/El Torito header for CD boot by default; a stick boots via GPT |
-| `SecureBoot=yes`, `SecureBootKey`/`Certificate` from `/var/lib/sbctl`, `SecureBootSignTool=systemd-sbsign`, `SecureBootAutoEnroll=no` | systemd-boot and the UKI are signed with the sbctl `db` key; no systemd-boot auto-enrollment files on the ESP (`safespace-seal` does enrollment) |
+| `SecureBoot=yes`, `SecureBootKey`/`Certificate` from `/var/lib/sbctl`, `SecureBootSignTool=systemd-sbsign`, `SecureBootAutoEnroll=no` | systemd-boot and the UKI are signed with the sbctl `db` key; no systemd-boot auto-enrollment files on the ESP (`safespace seal` does enrollment) |
 | `SignExpectedPcr=yes`, `SignExpectedPcrKey`/`Certificate` in `/var/lib/safespace/pcr-signing/` | the UKI carries signed expected PCR 11 values and the PCR public key (`.pcrsig`, `.pcrpkey`): systemd's NvPCRs can be set up, and TPM secrets can be bound to "a UKI signed by this host". Own key, created by `build.sh` on the first build (root-only, never in the image) |
 | `Verity=hash` | dm-verity root; the root hash is on the signed kernel command line, no signature partition needed |
 | `SplitArtifacts=uki,roothash,partitions`, `ManifestFormat=json` | the UKI, the root hash, the root and verity partitions as separate files, and the package list; `build.sh` keeps only these (plus systemd-boot and the partition table) and deletes the disk image |
@@ -1105,7 +1125,7 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 | Services | `system-preset/10-safespace.preset`: networkd, resolved, timesyncd, sshd, nftables, usbguard, var-factory; the groups add their own preset files |
 | Groups | `/usr/lib/safespace/groups`: the package groups of this image (written by `mkosi.postinst`) |
 | VM guest agent | `qemu/qemu-ga.conf`: `allow-rpcs=` reporting queries and `guest-shutdown` only; the agent starts via udev only in a VM with the agent channel |
-| Sealing | `safespace-seal`, plus the keys `build.sh` exports (`usr/share/safespace/secureboot/`) |
+| Sealing | `safespace seal`, plus the keys `build.sh` exports (`usr/share/safespace/secureboot/`) |
 | Locale | `etc/locale.gen` (en_US.UTF-8) |
 
 ### Tools around the build (not in the image)
@@ -1176,7 +1196,7 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 | Test in a VM (no root) | `./test-vm.sh` / `./test-vm.sh --secure-boot`, or `./test-vm.sh --netboot` (DHCP + HTTP boot, no disk; needs `qemu-desktop edk2-ovmf`, for Secure Boot `virt-firmware`) |
 | Machine does not boot the stick | `./hwtest-image.sh`, write `mkosi.test/hwtest.img` with `dd`, try the menu entries in order |
 | Burn / check (usb) | `sudo ./burn.sh [IMAGE\|URL] /dev/sdX`, `sudo ./diagnose.sh [--db-cert db.pem] /dev/sdX` |
-| Diagnostic tools on a machine | `sudo safespace-select once debug`, reboot (the combination `debug`) |
+| Diagnostic tools on a machine | `sudo safespace select debug --once`, reboot (the combination `debug`) |
 | Run the tests | `tests/run.sh` (no root; `tests/run.sh keys server` for single parts); `tests/vm.sh` (build, release, boots in QEMU) |
 | Delete old builds / the caches | `./build.sh prune` / `sudo ./build.sh purge-cache [--packages]` |
 

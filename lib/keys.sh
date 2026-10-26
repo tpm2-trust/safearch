@@ -3,7 +3,7 @@
 #
 #   keys_load SUMMARY_JSON   which keys this build uses (`mkosi --json summary`)
 #   keys_mkosi_args          mkosi options that point the signing at those keys
-#   keys_export OUT_DIR      public Secure Boot material for safespace-seal
+#   keys_export OUT_DIR      public Secure Boot material for safespace seal
 #   keys_ensure_pcr          create the PCR signing keys on the first build:
 #                            mkosi's (all boot phases) and the identity key
 #                            (enter-initrd only, lib/compose.sh)
@@ -18,7 +18,7 @@
 # Only file keys are supported: the .auth updates are signed with efitools
 # from the PK/KEK key files. (sbctl's own `enroll-keys --export auth` cannot
 # replace that: its --append export is signed for replacement, not for
-# APPEND_WRITE, so safespace-seal's default mode would be refused.) Keys on a
+# APPEND_WRITE, so safespace seal's default mode would be refused.) Keys on a
 # YubiKey (sbctl --*-keytype yubikey) are refused with a pointer to README.md,
 # "Secure Boot keys".
 #
@@ -83,7 +83,7 @@ keys_mkosi_args() {
 keys_fingerprint() { openssl x509 -in "$1" -noout -fingerprint -sha256 | cut -d= -f2; }
 
 # Every signed build ships the public half of the keys it is signed with, so
-# safespace-seal can enroll them on a machine in Setup Mode. Written anew on
+# safespace seal can enroll them on a machine in Setup Mode. Written anew on
 # every build, so the image can never carry the keys of another key set.
 #   PK.pem KEK.pem db.pem          certificates
 #   PK.auth KEK.auth db.auth       signed updates that replace the variable

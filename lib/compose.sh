@@ -98,7 +98,7 @@ compose_uki() { # OUT FIRST_UKI STUB CMDLINE
 	# Two PCR signing keys: mkosi's for every phase (first: its public key is the
 	# .pcrpkey systemd uses), the identity key for enter-initrd only. Both banks:
 	# SHA-1 for a TPM whose firmware activates nothing else (T450s), used there
-	# only where safespace-seal --sha1 allows it (initrd identity); a SHA-256 TPM
+	# only where safespace tpm sha1 allows it (initrd identity); a SHA-256 TPM
 	# seals to SHA-256, which no SHA-1 signature satisfies.
 	ukify build --efi-arch x64 --stub "$stub" --output "$out" \
 		--linux "$t/linux" --initrd "$t/initrd" --microcode "$t/ucode" \

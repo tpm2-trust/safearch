@@ -109,7 +109,7 @@ Nothing is installed on the machine itself, and the machine needs no local file.
 ## Build and release
 
 Once per build host: `users.conf` and `safespace.env`. The public Secure Boot keys for
-`safespace-seal` are exported by `build.sh` on every build. Then set the URL of the
+`safespace seal` are exported by `build.sh` on every build. Then set the URL of the
 distribution servers (`SERVER_URL` of their `server.conf` + `/`):
 
 ```sh
@@ -147,7 +147,7 @@ firmware loads the new `boot.efi`. If the image is refused although the server s
 this UKI's release, that is a real error and the boot stops (no reboot loop).
 
 **Which combination** (README "Combinations"): the initrd picks it (`safespace.select=`, the
-EFI variables set by `safespace-select`, else the first of `combinations.conf`) and downloads
+EFI variables set by `safespace select`, else the first of `combinations.conf`) and downloads
 only that root. Without `safespace.root.<name>=` on the signed command line it opens nothing.
 
 ## The distribution server
@@ -432,12 +432,12 @@ but the `db` certificate has to be on the machine. Three ways, all using the key
    Mode* / *Clear Secure Boot keys*. With no keys enrolled, Secure Boot cannot be
    enforced, so the machine netboots. Then on the machine:
    ```sh
-   sudo safespace-seal          # enrolls db, KEK, PK (see README, "Sealing")
+   sudo safespace seal          # enrolls db, KEK, PK (see README, "Sealing")
    ```
    Reboot, check that Secure Boot is on, set a firmware password. From now on the
    machine only boots UKIs signed with your `db` key — including the one it downloads.
 2. **Seal from a stick**: `sudo ./burn.sh /dev/sdX` (the same build), boot it
-   once per machine, `sudo safespace-seal`. Useful when netbooting in Setup Mode is not
+   once per machine, `sudo safespace seal`. Useful when netbooting in Setup Mode is not
    possible.
 3. **Enroll by hand in firmware setup**: most firmwares can load `db`/`KEK`/`PK` from a
    FAT medium. The files are in
@@ -447,7 +447,7 @@ but the `db` certificate has to be on the machine. Three ways, all using the key
 
 Notes:
 
-- `safespace-seal` **adds** your keys by default and keeps vendor/Microsoft
+- `safespace seal` **adds** your keys by default and keeps vendor/Microsoft
   certificates, so option ROMs of GPUs and NICs still load. That matters more here than
   for a stick: the NIC's own option ROM is what does HTTP boot. Do not use
   `--replace` on a machine that netboots through an add-in NIC.
@@ -535,7 +535,7 @@ host):
 
 ```sh
 ./test-vm.sh --netboot --url http://10.0.0.1/safespace/boot.efi --ssh 2222
-./test-vm.sh --netboot --url http://10.0.0.1/safespace/boot.efi --setup-mode --ssh 2222   # then safespace-seal inside, then --sealed
+./test-vm.sh --netboot --url http://10.0.0.1/safespace/boot.efi --setup-mode --ssh 2222   # then safespace seal inside, then --sealed
 ```
 
 A netbooting VM of its own (plain QEMU, or a persistent libvirt machine for virt-manager,
@@ -703,7 +703,7 @@ real system loads them from the root image.
   100 Mbit/s ~3 min. Many machines booting at once need the bandwidth on the server.
 - TFTP for the UKI is a fallback, not a plan: ~100 MiB over TFTP takes minutes.
 - One release per server: every machine of a server boots the same build; machine kinds
-  differ by the combination they select (`safespace-select`), all from the same release. A server only serves the newest release, but an old signed UKI or usb stick
+  differ by the combination they select (`safespace select`), all from the same release. A server only serves the newest release, but an old signed UKI or usb stick
   still boots on a sealed machine wherever someone kept a copy (and a server with its
   release).
 - Real hardware: a ThinkPad T450s (no HTTP boot) network-boots over PXE/TFTP only with

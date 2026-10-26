@@ -21,10 +21,10 @@
 #    unseal), written to the slot. When:
 #    - automatically, on the first boot with Secure Boot on (sealed) and no slot
 #      yet: the machine belongs to the combination it boots then;
-#    - SafespaceAssign=<name> (safespace-seal --move, after the PIN approved the
+#    - SafespaceAssign=<name> (safespace identity move, after the PIN approved the
 #      host key's move there) and <name> is what was measured. Another name:
 #      ignored. The variable is deleted either way. With it, SafespaceAssignId
-#      may carry the machine-id the machine had (--move from a boot where it was
+#      may carry the machine-id the machine had (safespace identity move from a boot where it was
 #      released): sealed here instead of a new one, so the machine-id survives the
 #      move; 32 hex digits, not all zero, else a new one. Deleted at every boot.
 #    A slot that exists but does not unseal (another combination) never leads
@@ -34,7 +34,7 @@
 #    which PID 1 takes over. A slot that does not unseal is left alone: the root
 #    then has a throwaway machine-id, as without an assignment.
 # On a TPM without an active SHA-256 bank (its firmware activates SHA-1 only:
-# ThinkPad T450s) 1 and 2 happen only while safespace-seal --sha1 on allows
+# ThinkPad T450s) 1 and 2 happen only while safespace tpm sha1 on allows
 # SHA-1: aSSH's NV index 0x01802914, the host key's alike. systemd-creds seals
 # to SHA-256 wherever that is active, and the UKI's PCR 11 is signed for both.
 # 3. Always, also on errors: extend PCR 15 with "safespace-identity:sealed", so
@@ -103,9 +103,9 @@ if [ ! -d "$TPM_SYSFS/pcr-sha256" ] && [ -d "$TPM_SYSFS/pcr-sha1" ]; then
 	attrs=$(echo "$pub" | sed -n '/^ *attributes:/,/^ *size:/s/^ *value: *//p')
 	size=$(echo "$pub" | sed -n 's/^ *size: *//p')
 	if [ "$attrs" = "$SHA1_ATTRS" ] && [ "$size" = 1 ]; then
-		msg "the TPM has the SHA-1 bank only, and SHA-1 is allowed (safespace-seal --sha1 on): the identity uses it"
+		msg "the TPM has the SHA-1 bank only, and SHA-1 is allowed (safespace tpm sha1 on): the identity uses it"
 	else
-		msg "the TPM has the SHA-1 bank only, and SHA-1 is not allowed: no identity this boot (sudo safespace-seal --sha1 on)"
+		msg "the TPM has the SHA-1 bank only, and SHA-1 is not allowed: no identity this boot (sudo safespace tpm sha1 on)"
 		var_rm SafespaceAssign
 		exit 0
 	fi

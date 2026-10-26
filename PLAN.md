@@ -17,6 +17,36 @@ T450s findings with usb/network aligned.
 
 ---
 
+# PLAN: one command, `safespace`
+
+Status: **confirmed 2026-10-26** (the user's choices: the verb `select`, the old commands
+replaced without aliases, implement now). Today a machine has `safespace-seal` (Secure Boot
+and the identity) and `safespace-select` (the combination), and `assh` for the rest (a PIN
+change, a lockout): confusing.
+
+```
+safespace                        overview: build, booted, preselected, Secure Boot, TPM, identity
+safespace select                 the combinations, booted, preselected
+safespace select NAME            NAME from the next boot on; with an identity it moves along (PIN)
+safespace select NAME --once     the next boot only; the identity stays
+safespace select --default       the first combination (moves like select NAME)
+safespace seal [--replace]       enroll the Secure Boot keys (Setup Mode)
+safespace identity               the CA, approvals, @cert-authority line, this boot's host key
+safespace identity create|approve|move [NAME]|clear|pin
+safespace tpm                    banks, SHA-1 flag, dictionary attack state
+safespace tpm sha1 on|off
+safespace tpm unlock             end a PIN lockout (lockout authorization)
+```
+
+- `--pin-fd N`, `--new-pin-fd N`, `--lockout-auth-fd N`, `--yes` wherever they apply; never a
+  secret in argv or the environment. The views work without root where they can.
+- One script, `/usr/local/sbin/safespace`, from today's two; what happens stays as it is,
+  `identity pin` (`assh ca pin`) and `tpm unlock` (`assh tpm da --reset`) are new.
+  `safespace-seal` and `safespace-select` are gone; the initrd's messages, the docs and the
+  tests name the new command.
+
+---
+
 # PLAN: moving and clearing the identity
 
 Status: **confirmed 2026-10-26** (the user chose these three; DHCP by MAC not now). Found on
@@ -47,6 +77,11 @@ no command to clear an identity (it was done by hand, with a helper for the TPM'
   checked against the TPM, or, with no file, those at assh.conf's handles when they have the
   shape of aSSH's; then `SafespaceIdMachine` and `SafespaceAssign`. The lockout authorization
   and the SHA-1 flag stay. No PIN: root can delete all of it anyway.
+- **The move goes with the selection** (decided later the same day): `safespace-select set NAME`
+  and `clear` run `safespace-seal --move NAME` (PIN) when the machine has an identity and NAME
+  is not the booted combination; only a successful move selects NAME (`safespace-seal` writes
+  the selection itself). A failed one selects nothing: retry, or `--identity-clear` first.
+  `once` moves nothing. `--move` without NAME in a certified boot moves to the preselection.
 - **aSSH:** `ca approve --events PCR:EVENT` (repeatable, in order: that PCR from zero, each
   event hashed in the CA's bank, as TPM2_PCR_Event extends it); `ca remove`.
 - **Tests:** aSSH (`--events` against a TPM's own extension; `ca remove` with and without the

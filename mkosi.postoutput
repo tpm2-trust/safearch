@@ -39,13 +39,13 @@ for uki in "$OUTPUTDIR"/*.efi; do
 	fi
 done
 
-# The keys shipped for safespace-seal must be the ones the UKI is signed with,
+# The keys shipped for safespace seal must be the ones the UKI is signed with,
 # or a machine sealed from this stick refuses to boot it.
 # build.sh exports them before every build; a missing export means mkosi was
 # run directly.
 keys=$SRCDIR/mkosi.extra/usr/share/safespace/secureboot
 if [[ ! -f $keys/db.pem || ! -f $keys/PK.auth ]]; then
-	echo "safespace: ERROR: no Secure Boot keys in the image, safespace-seal would not work (build with ./build.sh)" >&2
+	echo "safespace: ERROR: no Secure Boot keys in the image, safespace seal would not work (build with ./build.sh)" >&2
 	exit 1
 fi
 # Only public material: certificates, signed updates, the GUID.
@@ -75,11 +75,11 @@ for uki in "$OUTPUTDIR"/*.efi; do
 	)
 	shipped=$(openssl x509 -in "$keys/db.pem" -noout -fingerprint -sha256)
 	if [[ $signer != "$shipped" ]]; then
-		echo "safespace: ERROR: UKI is signed by a different key than the db.pem shipped for safespace-seal" >&2
+		echo "safespace: ERROR: UKI is signed by a different key than the db.pem shipped for safespace seal" >&2
 		echo "  UKI:     $signer" >&2
 		echo "  shipped: $shipped" >&2
 		echo "  Build with build.sh: it exports the keys it signs with." >&2
 		exit 1
 	fi
-	echo "safespace: UKI signed by the shipped db key (safespace-seal can enroll it)"
+	echo "safespace: UKI signed by the shipped db key (safespace seal can enroll it)"
 done
