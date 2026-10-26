@@ -501,9 +501,10 @@ if wanted compose && fixtures; then
 	R="names a combination" ctamper "a UKI named after one combination" - "$cuki '$ccmd' $KD/db/db.key $KD/db/db.pem 'PRETTY_NAME=\"safespace 20990101-0100 root\"'"
 	R="no AuthenticAMD microcode" ctamper "a UKI without AMD microcode" - "export FX_UCODE_VENDORS=GenuineIntel; $cuki '$ccmd' $KD/db/db.key $KD/db/db.pem 'PRETTY_NAME=\"safespace 20990101-0100\"'"
 	R="no signed expected PCRs" ctamper "a UKI without signed expected PCRs" - "$cuki '$ccmd' $KD/db/db.key $KD/db/db.pem 'PRETTY_NAME=\"safespace 20990101-0100\"'"
-	R="not exactly one identity signature, for enter-initrd" ctamper "a UKI without the identity key's signature" - "source $REPO/tests/lib/fixtures.sh; fx_reuki \$1 $KD ''"
-	R="not exactly one identity signature, for enter-initrd" ctamper "a UKI whose identity signature covers every phase (a root could unseal)" - "source $REPO/tests/lib/fixtures.sh; fx_reuki \$1 $KD 'enter-initrd enter-initrd:leave-initrd enter-initrd:leave-initrd:sysinit enter-initrd:leave-initrd:sysinit:ready'"
-	R="not exactly one identity signature, for enter-initrd" ctamper "a UKI whose identity signature is for leave-initrd" - "source $REPO/tests/lib/fixtures.sh; fx_reuki \$1 $KD 'enter-initrd:leave-initrd'"
+	R="not exactly one identity signature for enter-initrd" ctamper "a UKI without the identity key's signature" - "source $REPO/tests/lib/fixtures.sh; fx_reuki \$1 $KD ''"
+	R="not exactly one identity signature for enter-initrd" ctamper "a UKI whose identity signature covers every phase (a root could unseal)" - "source $REPO/tests/lib/fixtures.sh; fx_reuki \$1 $KD 'enter-initrd enter-initrd:leave-initrd enter-initrd:leave-initrd:sysinit enter-initrd:leave-initrd:sysinit:ready'"
+	R="not exactly one identity signature for enter-initrd" ctamper "a UKI whose identity signature is for leave-initrd" - "source $REPO/tests/lib/fixtures.sh; fx_reuki \$1 $KD 'enter-initrd:leave-initrd'"
+	R="not exactly one identity signature for enter-initrd (sha1)" ctamper "a UKI whose identity signature is for SHA-256 only (SHA-1 TPMs)" - "source $REPO/tests/lib/fixtures.sh; fx_reuki \$1 $KD enter-initrd sha256"
 	check "compose_check passes a UKI rebuilt with the identity key for enter-initrd" bash -c 'rm -rf "$W/creuki" && cp -a "$1" "$W/creuki" && source "$REPO/tests/lib/fixtures.sh" && fx_reuki "$W/creuki" "$KD" enter-initrd && t_check "$W/creuki" >/dev/null 2>&1' _ "$B"
 	R="roothash-containers is not" ctamper "a roothash-<name> that is not the signed one" - 'echo 0000000000000000000000000000000000000000000000000000000000000000 >$1/roothash-containers'
 	R="not the combinations" ctamper "combinations in another order" - "$cuki '${ccmd/safespace.root.root=$hr safespace.root.containers=$hc/safespace.root.containers=$hc safespace.root.root=$hr}' $KD/db/db.key $KD/db/db.pem"
@@ -570,12 +571,23 @@ if wanted compose && fixtures; then
 	STUB
 	chmod +x "$CS"
 	echo good >"$W/sig-good.json"; echo bad >"$W/sig-bad.json"
+	# The TPM's active banks (sysfs), and tpm2 nvreadpublic of aSSH's SHA-1 flag:
+	# printed as tpm2-tools does while $W/sha1-flag holds its attributes value.
+	mkdir -p "$W/tpm-sha256/pcr-sha256" "$W/tpm-sha256/pcr-sha1" "$W/tpm-sha1/pcr-sha1"
+	cat >"$W/tpm2-stub" <<-STUB
+		#!/bin/bash
+		[[ \$1 == nvreadpublic && \$2 == 0x01802914 && -s $W/sha1-flag ]] || exit 1
+		printf '0x1802914:\\n  name: 000b0c8a\\n  hash algorithm:\\n    friendly: sha256\\n    value: 0xB\\n  attributes:\\n    friendly: ownerwrite|ownerread|no_da|written\\n    value: %s\\n  size: 1\\n\\n' "\$(cat $W/sha1-flag)"
+	STUB
+	chmod +x "$W/tpm2-stub"
+	rm -f "$W/sha1-flag"
 	t_id() { # COMBINATION SECUREBOOT SETUPMODE SIGNATURE [ENV...]: run identity, results in $IR/
 		rm -rf "$IR" "$W/pcrextend.log" && mkdir -p "$IR/run" "$EV"
 		printf '\x06\x00\x00\x00\x0'"$2" >"$EV/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
 		printf '\x06\x00\x00\x00\x0'"$3" >"$EV/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c"
 		[[ -z $1 ]] || echo "$1" >"$IR/run/combination"
-		env "${@:5}" SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$IR/run SAFESPACE_PCREXTEND=$PX SAFESPACE_CREDS=$CS \
+		env SAFESPACE_TPM_SYSFS="$W/tpm-sha256" SAFESPACE_TPM2="$W/tpm2-stub" "${@:5}" \
+			SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$IR/run SAFESPACE_PCREXTEND=$PX SAFESPACE_CREDS=$CS \
 			SAFESPACE_IDENTITY_KEY=/dev/null SAFESPACE_PCRSIG=$4 SAFESPACE_MACHINE_ID=$IR/machine-id \
 			sh "$ID" 2>"$IR/log"
 	}
@@ -618,6 +630,32 @@ if wanted compose && fixtures; then
 		[[ $(slot SafespaceIdMachine) != "$h" && -s $IR/machine-id && $(cat "$IR/machine-id") != "$m" && ! -e $EV/SafespaceAssign-$SG ]]
 	}
 	check "identity: SafespaceAssign for the measured combination (safespace-seal --move): a new machine-id" t_id_move
+	t_id_carry() { # ID WANT: the move carries ID; the machine-id is ID (WANT=same) or a new one (new)
+		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" || return 1
+		local m=$(cat "$IR/machine-id")
+		printf '\x07\x00\x00\x00containers' >"$EV/SafespaceAssign-$SG"
+		printf '\x07\x00\x00\x00%s' "$1" >"$EV/SafespaceAssignId-$SG"
+		t_id containers 1 0 "$W/sig-good.json"
+		[[ ! -e $EV/SafespaceAssignId-$SG && ! -e $EV/SafespaceAssign-$SG && -s $IR/machine-id ]] || return 1
+		if [[ $2 == same ]]; then [[ $(cat "$IR/machine-id") == "$1" ]] && grep -q "its machine-id moves here" "$IR/log"
+		else [[ $(cat "$IR/machine-id") != "$1" && $(cat "$IR/machine-id") != "$m" ]] && grep -q "ignoring SafespaceAssignId" "$IR/log"; fi
+	}
+	check "identity: --move NAME carries the machine-id: sealed in NAME instead of a new one" t_id_carry 0123456789abcdef0123456789abcdef same
+	check "identity: a carried machine-id that is not one (too short) is ignored: a new one" t_id_carry 0123456789abcdef new
+	check "identity: a carried machine-id that is not one (upper case) is ignored: a new one" t_id_carry 0123456789ABCDEF0123456789ABCDEF new
+	check "identity: a carried machine-id of zeros is ignored: a new one" t_id_carry 00000000000000000000000000000000 new
+	t_id_carry_other() {
+		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" || return 1
+		local h=$(slot SafespaceIdMachine)
+		printf '\x07\x00\x00\x00root' >"$EV/SafespaceAssign-$SG"
+		printf '\x07\x00\x00\x000123456789abcdef0123456789abcdef' >"$EV/SafespaceAssignId-$SG"
+		t_id containers 1 0 "$W/sig-good.json"
+		[[ $(slot SafespaceIdMachine) == "$h" && ! -e $EV/SafespaceAssignId-$SG ]] || return 1
+		printf '\x07\x00\x00\x000123456789abcdef0123456789abcdef' >"$EV/SafespaceAssignId-$SG"
+		t_id "" 1 0 "$W/sig-good.json"
+		[[ ! -e $EV/SafespaceAssignId-$SG ]]
+	}
+	check "identity: a carried machine-id for another combination, or with nothing measured: deleted, unused" t_id_carry_other
 	t_id_plain() { rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" STUB_TYPE=plain; [[ ! -e $EV/SafespaceIdMachine-$SG ]] && grep -q "not bound to the signed policy" "$IR/log"; }
 	check "identity: a slot without the signed policy type is not written" t_id_plain
 	t_id_nosig() { rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" STUB_NOSIG_OK=1; [[ ! -e $EV/SafespaceIdMachine-$SG ]] && grep -q "not bound to the signed policy" "$IR/log"; }
@@ -633,6 +671,33 @@ if wanted compose && fixtures; then
 		[[ ! -e $IR/machine-id ]]
 	}
 	check "identity: a credential of another name in the slot is not released" t_id_swap
+	t_id_sha1_off() {
+		rm -rf "$EV" "$W/sha1-flag"; mkdir -p "$EV"; printf '\x07\x00\x00\x00containers' >"$EV/SafespaceAssign-$SG"
+		t_id containers 1 0 "$W/sig-good.json" SAFESPACE_TPM_SYSFS="$W/tpm-sha1"
+		[[ ! -e $EV/SafespaceIdMachine-$SG && ! -e $IR/machine-id && ! -e $EV/SafespaceAssign-$SG ]] &&
+			grep -q "SHA-1 is not allowed: no identity this boot (sudo safespace-seal --sha1 on)" "$IR/log" && grep -q 'identity:sealed' "$W/pcrextend.log"
+	}
+	check "identity: a TPM with SHA-1 only, not allowed: no identity, PCR 15 closed" t_id_sha1_off
+	t_id_sha1_on() {
+		rm -rf "$EV"; echo 0x22020002 >"$W/sha1-flag"
+		t_id containers 1 0 "$W/sig-good.json" SAFESPACE_TPM_SYSFS="$W/tpm-sha1" && cp "$IR/machine-id" "$W/mid-sha1" &&
+			t_id containers 1 0 "$W/sig-good.json" SAFESPACE_TPM_SYSFS="$W/tpm-sha1" && cmp -s "$IR/machine-id" "$W/mid-sha1" &&
+			grep -q "SHA-1 is allowed" "$IR/log" || return 1
+		# forbidden again: the slot stays, nothing is released
+		rm -f "$W/sha1-flag"; t_id containers 1 0 "$W/sig-good.json" SAFESPACE_TPM_SYSFS="$W/tpm-sha1"
+		[[ -e $EV/SafespaceIdMachine-$SG && ! -e $IR/machine-id ]]
+	}
+	check "identity: SHA-1 only, allowed (safespace-seal --sha1 on): the machine-id, the same at the next boot; off again: not released" t_id_sha1_on
+	t_id_sha1_other() {
+		rm -rf "$EV"; echo 0x22020006 >"$W/sha1-flag"
+		t_id containers 1 0 "$W/sig-good.json" SAFESPACE_TPM_SYSFS="$W/tpm-sha1"; rm -f "$W/sha1-flag"
+		[[ ! -e $EV/SafespaceIdMachine-$SG ]] && grep -q "SHA-1 is not allowed" "$IR/log"
+	}
+	check "identity: SHA-1 only, an index of other attributes at the flag's handle: not allowed" t_id_sha1_other
+	t_id_sha1_both() { rm -rf "$EV" "$W/sha1-flag"; t_id containers 1 0 "$W/sig-good.json" && [[ -e $EV/SafespaceIdMachine-$SG ]] && ! grep -q "SHA-1" "$IR/log"; }
+	check "identity: SHA-256 active: the flag is not asked" t_id_sha1_both
+	# The initrd has no grep (mkosi's Arch initrd): its scripts use sed.
+	check "identity, select: no grep (the initrd has none)" bash -c '! grep -nE "(^|[|;&(]|then|do)[[:space:]]*grep[[:space:]]" "$@"' _ "$ID" "$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/select"
 	check "identity: every sealing uses tpm2-with-public-key" bash -c '! grep -nE "(creds|CREDS\"?) encrypt" "$@" | grep -v "with-key=tpm2-with-public-key"' _ "$ID" "$REPO/mkosi.extra/usr/local/sbin/safespace-seal"
 fi
 

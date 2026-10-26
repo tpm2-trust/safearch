@@ -96,13 +96,16 @@ compose_uki() { # OUT FIRST_UKI STUB CMDLINE
 	(cd "$t/id" && find usr | sort | cpio -o -H newc --owner=0:0 --reproducible --quiet) >>"$t/initrd" ||
 		{ rm -rf "$t"; die "cannot append the identity key to the initrd"; }
 	# Two PCR signing keys: mkosi's for every phase (first: its public key is the
-	# .pcrpkey systemd uses), the identity key for enter-initrd only.
+	# .pcrpkey systemd uses), the identity key for enter-initrd only. Both banks:
+	# SHA-1 for a TPM whose firmware activates nothing else (T450s), used there
+	# only where safespace-seal --sha1 allows it (initrd identity); a SHA-256 TPM
+	# seals to SHA-256, which no SHA-1 signature satisfies.
 	ukify build --efi-arch x64 --stub "$stub" --output "$out" \
 		--linux "$t/linux" --initrd "$t/initrd" --microcode "$t/ucode" \
 		--os-release "@$t/osrel" --uname "$(uki_section "$uki" .uname)" --cmdline "@$t/cmdline" \
 		--no-sign-kernel --signtool systemd-sbsign \
 		--secureboot-private-key "$KEYS_SB_DIR/db/db.key" --secureboot-certificate "$KEYS_SB_DIR/db/db.pem" \
-		--pcr-banks sha256 \
+		--pcr-banks sha1,sha256 \
 		--pcr-certificate "$KEYS_PCR_CERT" --pcr-private-key "$KEYS_PCR_KEY" \
 		--phases "enter-initrd enter-initrd:leave-initrd enter-initrd:leave-initrd:sysinit enter-initrd:leave-initrd:sysinit:ready" \
 		--pcr-certificate "$KEYS_ID_CERT" --pcr-private-key "$KEYS_ID_KEY" --phases enter-initrd \
@@ -181,11 +184,11 @@ compose_check() { # DEST DB_CERT
 
 # The machine's secrets are sealed to the identity key (SECURITY.md, "Machine
 # identity"): its public part must be in the initrd, and the .pcrsig must hold
-# exactly one signature by it: for PCR 11 at enter-initrd, computed here from
-# the UKI's own sections. A signature for a later phase would let a root unseal
-# the secrets.
+# exactly one signature by it per bank (SHA-256 and SHA-1): for PCR 11 at
+# enter-initrd, computed here from the UKI's own sections. A signature for a
+# later phase would let a root unseal the secrets.
 compose_check_identity() { # UKI
-	local t fp s want args=()
+	local t fp s want bank args=()
 	t=$(mktemp -d)
 	for s in linux osrel cmdline initrd ucode splash dtb uname sbat pcrpkey profile pcrsig; do
 		objcopy -O binary --only-section=".$s" "$1" "$t/$s" 2>/dev/null && [[ -s $t/$s ]] || continue
@@ -205,14 +208,16 @@ compose_check_identity() { # UKI
 		sys.stdout.buffer.write(d[start:start + size])
 	EOF
 	fp=$(openssl rsa -pubin -in "$t/identity.pem" -RSAPublicKey_out -outform DER 2>/dev/null | sha256sum | cut -c1-64)
-	want=$(/usr/lib/systemd/systemd-measure policy-digest "${args[@]}" --phase=enter-initrd --bank=sha256 --json=short |
-		python3 -I -c 'import json, sys; print(json.load(sys.stdin)["sha256"][0]["pol"])') ||
-		{ rm -rf "$t"; die "systemd-measure cannot compute the enter-initrd policy of $1"; }
-	python3 -I - "$t/pcrsig" "$fp" "$want" <<-'EOF' || { rm -rf "$t"; die "the composed UKI's .pcrsig: not exactly one identity signature, for enter-initrd"; }
-		import json, sys
-		s = json.loads(open(sys.argv[1], "rb").read().rstrip(b"\0"))["sha256"]
-		mine = [(e["pcrs"], e["pol"]) for e in s if e["pkfp"] == sys.argv[2]]
-		sys.exit(mine != [([11], sys.argv[3])])
-	EOF
+	for bank in sha256 sha1; do
+		want=$(/usr/lib/systemd/systemd-measure policy-digest "${args[@]}" --phase=enter-initrd --bank=$bank --json=short |
+			python3 -I -c 'import json, sys; print(json.load(sys.stdin)[sys.argv[1]][0]["pol"])' $bank) ||
+			{ rm -rf "$t"; die "systemd-measure cannot compute the enter-initrd policy of $1 ($bank)"; }
+		python3 -I - "$t/pcrsig" "$fp" "$want" $bank <<-'EOF' || { rm -rf "$t"; die "the composed UKI's .pcrsig: not exactly one identity signature for enter-initrd ($bank)"; }
+			import json, sys
+			s = json.loads(open(sys.argv[1], "rb").read().rstrip(b"\0")).get(sys.argv[4], [])
+			mine = [(e["pcrs"], e["pol"]) for e in s if e["pkfp"] == sys.argv[2]]
+			sys.exit(mine != [([11], sys.argv[3])])
+		EOF
+	done
 	rm -rf "$t"
 }

@@ -23,21 +23,28 @@
 #      yet: the machine belongs to the combination it boots then;
 #    - SafespaceAssign=<name> (safespace-seal --move, after the PIN approved the
 #      host key's move there) and <name> is what was measured. Another name:
-#      ignored. The variable is deleted either way.
+#      ignored. The variable is deleted either way. With it, SafespaceAssignId
+#      may carry the machine-id the machine had (--move from a boot where it was
+#      released): sealed here instead of a new one, so the machine-id survives the
+#      move; 32 hex digits, not all zero, else a new one. Deleted at every boot.
 #    A slot that exists but does not unseal (another combination) never leads
 #    to a new machine-id.
 # 2. Unseal the slot into /run/safespace/identity/ (RAM; /run stays across the
 #    switch to the root; "released" lists it if it was) and to /run/machine-id,
 #    which PID 1 takes over. A slot that does not unseal is left alone: the root
 #    then has a throwaway machine-id, as without an assignment.
+# On a TPM without an active SHA-256 bank (its firmware activates SHA-1 only:
+# ThinkPad T450s) 1 and 2 happen only while safespace-seal --sha1 on allows
+# SHA-1: aSSH's NV index 0x01802914, the host key's alike. systemd-creds seals
+# to SHA-256 wherever that is active, and the UKI's PCR 11 is signed for both.
 # 3. Always, also on errors: extend PCR 15 with "safespace-identity:sealed", so
 #    nothing unseals again in this boot. aSSH's agent finds PCR 15 so (the
 #    combination, then this) at every boot of the combination.
 # The boot never depends on this: every failure only means no identity.
 #
 # SAFESPACE_EFIVARS, SAFESPACE_RUN, SAFESPACE_PCREXTEND, SAFESPACE_CREDS,
-# SAFESPACE_IDENTITY_KEY, SAFESPACE_PCRSIG, SAFESPACE_MACHINE_ID: only for
-# tests/run.sh.
+# SAFESPACE_IDENTITY_KEY, SAFESPACE_PCRSIG, SAFESPACE_MACHINE_ID,
+# SAFESPACE_TPM_SYSFS, SAFESPACE_TPM2: only for tests/run.sh.
 
 msg() { echo "safespace-identity: $*" >/dev/kmsg 2>/dev/null || echo "safespace-identity: $*" >&2; }
 
@@ -48,6 +55,11 @@ CREDS=${SAFESPACE_CREDS:-systemd-creds}
 KEY=${SAFESPACE_IDENTITY_KEY:-${0%/*}/identity.pem}
 OUT=$SELECT_RUN/identity
 MACHINE_ID=${SAFESPACE_MACHINE_ID:-/run/machine-id}
+TPM_SYSFS=${SAFESPACE_TPM_SYSFS:-/sys/class/tpm/tpm0}
+TPM2=${SAFESPACE_TPM2:-tpm2}
+# aSSH's SHA-1 flag (hostkey.SHA1Handle) as aSSH makes it: owner write and read,
+# noDA, written; one byte.
+SHA1_INDEX=0x01802914 SHA1_ATTRS=0x22020002
 # The credential header's type for "sealed with a signed PCR policy"
 # (--with-key=tpm2-with-public-key). With plain tpm2, systemd-creds drops the
 # --tpm2-public-key* options without a word and PCR 11 is not bound at all.
@@ -58,6 +70,8 @@ SLOTS="SafespaceIdMachine:safespace-machine-id:machine-id"
 close() {
 	"$SELECT_PCREXTEND" --graceful --pcr=15 "safespace-identity:sealed" >/dev/null 2>&1 ||
 		msg "WARNING: could not close PCR 15"
+	# A carried machine-id never outlives the boot after the move.
+	var_rm SafespaceAssignId
 	rm -rf "$OUT/.new"
 }
 trap close EXIT
@@ -82,6 +96,21 @@ esac
 umask 077
 mkdir -p "$OUT/.new" || exit 0
 
+# The kernel lists the TPM's active banks in sysfs (pcr-<alg>/).
+if [ ! -d "$TPM_SYSFS/pcr-sha256" ] && [ -d "$TPM_SYSFS/pcr-sha1" ]; then
+	# (No grep in the initrd: sed.)
+	pub=$(TPM2TOOLS_TCTI=device:/dev/tpmrm0 "$TPM2" nvreadpublic $SHA1_INDEX 2>/dev/null)
+	attrs=$(echo "$pub" | sed -n '/^ *attributes:/,/^ *size:/s/^ *value: *//p')
+	size=$(echo "$pub" | sed -n 's/^ *size: *//p')
+	if [ "$attrs" = "$SHA1_ATTRS" ] && [ "$size" = 1 ]; then
+		msg "the TPM has the SHA-1 bank only, and SHA-1 is allowed (safespace-seal --sha1 on): the identity uses it"
+	else
+		msg "the TPM has the SHA-1 bank only, and SHA-1 is not allowed: no identity this boot (sudo safespace-seal --sha1 on)"
+		var_rm SafespaceAssign
+		exit 0
+	fi
+fi
+
 # The signed expected PCR values, as systemd-stub hands them to the initrd.
 sig=${SAFESPACE_PCRSIG:-}
 if [ -z "$sig" ]; then
@@ -104,6 +133,14 @@ global_byte() { od -An -tu1 -j4 -N1 "$SELECT_VARS/$1-8be4df61-93ca-11d2-aa0d-00e
 
 assign=$(select_var SafespaceAssign)
 var_rm SafespaceAssign
+carry=""
+[ -r "$(var_path SafespaceAssignId)" ] && carry=$(tail -c +5 "$(var_path SafespaceAssignId)" | tr -d '\000\n')
+var_rm SafespaceAssignId
+case $carry in
+	'' ) ;;
+	*[!0-9a-f]* | 00000000000000000000000000000000) msg "ignoring SafespaceAssignId: not a machine-id"; carry="" ;;
+	*) [ ${#carry} = 32 ] || { msg "ignoring SafespaceAssignId: not a machine-id"; carry=""; } ;;
+esac
 if [ -z "$assign" ] && [ ! -e "$(var_path SafespaceIdMachine)" ]; then
 	if [ "$(global_byte SecureBoot)" = 1 ] && [ "$(global_byte SetupMode)" = 0 ]; then
 		msg "no identity yet, Secure Boot on: this machine belongs to $name from now on"
@@ -115,9 +152,14 @@ fi
 if [ -n "$assign" ] && [ "$assign" != "$name" ]; then
 	msg "ignoring SafespaceAssign=$assign: this boot measured $name"
 elif [ -n "$assign" ]; then
-	msg "assigning this machine to $name: new machine-id"
 	ok=1
-	systemd-id128 new >"$OUT/.new/machine-id" 2>/dev/null || ok=0
+	if [ -n "$carry" ]; then
+		msg "assigning this machine to $name: its machine-id moves here"
+		printf '%s\n' "$carry" >"$OUT/.new/machine-id" || ok=0
+	else
+		msg "assigning this machine to $name: new machine-id"
+		systemd-id128 new >"$OUT/.new/machine-id" 2>/dev/null || ok=0
+	fi
 	for s in $SLOTS; do
 		[ $ok = 1 ] || break
 		v=${s%%:*} c=${s#*:} c=${c%%:*} f=${s##*:}

@@ -17,6 +17,89 @@ T450s findings with usb/network aligned.
 
 ---
 
+# PLAN: moving and clearing the identity
+
+Status: **confirmed 2026-10-26** (the user chose these three; DHCP by MAC not now). Found on
+the T450s: a move gives the new combination a new machine-id, and takes two boots; there is
+no command to clear an identity (it was done by hand, with a helper for the TPM's NV indices).
+
+## Design
+
+- **`sudo safespace-seal --move NAME`, from the current boot, without booting NAME first.**
+  All combinations share one signed UKI, so in NAME's boots PCR 0, 2, 7 and 11 hold what this
+  boot's agent recorded, and PCR 15 is known: `safespace-combination:NAME`, then
+  `safespace-identity:sealed`, from zero, in the CA's bank. aSSH approves exactly that
+  (`ca approve --values STATE --events 15:safespace-combination:NAME --events
+  15:safespace-identity:sealed --next-generation`, PIN): every older approval is revoked, the
+  next boot of NAME is certified at once. Then the assignment and the selection of NAME. From
+  a boot of the same build (PCR 11; slot 1 covers an update). `--move` without NAME keeps
+  today's flow (in a boot of NAME: approve this state) - for a changed PCR 7, or a boot that
+  is not certified.
+- **The machine-id survives a move.** `--move` writes `SafespaceAssign=NAME:<machine-id>` when
+  the machine-id is released in the boot it runs in; the initrd of NAME's next boot seals that
+  machine-id instead of a new one (32 hex digits, not all zero; anything else: a new one, as
+  now). Moved from a boot where it is not released (today's flow, in NAME): a new one, said so.
+  Trade-off: root of a booted combination can already write `SafespaceAssign` and so take the
+  machine-id from the assigned combination; now it can also choose the value. The machine-id
+  is a label, not a credential (SECURITY.md); the host key's certificate needs the PIN.
+- **`sudo safespace-seal --identity-clear [--yes]`** (YES asked): aSSH's new `ca remove`
+  removes the CA's file (`SAFEasshCA`) and its PIN index and counter - those the file names,
+  checked against the TPM, or, with no file, those at assh.conf's handles when they have the
+  shape of aSSH's; then `SafespaceIdMachine` and `SafespaceAssign`. The lockout authorization
+  and the SHA-1 flag stay. No PIN: root can delete all of it anyway.
+- **aSSH:** `ca approve --events PCR:EVENT` (repeatable, in order: that PCR from zero, each
+  event hashed in the CA's bank, as TPM2_PCR_Event extends it); `ca remove`.
+- **Tests:** aSSH (`--events` against a TPM's own extension; `ca remove` with and without the
+  file, a foreign index at the handle untouched); tests/run.sh (the initrd takes a carried
+  machine-id, refuses a malformed one); tests/vm.sh: the move branch moves from the certified
+  default with `--move containers`, the next boot of containers is certified with the same
+  machine-id; a clear branch: `--identity-clear`, `--identity` says none, `--identity-create`,
+  the next boot certified by the new CA.
+
+---
+
+# PLAN: the identity on a TPM with the SHA-1 bank only (T450s)
+
+Status: **confirmed 2026-10-26** (decisions below). Found on the T450s: `assh: the TPM has
+no sha256 bank for PCR 0` - its firmware activates only the SHA-1 bank, so the agent failed
+and the machine-id could not be sealed (the UKI's PCR 11 signature was SHA-256 only).
+
+## Design
+
+- **The flag:** the NV index `0x01802914` (aSSH's `hostkey.SHA1Handle`), defined by the
+  owner, one byte, not signed. `sudo safespace-seal --sha1 on|off` sets it (`assh tpm sha1
+  --allow|--forbid`), `--identity` shows it. It counts only on a TPM without an active
+  SHA-256 bank; there, SHA-1 is used only while it is there - for the machine-id and the
+  host key alike, at every boot (`off` stops both at the next boot).
+- **Why unsigned:** where SHA-256 is active the flag changes nothing, and which banks are
+  active only the firmware decides (TPM2_PCR_Allocate needs the platform hierarchy). On a
+  SHA-1-only TPM the choice is SHA-1 or no identity. A downgrade through the BIOS loses the
+  old identity (sealed to SHA-256), it does not reveal it; a new CA is another key, which the
+  clients' `@cert-authority` line does not name. A signature per EK would add central
+  control, not protection.
+- **Build:** ukify signs PCR 11 for `sha1,sha256` (both PCR keys, `lib/compose.sh`). On a
+  SHA-256 TPM nothing changes: systemd-creds seals to SHA-256 there, and a SHA-1 signature
+  satisfies no SHA-256 policy.
+- **initrd `identity`:** the active banks from sysfs (`/sys/class/tpm/tpm0/pcr-<alg>/`, which
+  the kernel makes for allocated banks only); without SHA-256, it seals and unseals only when
+  `tpm2 nvreadpublic 0x01802914` shows the flag (tpm2-tools in the initrd), else no identity
+  this boot, and the console says `safespace-seal --sha1 on`.
+- **aSSH:** `ASSH_CA_BANK=auto` (assh.conf): SHA-256 where active, else SHA-1 where the flag
+  allows it; without it the agent serves a temporary key and records nothing, `ca create`
+  refuses; a SHA-1 CA certifies nothing once the flag is gone.
+- **Tests:** aSSH (swtpm with SHA-1 only: `TestSHA1`, `TestResolveBank`); tests/run.sh (the
+  identity script with a SHA-1-only sysfs, with and without the flag; `--sha1`);
+  `test-vm.sh --tpm-banks sha1`; tests/vm.sh: a SHA-1-only TPM, no identity without the flag,
+  `--sha1 on`, the machine-id follows, `--identity-create`, the next boot certified.
+
+## Decisions (2026-10-26)
+
+1. For every combination, machine-id included (not the host key alone).
+2. The flag is not signed (the reasons above); set with `safespace-seal --sha1 on|off`.
+3. tpm2-tools in the initrd to read the flag (not a raw TPM command).
+
+---
+
 # PLAN: the machine identity through aSSH (submodule `assh/`)
 
 Status: **confirmed 2026-10-26, done in QEMU** (decisions below); open: the hand test on the T450s, an update in QEMU (two builds). Goal: the host key of every

@@ -175,9 +175,9 @@ fx_build() {
 	fx_info "$co" "$v" "${combos%,}"
 }
 
-# fx_reuki DIR KEYDIR IDENTITY_PHASES: rebuild DIR/boot.efi from its own
+# fx_reuki DIR KEYDIR IDENTITY_PHASES [BANKS]: rebuild DIR/boot.efi from its own
 # sections, as lib/compose.sh does, but with the identity key signing the given
-# phases (empty: no identity signature at all).
+# phases (empty: no identity signature at all), for BANKS (sha1,sha256).
 fx_reuki() {
 	local d=$1 kd=$2 t s all="enter-initrd enter-initrd:leave-initrd enter-initrd:leave-initrd:sysinit enter-initrd:leave-initrd:sysinit:ready" id=()
 	t=$(mktemp -d)
@@ -190,7 +190,7 @@ fx_reuki() {
 		--uname "$(tr -d '\0' <"$t/uname")" --cmdline "@$t/cmdline" \
 		--no-sign-kernel --signtool systemd-sbsign \
 		--secureboot-private-key "$kd/db/db.key" --secureboot-certificate "$kd/db/db.pem" \
-		--pcr-banks sha256 --pcr-certificate "$kd/pcr.crt" --pcr-private-key "$kd/pcr.key" --phases "$all" \
+		--pcr-banks "${4:-sha1,sha256}" --pcr-certificate "$kd/pcr.crt" --pcr-private-key "$kd/pcr.key" --phases "$all" \
 		"${id[@]}" >/dev/null 2>&1 || return 1
 	mv "$t/boot.efi" "$d/boot.efi"
 	rm -rf "$t"

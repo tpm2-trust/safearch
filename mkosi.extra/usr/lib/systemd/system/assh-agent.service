@@ -24,7 +24,9 @@ ExecStart=/usr/bin/assh agent --config /etc/assh/assh.conf
 TimeoutStartSec=60s
 StandardError=journal+console
 ExecStartPost=/usr/bin/install -d -m 0755 /run/safespace
-ExecStartPost=/bin/sh -c 'printf "HostKey /run/assh/host.pub\\nHostCertificate /run/assh/host-cert.pub\\nHostKeyAgent /run/assh/agent.sock\\n" >/run/safespace/sshd-hostkey.conf'
+# The agent's sshd lines (assh/README.md): the host key, its certificate when the
+# CA certified it, the agent, and the algorithms the TPM signs in.
+ExecStartPost=/usr/bin/install -m 0644 /run/assh/sshd.conf /run/safespace/sshd-hostkey.conf
 # A restart gets no certificate: the window is closed until the next boot.
 Restart=no
 

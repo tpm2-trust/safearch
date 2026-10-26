@@ -132,6 +132,7 @@ sequenceDiagram
 | **The window**: the agent runs before `sysinit.target` and before systemd's PCR 15 units (`systemd-pcrmachine`, `systemd-pcrfs-root`): PCR 11 and 15 hold what the initrd left, the same at every boot of the combination. Right after the host key is made it extends PCR 15 (`assh: closed`), also when the key is temporary and also before a CA exists: **the CA certifies nothing more until the next reboot** - a process started later, an agent restart, a CA created in this boot | a root process getting a certificate for a key of its own | `assh-agent.service` |
 | **The host key is new at every boot, in the TPM** (NULL hierarchy, gone at the reboot); its authorization value is in the agent's memory alone (not dumpable); sshd gets signatures through `HostKeyAgent`, never the key | the host key on any medium, or used after the boot | `assh-agent.service`, `sshd_config.d/10-safespace.conf` |
 | **One command creates the identity**, in the boot to be approved: the agent recorded the PCRs of the slots at its start (`/run/assh/agent.pcrs.json`, before a CA exists: from `assh.conf`), `--identity-create` creates the CA and approves that state; the certificate comes with the next boot (the window is closed) | a certificate in a boot whose later processes are not the measured ones | `safespace-seal` |
+| **`--move NAME` approves a state before it is booted**: this boot's PCR 0, 2, 7 and 11 (one signed UKI for every combination) and PCR 15 calculated as NAME's initrd leaves it (`safespace-combination:NAME`, `safespace-identity:sealed`, from zero; `assh ca approve --events`), with the PIN and a new generation. A wrong prediction only means no certificate; the PIN decides either way | moving needing a boot of the target first (two boots) | `safespace-seal`, `assh` |
 | **`--approve` only in a certified boot** (slot 1 after an update): in a boot with the temporary key (another combination, or PCR 7 changed) only `--move` approves, with a new generation | the identity silently held by two combinations | `safespace-seal` |
 | **Secrets never on a command line, in the environment or on disk:** `safespace-seal` asks the PIN and the lockout authorization on the terminal (or reads them from a file descriptor, tests) and hands them to `assh` on a pipe of a shell builtin | the PIN in `ps`, logs, `/proc/*/environ` | `safespace-seal` |
 | **The machine-id: one slot**, a systemd-creds TPM credential in the EFI variable `SafespaceIdMachine` (credential name `safespace-machine-id`, checked) | renewing it with another secret's credential | `mkosi.initrd.conf/.../identity` |
@@ -140,17 +141,40 @@ sequenceDiagram
 | — the **identity key** signs `enter-initrd` only; mkosi's PCR key keeps signing every phase for systemd's own use. `compose_check` computes the `enter-initrd` policy from the UKI's sections (`systemd-measure policy-digest`) and refuses a UKI whose `.pcrsig` does not hold exactly that one identity signature | a root unsealing after the initrd: with an all-phase signature, a root whose initrd measured nothing could extend PCR 15 itself and unseal (shown, see below) | `lib/keys.sh`, `lib/compose.sh` |
 | — PCR 7 | a machine with Secure Boot off running a foreign stub that measures the genuine section hashes into PCR 11 but boots something else; changed Secure Boot keys | |
 | — PCR 15 | another combination | |
-| **The machine-id is sealed in the initrd**, never in a root, after measuring: generated (`systemd-id128`), sealed with the *current* PCR 7 and 15. When: automatically on a boot with Secure Boot on (SecureBoot=1, SetupMode=0) and *no slot*; or when `SafespaceAssign` (written by `--move` after the PIN approved the move) names the measured combination. A `SafespaceAssign` for another name is deleted and ignored. A slot that exists but doesn't unseal (another combination) **never** leads to a new one | the plaintext in any process of a root; a machine-id for a combination that did not boot | `identity`, `safespace-seal` |
+| **The machine-id is sealed in the initrd**, never in a root, after measuring: generated (`systemd-id128`), sealed with the *current* PCR 7 and 15. When: automatically on a boot with Secure Boot on (SecureBoot=1, SetupMode=0) and *no slot*; or when `SafespaceAssign` (written by `--move` after the PIN approved the move) names the measured combination - then with the machine-id `SafespaceAssignId` carries (`--move NAME`: the machine keeps its machine-id), else a new one. A `SafespaceAssign` for another name is deleted and ignored; `SafespaceAssignId` is deleted at every boot. A slot that exists but doesn't unseal (another combination) **never** leads to a new one | the plaintext in any process of a root; a machine-id for a combination that did not boot | `identity`, `safespace-seal` |
 | **Every new slot is checked before it is written:** its header type must be the signed-policy one (`5e2d5c76-0372-4eaf-843c-6fb5f64098f5`), and it must *not* unseal with an empty signature; otherwise nothing is written | the `systemd-creds` pitfall below (a slot without PCR 11 binding) | `identity` |
 | **The TPM is closed** after unsealing: PCR 15 is extended with `safespace-identity:sealed`, always (also on errors, `trap`) | a second unseal in the same boot, even in the initrd | `identity` |
 | **The released machine-id lives in RAM only**: `/run/safespace/identity/` (0700 root) and `/run/machine-id` (PID 1 takes it over) | the secret on any medium | `identity` |
+| **SHA-1 only where the owner allows it**: on a TPM whose firmware activates no SHA-256 PCR bank (ThinkPad T450s) the machine-id and the host key are bound to SHA-1 values only while `safespace-seal --sha1 on` has set aSSH's NV index `0x01802914` - read at every boot by the initrd (`tpm2 nvreadpublic`, its exact attributes) and the agent (`ASSH_CA_BANK=auto`); off, neither is released or certified. Where SHA-256 is active it changes nothing (see [The SHA-1 bank](#the-sha-1-bank)) | binding the identity to the weaker hash without the owner's decision | `identity`, `assh.conf`, `safespace-seal` |
 | **The boot never depends on the TPM**: no TPM, no slot, no CA, no signature, any error → no identity (temporary or throwaway key, throwaway machine-id), the boot goes on | a TPM fault making the machine unusable | `identity`, `assh-agent.service`, `sshd-hostkeys.service` |
 
 **What root of the approved combination can do** (the same in every design): use the host key
 until the next reboot, on this machine only (the agent answers root); delete `SAFEasshCA`
 (the identity is gone, which every client notices); write `SafespaceAssign` by hand, which
-gives another combination a **new** machine-id and takes this one's - never the host key's
-certificate: the machine-id is a label, not a credential.
+gives another combination a **new** machine-id and takes this one's - and, with
+`SafespaceAssignId`, one of its choosing (`--move NAME` carries the machine-id that way, from a
+boot where it is released; the next boot's initrd seals it for NAME and deletes the variable,
+whatever it measured) - never the host key's certificate: the machine-id is a label, not a
+credential. Remove the identity: `--identity-clear` (the CA, its PIN index and counter, the
+machine-id slot); root could delete them anyway.
+
+### The SHA-1 bank
+
+Which PCR banks a TPM extends its firmware decides (TPM2_PCR_Allocate needs the platform
+hierarchy, which the firmware closes before the OS); the T450s's activates SHA-1 only. The
+build signs PCR 11 for both banks (`lib/compose.sh`; `compose_check` wants one identity
+signature per bank); systemd-creds seals to SHA-256 wherever it is active, and a SHA-1
+signature satisfies no SHA-256 policy, so the SHA-1 entries change nothing on other machines.
+
+The flag is not signed. Where SHA-256 is active it does nothing; on a SHA-1-only TPM the choice
+is SHA-1 or no identity, and root of the machine could set it as it can create the CA. Someone
+who switches a TPM to SHA-1 in the BIOS gains nothing either: the identity sealed to SHA-256
+does not unseal, and a new CA is another key, which the clients' `@cert-authority` line does
+not name. A signature per EK by the build host would give central control, not protection.
+
+SHA-1 is the weaker hash. A collision helps an attacker who chose both colliding inputs; the
+values a slot approves come from the firmware, signed UKIs and Secure Boot variables, so
+matching one of them would take a second preimage, which is not known for SHA-1.
 
 ### What is public, what is private
 

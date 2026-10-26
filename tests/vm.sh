@@ -73,17 +73,23 @@
 #           extending PCR 15); the debug combination once: temporary key,
 #           nothing released, --approve refused; network boot: certified; an
 #           option ROM more (PCR 2): slot 1, --approve, slot 0; another db
-#           certificate (PCR 7): temporary; --move to another combination (PIN):
-#           certified there with a new machine-id, wrong PINs lock out; the
-#           default afterwards: temporary (its approvals revoked); SAFEasshCA
+#           certificate (PCR 7): temporary, --move keeps it there (a new
+#           machine-id); --move NAME from the certified default, without
+#           booting NAME first: NAME's next boot certified with the same
+#           machine-id, wrong PINs lock out; the default afterwards: temporary
+#           (its approvals revoked); --identity-clear, --identity-create: the
+#           next boot certified by the new CA, the old line refused; SAFEasshCA
 #           damaged, so the agent fails: sshd up with a throwaway key, the
-#           console says why.
+#           console says why. Beside them a new TPM with the SHA-1 bank only
+#           (as the T450s's firmware leaves it): without safespace-seal --sha1
+#           on no machine-id and the temporary key; with it the machine-id,
+#           --identity-create, the next boot certified; --sha1 off: neither.
 #
 # Prerequisites (all checked before anything starts; the list of what is
 # missing, then exit 2):
 #   - qemu-desktop, edk2-ovmf, virt-firmware (virt-fw-vars), openssh, curl,
 #     binutils, sbsigntools, cryptsetup, dosfstools, mtools, util-linux,
-#     python, rsync; /dev/kvm read/write; swtpm (step identity)
+#     python, rsync; /dev/kvm read/write; swtpm, swtpm_setup (step identity)
 #   - sudo for ./build.sh (asked once at the start, or a NOPASSWD rule for
 #     unattended runs, see README.md "Integration test"); not with --no-build
 #   - with --no-build / --build: the public keys the test build was signed
@@ -139,7 +145,7 @@ for f in OVMF_CODE.4m.fd OVMF_CODE.secboot.4m.fd OVMF_VARS.4m.fd; do
 	[[ -f /usr/share/edk2/x64/$f ]] || miss "/usr/share/edk2/x64/$f (pacman -S edk2-ovmf)"
 done
 [[ -r /dev/kvm && -w /dev/kvm ]] || miss "read/write access to /dev/kvm (group kvm)"
-wants identity && ! command -v swtpm >/dev/null && miss "swtpm (pacman -S swtpm; the step identity's TPM)"
+wants identity && ! { command -v swtpm && command -v swtpm_setup; } >/dev/null && miss "swtpm (pacman -S swtpm; the step identity's TPM)"
 # A build builds aSSH (lib/assh.sh) with the build host's Go.
 [[ $BUILD_MODE != build ]] || command -v go >/dev/null || miss "go (pacman -S go; build.sh builds aSSH)"
 # A test build exports the keys it is signed with; an existing one needs them.
@@ -340,6 +346,8 @@ echo machine_id=$(cat /etc/machine-id)
 echo pcrs=$(sudo cat /run/assh/agent.pcrs.json 2>/dev/null | tr -d " \n")
 echo identity=$(sudo cat /run/safespace/identity/released 2>/dev/null | tr "\n" , | sed "s/,\$//")
 echo identity_created=$(sudo dmesg | grep -c "safespace-identity: assigned to")
+# The TPM'"'"'s active PCR banks (sysfs).
+echo tpm_banks=$(cd /sys/class/tpm/tpm0 2>/dev/null && ls -d pcr-* 2>/dev/null | sed "s/^pcr-//" | tr "\n" , | sed "s/,\$//")
 '
 probe() { vm_ssh "$PROBE" >"$LOGS/$1.probe" 2>&1; }
 val() { sed -n "s/^$2=//p" "$LOGS/$1.probe" 2>/dev/null | head -1; }
@@ -501,7 +509,8 @@ id_seal() { # ARGS...
 }
 id_boot() { # NAME TEST-VM-ARGS...: boot on the step's firmware and TPM, probe (and the CA login)
 	local n=$1; shift
-	if vm_start "$n" "$@" --sealed --tpm; then probe "$n"; ca_login >>"$LOGS/$n.probe"; return 0; fi
+	# ID_TPM: the TPM option (--tpm-banks sha1 for a TPM like the T450s's).
+	if vm_start "$n" "$@" --sealed ${ID_TPM:---tpm}; then probe "$n"; ca_login >>"$LOGS/$n.probe"; return 0; fi
 	result FAIL "$n" "$ERR"; vm_stop "$n"; return 1
 }
 # id_check NAME DESCRIPTION CONDITION...: PASS if every [[ ]] condition holds
@@ -618,35 +627,68 @@ step_identity_pcr7() {
 	local first other move mid
 	id_names
 	id_branch || return
-	# 6. Another certificate in db (PCR 7, every slot reads it): temporary, nothing released.
+	# 6. Another certificate in db (PCR 7, every slot reads it): temporary, nothing
+	# released; --move (no name: this boot's state, PIN, a new generation) keeps the
+	# identity here: the next boot certified, with a new machine-id (the machine's is
+	# sealed to the old PCR 7).
 	cp "$WORK/sealed-vars.fd" "$WORK/sealed-vars.keep"
 	openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=extra-db/ -keyout "$WORK/extra.key" -out "$WORK/extra.pem" 2>/dev/null &&
 		virt-fw-vars -i "$WORK/sealed-vars.keep" -o "$WORK/sealed-vars.fd" --add-db 11111111-2222-3333-4444-555555555555 "$WORK/extra.pem" >"$LOGS/identity-pcr7.vars.log" 2>&1 ||
 		{ result FAIL identity-pcr7 "could not change db (see ${LOGS#"$REPO"/}/identity-pcr7.vars.log)"; return; }
 	id_boot identity-pcr7 "$STICK" || return
+	id_run identity-pcr7-move "--move after a Secure Boot change (PIN)" "the identity is $first's" id_seal --move --yes --pin-fd 3
 	vm_stop identity-pcr7
 	expect identity-pcr7 combination="$first" identity= hostcert=no ca_login=no "${SEALED[@]}"
+	id_boot identity-pcr7-moved "$STICK" || return
+	vm_stop identity-pcr7-moved
+	expect identity-pcr7-moved combination="$first" identity=SafespaceIdMachine identity_created=1 hostcert=yes assh_slot=0 ca_login=yes "${SEALED[@]}"
+	id_check identity-pcr7-moved "a new machine-id" "[[ '$(val identity-pcr7-moved machine_id)' != '$mid' ]]"
 }
 step_identity_move() {
 	local first other move mid
 	id_names
 	id_branch || return
-	# 7. Moved: in $move (temporary key), --move (PIN, a new generation); the next boot
-	# there certified, with a new machine-id; wrong PINs lock out.
-	id_boot_once identity-move-req "$move" || return
-	id_run identity-move "--move to $move (PIN)" "the identity is $move's" id_seal --move --yes --pin-fd 3
-	vm_stop identity-move-req
-	expect identity-move-req combination="$move" hostcert=no ca_login=no "${SEALED[@]}"
+	# 7. Moved ahead: from the certified default, --move $move (PIN, a new generation:
+	# $move's state approved before it is booted); the next boot is $move's,
+	# certified at once, with the same machine-id; wrong PINs lock out.
+	id_boot identity-move-from "$STICK" || return
+	id_run identity-move "--move $move from the default (PIN), without booting $move first" "keeps this machine-id" id_seal --move "$move" --yes --pin-fd 3
+	vm_stop identity-move-from
+	expect identity-move-from combination="$first" hostcert=yes assh_slot=0 ca_login=yes "${SEALED[@]}"
 	id_boot "identity-moved-$move" "$STICK" || return
 	vm_ssh 'for i in 1 2 3; do sudo bash -c "assh ca approve --config /etc/assh/assh.conf --pin-fd 3 3< <(printf wrong-pin)"; done; sudo bash -c "assh ca approve --config /etc/assh/assh.conf --pin-fd 3 3< <(printf %s \"\$0\")" '"$ID_PIN" >"$LOGS/identity-lockout.log" 2>&1
 	vm_stop "identity-moved-$move"
 	expect "identity-moved-$move" combination="$move" identity=SafespaceIdMachine identity_created=1 hostcert=yes assh_slot=0 ca_login=yes "${SEALED[@]}"
-	id_check "identity-moved-$move" "a new machine-id" "[[ '$(val "identity-moved-$move" machine_id)' != '$mid' ]]"
+	id_check "identity-moved-$move" "the same machine-id" "[[ '$(val "identity-moved-$move" machine_id)' == '$mid' ]]"
 	id_check identity-lockout "3 wrong PINs: the right one is locked out too" "grep -q 'wrong PIN' '$LOGS/identity-lockout.log' && tail -1 '$LOGS/identity-lockout.log' | grep -q 'locked out after too many wrong PINs'"
 	# 8. The default afterwards: its approvals are revoked.
 	id_boot_once identity-after-move "$first" || return
 	vm_stop identity-after-move
 	expect identity-after-move combination="$first" identity= hostcert=no ca_login=no "${SEALED[@]}"
+}
+step_identity_clear() {
+	local first other move mid old
+	id_names
+	id_branch || return
+	# 11. Cleared in the certified default: --identity says none; --identity-create in
+	# the same boot (this boot's recorded state); the next boot certified by the new
+	# CA, with a new machine-id; the old CA's line no longer logs in.
+	old=$(cat "$WORK/ca_known_hosts")
+	id_boot identity-clear "$STICK" || return
+	id_run identity-clear-run "--identity-clear" "the identity is removed" id_seal --identity-clear --yes
+	vm_ssh 'sudo safespace-seal --identity; ls /sys/firmware/efi/efivars | grep -c -E "^(SAFEasshCA|SafespaceIdMachine)-" || true' >"$LOGS/identity-clear.out" 2>&1
+	id_run identity-recreate "--identity-create after --identity-clear" "identity is created" id_seal --identity-create --pin-fd 3 --lockout-auth-fd 4
+	sed -n 's/^ *\(@cert-authority .*\)$/\1/p' "$LOGS/identity-recreate.log.out" | head -1 >"$WORK/ca_known_hosts"
+	vm_stop identity-clear
+	id_check identity-clear "nothing left of the identity: --identity says none" "grep -q 'identity:      none yet' '$LOGS/identity-clear.out' && tail -1 '$LOGS/identity-clear.out' | grep -qx 0"
+	id_boot identity-recreated "$STICK" || return
+	printf '%s\n' "$old" >"$WORK/ca_known_hosts.old"
+	cp "$WORK/ca_known_hosts" "$WORK/ca_known_hosts.new" && cp "$WORK/ca_known_hosts.old" "$WORK/ca_known_hosts"
+	ca_login | sed 's/^/old_/' >>"$LOGS/identity-recreated.probe"
+	cp "$WORK/ca_known_hosts.new" "$WORK/ca_known_hosts"
+	vm_stop identity-recreated
+	expect identity-recreated combination="$first" identity=SafespaceIdMachine identity_created=1 hostcert=yes assh_slot=0 ca_login=yes old_ca_login=no "${SEALED[@]}"
+	id_check identity-recreated "a new CA and a new machine-id" "[[ -s '$WORK/ca_known_hosts' && \"\$(cat '$WORK/ca_known_hosts')\" != '$old' && '$(val identity-recreated machine_id)' != '$mid' ]]"
 }
 step_identity_fails() {
 	local first other move mid
@@ -667,6 +709,44 @@ step_identity_fails() {
 		root=/dev/mapper/root,erofs verity=verified state=degraded failed=1 lockdown=integrity slim=ok
 	# StandardOutput=journal+console: the journal here (the VM's /dev/console is its screen).
 	id_check identity-agent-fails "the fallback says the host key is a throwaway one, and why" "grep -q 'ssh host key: THROWAWAY (aSSH did not start' '$LOGS/identity-agent-fails.journal' && grep -q 'SAFEasshCA' '$LOGS/identity-agent-fails.journal'"
+}
+step_identity_sha1() {
+	local first other move mid
+	id_names
+	# 10. A TPM with the SHA-1 bank only (the T450s's firmware), new, on the sealed
+	# variables without an identity. SHA-1 not allowed: no machine-id, aSSH's
+	# temporary key and nothing recorded; --sha1 on; the next boot gives the
+	# machine-id, --identity-create, the boot after is certified through slot 0;
+	# --sha1 off: the boot after has neither.
+	local ID_TPM="--tpm-banks sha1"
+	cp "$RUN/sealed-vars.fd" "$WORK/sealed-vars.fd"
+	: >"$WORK/ca_known_hosts"
+	id_boot identity-sha1-off "$STICK" || return
+	vm_ssh 'sudo dmesg | grep safespace-identity; sudo journalctl -b -u assh-agent -o cat; sudo safespace-seal --identity' >"$LOGS/identity-sha1-off.out" 2>&1
+	id_run identity-sha1-on "--sha1 on" "SHA-1 is allowed: from the next boot" id_seal --sha1 on
+	vm_stop identity-sha1-off
+	expect identity-sha1-off combination="$first" tpm_banks=sha1 identity= identity_created=0 hostkey_src=assh hostcert=no pcrs= ca_login=no "${SEALED[@]}" || return
+	id_check identity-sha1-off "SHA-1 not allowed: the initrd and the agent say so, --identity too" "grep -q 'SHA-1 is not allowed: no identity this boot' '$LOGS/identity-sha1-off.out' && grep -q 'none can be made: the TPM.s only active PCR bank is sha1, and sha1 is not allowed' '$LOGS/identity-sha1-off.out' && grep -q 'PCR bank:      none: the TPM has the SHA-1 bank only' '$LOGS/identity-sha1-off.out'"
+	id_boot identity-sha1-first "$STICK" || return
+	id_run identity-sha1-create "--identity-create on SHA-1" "identity is created" id_seal --identity-create --pin-fd 3 --lockout-auth-fd 4
+	sed -n 's/^ *\(@cert-authority .*\)$/\1/p' "$LOGS/identity-sha1-create.log.out" | head -1 >"$WORK/ca_known_hosts"
+	vm_stop identity-sha1-first
+	expect identity-sha1-first combination="$first" tpm_banks=sha1 identity=SafespaceIdMachine identity_created=1 hostkey_src=assh hostcert=no ca_login=no "${SEALED[@]}" || return
+	id_check identity-sha1-first "the recorded state is SHA-1's" "[[ '$(val identity-sha1-first pcrs)' == *'\"bank\":\"sha1\"'* ]]"
+	mid=$(val identity-sha1-first machine_id)
+	id_boot identity-sha1-certified "$STICK" || return
+	vm_ssh 'sudo safespace-seal --identity' >"$LOGS/identity-sha1-certified.out" 2>&1
+	id_attack "$first" >"$LOGS/identity-sha1-certified.attack" 2>&1
+	id_run identity-sha1-forbid "--sha1 off" "SHA-1 is forbidden: from the next boot" id_seal --sha1 off
+	vm_stop identity-sha1-certified
+	cat "$LOGS/identity-sha1-certified.attack" >>"$LOGS/identity-sha1-certified.probe"
+	expect identity-sha1-certified combination="$first" tpm_banks=sha1 identity=SafespaceIdMachine identity_created=0 hostkey_src=assh hostcert=yes assh_slot=0 ca_login=yes unsealed=no unsealed_extended=no "${SEALED[@]}"
+	id_check identity-sha1-certified "the same machine-id; --identity names the SHA-1 bank" "[[ '$(val identity-sha1-certified machine_id)' == '$mid' ]] && grep -q 'PCR bank:      sha1' '$LOGS/identity-sha1-certified.out'"
+	id_boot identity-sha1-forbidden "$STICK" || return
+	vm_ssh 'sudo dmesg | grep safespace-identity; sudo journalctl -b -u assh-agent -o cat' >"$LOGS/identity-sha1-forbidden.out" 2>&1
+	vm_stop identity-sha1-forbidden
+	expect identity-sha1-forbidden combination="$first" identity= hostkey_src=assh hostcert=no ca_login=no "${SEALED[@]}"
+	id_check identity-sha1-forbidden "--sha1 off: neither the machine-id nor a certificate" "grep -q 'SHA-1 is not allowed: no identity this boot' '$LOGS/identity-sha1-forbidden.out' && grep -q 'the CA reads sha1, and sha1 is no longer allowed' '$LOGS/identity-sha1-forbidden.out'"
 }
 
 # Boot NAME once in COMBINATION: the selection written into the step's firmware
@@ -735,6 +815,8 @@ if wants identity; then
 	else
 		job 30-identity step_identity
 		ID_PID=$JOB_PID
+		# A TPM of its own, from the sealed variables: beside the rest.
+		job 37-identity-sha1 step_identity_sha1
 	fi
 fi
 if wants select; then
@@ -756,6 +838,7 @@ if [[ -n ${ID_PID:-} ]]; then
 	job 34-identity-pcr7 step_identity_pcr7
 	job 35-identity-move step_identity_move
 	job 36-identity-fails step_identity_fails
+	job 38-identity-clear step_identity_clear
 fi
 wait
 

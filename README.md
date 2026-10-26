@@ -619,7 +619,7 @@ tests/vm.sh --no-build --jobs 2      # at most two VMs at a time
 | `seal` | Setup Mode → `safespace-seal` → the sealed firmware | Secure Boot `enabled (user)`, `verified`, `running` |
 | `net-sb` | network boot with enforced Secure Boot | Secure Boot enabled, `verified`, `running` |
 | `select` | on the sealed firmware, one VM, one boot after the other: no selection, `safespace-select set <second>`, `once <first>`, the second again (persistent), `clear`, the first again. Side by side, every further combination in a VM of its own: `SafespaceSelectOnce=<name>` written into a copy of the sealed variables (`virt-fw-vars`) | the booted combination's name (the initrd's choice, `/usr/lib/safespace/combination`, `PRETTY_NAME`, the login banner) and groups (`/usr/lib/safespace/groups`; the docker command exactly with the docker group); a preset `SafespaceSelectOnce` deleted by the initrd; `debug` has exactly the default's setuid/setgid files, file capabilities and enabled units; each Secure Boot enabled and `verified` |
-| `identity` | on a TPM of its own (swtpm, `test-vm.sh --tpm`) and a copy of the sealed firmware, the creation and the certified boot first, then each further case side by side on a copy of their TPM and variables, with a client that trusts only the CA (`@cert-authority`, `StrictHostKeyChecking yes`): the first sealed boot and `safespace-seal --identity-create` in it, the default again, `debug` once, over the network, an option ROM more (PCR 2), another db certificate (PCR 7), `--move` to `containers`, the default afterwards | first boot: machine-id created, aSSH's temporary key, the client refused, the identity created; the default again: certified through slot 0, the client logs in, `--identity` says so, an agent restart gets no certificate (window closed; sshd restarts with it, the first state is kept), its root can't unseal the machine-id (also not after extending PCR 15); `debug`: temporary key, nothing released, `--approve` refused; network: slot 1 (PCR 0 differs in QEMU), `--approve`; PCR 2: slot 1, `--approve`, slot 0; PCR 7: temporary; moved: certified in `containers` with a new machine-id, 3 wrong PINs lock out, the default then temporary ([Machine identity](#machine-identity)) |
+| `identity` | on a TPM of its own (swtpm, `test-vm.sh --tpm`) and a copy of the sealed firmware, the creation and the certified boot first, then each further case side by side on a copy of their TPM and variables, with a client that trusts only the CA (`@cert-authority`, `StrictHostKeyChecking yes`): the first sealed boot and `safespace-seal --identity-create` in it, the default again, `debug` once, over the network, an option ROM more (PCR 2), another db certificate (PCR 7), `--move` to `containers`, the default afterwards, the agent failing; beside them a new TPM with the SHA-1 bank only (`--tpm-banks sha1`): not allowed, `--sha1 on`, the creation, certified, `--sha1 off` | first boot: machine-id created, aSSH's temporary key, the client refused, the identity created; the default again: certified through slot 0, the client logs in, `--identity` says so, an agent restart gets no certificate (window closed; sshd restarts with it, the first state is kept), its root can't unseal the machine-id (also not after extending PCR 15); `debug`: temporary key, nothing released, `--approve` refused; network: slot 1 (PCR 0 differs in QEMU), `--approve`; PCR 2: slot 1, `--approve`, slot 0; PCR 7: temporary; moved: certified in `containers` with a new machine-id, 3 wrong PINs lock out, the default then temporary; the agent failing: the throwaway key, the reason on the console; SHA-1 only: without `--sha1 on` no machine-id and the temporary key (nothing recorded), with it the machine-id, the creation and slot 0, after `--sha1 off` neither ([Machine identity](#machine-identity)) |
 
 **Kept apart from everything real**, in `mkosi.test/vm/` (gitignored): the test user
 `tester` and its key (created on the first run, used for nothing else), the test builds
@@ -902,7 +902,7 @@ same across reboots and updates of that combination. The host key is
 - **Another combination** boots normally, with aSSH's temporary host key (made in the TPM,
   not certified, its fingerprint in the journal) and a throwaway machine-id: clients that
   trust only the CA refuse it. Moving the identity there takes the PIN, and takes it from
-  the old combination: `sudo safespace-seal --move`.
+  the old combination: `sudo safespace-seal --move NAME` from a boot of the current one.
 - **The PIN** opens a key in the TPM that approves states; 3 wrong entries lock it for 30
   minutes. The TPM's **lockout authorization** (set at the creation, asked twice) resets a
   lockout and clears the TPM: keep it off the machine, in your password manager.
@@ -912,7 +912,10 @@ same across reboots and updates of that combination. The host key is
 | `sudo safespace-seal --identity-create` | the first identity, for the combination booted (Secure Boot on): sets the lockout authorization if the TPM has none, asks a new PIN, creates the CA, approves this boot's state, prints the `@cert-authority` line. sshd serves the temporary key until the reboot; the next boot certifies |
 | `safespace-seal --identity` | the combination, the machine-id, the CA with its approvals and the `@cert-authority` line, this boot's host key: certified through which slot, or temporary |
 | `sudo safespace-seal --approve` | after an update (certified through slot 1): approves this state in every slot (PIN) |
-| `sudo safespace-seal --move` | in a boot with the temporary key (`safespace-select set NAME`, reboot): moves the identity here (PIN), revokes every approval before, gives this combination the machine-id at the next boot and keeps booting it. Also after a Secure Boot key change (PCR 7) in the same combination |
+| `sudo safespace-seal --sha1 on\|off` | allows SHA-1 on a TPM whose firmware activates no SHA-256 PCR bank (T450s), or forbids it again: the machine-id and the host key use it from the next boot, only while it is on. Elsewhere it changes nothing ([SECURITY.md](SECURITY.md#the-sha-1-bank)) |
+| `sudo safespace-seal --move NAME` | from the current boot, without booting NAME first: approves NAME's state (this boot's PCR 0, 2, 7, 11; PCR 15 as NAME's initrd leaves it) with the PIN, revokes every approval before, carries the machine-id (when it is released in this boot) and selects NAME. The next boot is NAME's, certified, with the same machine-id |
+| `sudo safespace-seal --move` | in a boot with the temporary key: moves the identity to the combination booted (PIN), revokes every approval before; a new machine-id at the next boot. For a Secure Boot key change (PCR 7) in the same combination, or a boot `--move NAME` was not run from |
+| `sudo safespace-seal --identity-clear` | removes the identity (YES): the CA, its PIN index and counter in the TPM, the machine-id slot; the lockout authorization and `--sha1` stay. `--identity-create` makes a new one, with a new `@cert-authority` line |
 
 The CA's file is the EFI variable `SAFEasshCA` (nothing secret in it: the TPM checks every
 approval). The identity is lost when the TPM is cleared or the firmware's variables are wiped:
@@ -934,9 +937,14 @@ ssh -p 2222 you@127.0.0.1 sudo safespace-seal --identity-create   # PIN, lockout
 #   power off, boot again (--sealed --tpm): ssh -o StrictHostKeyChecking=yes -p 2222 you@127.0.0.1
 ```
 
+A TPM like the T450s's, with the SHA-1 bank only: `--tpm-banks sha1` instead of `--tpm` (on
+a new work directory); `sudo safespace-seal --sha1 on` and a reboot before `--identity-create`.
+
 On a T450s: the security chip must be a TPM 2.0 (booted, `ls /dev/tpmrm0`; if not, look at
 the firmware setup's security chip settings), seal with the stick (`sudo safespace-seal` in Setup Mode, then Secure Boot
-on), boot it once sealed, then `sudo safespace-seal --identity-create` and reboot. Check:
+on), boot it once sealed, then `sudo safespace-seal --identity-create` and reboot. Its firmware
+activates the TPM's SHA-1 bank only (`safespace-seal --identity`: "PCR bank: none ..."): first
+`sudo safespace-seal --sha1 on` and a reboot, which also gives it the machine-id. Check:
 `safespace-seal --identity` says "certified by the CA through slot 0", and a client with only
 the `@cert-authority` line logs in. Then: another combination (`safespace-select once NAME`) is
 refused by that client; an update keeps the login (slot 1 until `--approve`).

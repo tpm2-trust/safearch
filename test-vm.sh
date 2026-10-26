@@ -49,6 +49,9 @@
 # --tpm: a TPM 2.0 (swtpm, CRB interface like Intel PTT). Its state is kept in
 #   tpm/ of the work directory, so the TPM survives reboots like a real one
 #   (the machine's identity is sealed to it). Needs swtpm (pacman -S swtpm).
+# --tpm-banks BANKS: --tpm, made with only these PCR banks active (sha1: as
+#   the ThinkPad T450s's firmware leaves its TPM), when tpm/ is new
+#   (swtpm_setup --pcr-banks); a TPM kept in tpm/ keeps its banks.
 # --work DIR: the VM's files (firmware variables, serial.log, qga.sock, the
 #   stick image, the netboot docroot); default mkosi.test/. One per VM when
 #   several run at once (tests/vm.sh). Keep the path short: qga.sock is a unix
@@ -64,7 +67,7 @@ HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 
-IMAGE="" SB=0 SETUP=0 SEALED=0 SSH_PORT="" NETBOOT=0 TREE="" NBMODE=http BOOT_URL="" SERVE=1 WORK="" TPM=0
+IMAGE="" SB=0 SETUP=0 SEALED=0 SSH_PORT="" NETBOOT=0 TREE="" NBMODE=http BOOT_URL="" SERVE=1 WORK="" TPM=0 TPM_BANKS=""
 while (($#)); do
 	case $1 in
 		--netboot) NETBOOT=1; shift ;;
@@ -75,6 +78,7 @@ while (($#)); do
 		--setup-mode) SETUP=1; shift ;;
 		--sealed) SEALED=1; shift ;;
 		--tpm) TPM=1; shift ;;
+		--tpm-banks) TPM=1 TPM_BANKS=${2:?--tpm-banks needs banks, e.g. sha1}; shift 2 ;;
 		--ssh) SSH_PORT=${2:?--ssh needs a port}; shift 2 ;;
 		--no-server) SERVE=0; shift ;;
 		--work) WORK=${2:?--work needs a directory}; shift 2 ;;
@@ -270,13 +274,17 @@ if ((TPM)); then
 	((${#WORK} + 9 <= 107)) || die "--work path too long for the tpm.sock unix socket: $WORK"
 	mkdir -p "$WORK/tpm"
 	rm -f "$WORK/tpm.sock"
+	if [[ -n $TPM_BANKS && -z $(ls -A "$WORK/tpm") ]]; then
+		swtpm_setup --tpm2 --tpmstate "$WORK/tpm" --config /dev/null --pcr-banks "$TPM_BANKS" >"$WORK/swtpm_setup.log" 2>&1 ||
+			die "swtpm_setup failed (see $WORK/swtpm_setup.log)"
+	fi
 	# --terminate: swtpm ends with QEMU's connection; the state stays in tpm/.
 	swtpm socket --tpm2 --tpmstate dir="$WORK/tpm" --ctrl type=unixio,path="$WORK/tpm.sock" \
 		--terminate --log file="$WORK/swtpm.log" &
 	for _ in $(seq 50); do [[ -S $WORK/tpm.sock ]] && break; sleep 0.1; done
 	[[ -S $WORK/tpm.sock ]] || die "swtpm did not start (see $WORK/swtpm.log)"
 	extra+=(-chardev socket,id=chrtpm,path="$WORK/tpm.sock" -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-crb,tpmdev=tpm0)
-	log "TPM 2.0: swtpm, state in $WORK/tpm"
+	log "TPM 2.0: swtpm, state in $WORK/tpm${TPM_BANKS:+ (made with the PCR banks $TPM_BANKS)}"
 fi
 qemu-system-x86_64 -machine "$machine" "${extra[@]}" -cpu host -smp 2 -m "$MEM" \
 	-drive if=pflash,format=raw,readonly=on,file="$code" \
