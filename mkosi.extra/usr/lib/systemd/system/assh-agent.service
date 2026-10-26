@@ -5,7 +5,8 @@
 # measures "sysinit" after sysinit.target), and PCR 15 the initrd's
 # measurements alone - so before systemd-pcrmachine and systemd-pcrfs-root.
 # It closes the window (PCR 15) once the key is made, also without a
-# certificate. Without a TPM 2.0, sshd-hostkeys.service makes a throwaway key.
+# certificate. Without a TPM 2.0, or when this fails, sshd-hostkeys.service
+# makes a throwaway key; what went wrong is on the console too.
 [Unit]
 Description=aSSH: the host key in the TPM, certified by the machine's CA
 DefaultDependencies=no
@@ -19,6 +20,9 @@ Before=shutdown.target
 [Service]
 Type=notify
 ExecStart=/usr/bin/assh agent --config /etc/assh/assh.conf
+# Never holds the boot: sshd falls back to a throwaway key.
+TimeoutStartSec=60s
+StandardError=journal+console
 ExecStartPost=/usr/bin/install -d -m 0755 /run/safespace
 ExecStartPost=/bin/sh -c 'printf "HostKey /run/assh/host.pub\\nHostCertificate /run/assh/host-cert.pub\\nHostKeyAgent /run/assh/agent.sock\\n" >/run/safespace/sshd-hostkey.conf'
 # A restart gets no certificate: the window is closed until the next boot.

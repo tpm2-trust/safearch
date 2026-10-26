@@ -916,8 +916,10 @@ same across reboots and updates of that combination. The host key is
 
 The CA's file is the EFI variable `SAFEasshCA` (nothing secret in it: the TPM checks every
 approval). The identity is lost when the TPM is cleared or the firmware's variables are wiped:
-`--identity-create` again, and the clients need the new line. Machines without a TPM 2.0
-get a throwaway ed25519 host key on every boot. Details, measures and tests:
+`--identity-create` again, and the clients need the new line. Machines without a TPM 2.0,
+and any boot where aSSH can't start, get a throwaway ed25519 host key (new on every boot):
+ssh stays reachable, and the console says `ssh host key: THROWAWAY (...)` with the reason
+(`journalctl -b -u assh-agent`). Details, measures and tests:
 [SECURITY.md](SECURITY.md#machine-identity).
 
 #### Trying it by hand (QEMU, or a T450s)

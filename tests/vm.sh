@@ -74,7 +74,9 @@
 #           option ROM more (PCR 2): slot 1, --approve, slot 0; another db
 #           certificate (PCR 7): temporary; --move to another combination (PIN):
 #           certified there with a new machine-id, wrong PINs lock out; the
-#           default afterwards: temporary (its approvals revoked).
+#           default afterwards: temporary (its approvals revoked); SAFEasshCA
+#           damaged, so the agent fails: sshd up with a throwaway key, the
+#           console says why.
 #
 # Prerequisites (all checked before anything starts; the list of what is
 # missing, then exit 2):
@@ -599,8 +601,19 @@ step_identity() {
 	id_check identity-lockout "3 wrong PINs: the right one is locked out too" "grep -q 'wrong PIN' '$LOGS/identity-lockout.log' && tail -1 '$LOGS/identity-lockout.log' | grep -q 'locked out after too many wrong PINs'"
 	# 8. The default afterwards: its approvals are revoked.
 	id_boot_once identity-after-move "$first" || return
+	# 9. The agent fails (SAFEasshCA damaged): sshd still comes up, with the throwaway
+	# key, and the console says why.
+	vm_ssh 'v=/sys/firmware/efi/efivars/SAFEasshCA-24415b90-39be-45c0-a9a3-d547ebe28ea0; sudo chattr -i $v; printf "\007\000\000\000{broken" | sudo tee $v >/dev/null' >"$LOGS/identity-broken.log" 2>&1
 	vm_stop identity-after-move
 	expect identity-after-move combination="$first" identity= hostcert=no ca_login=no "${SEALED[@]}"
+	id_boot_once identity-agent-fails "$first" || return
+	vm_ssh 'sudo journalctl -b -u sshd-hostkeys -u assh-agent -o cat' >"$LOGS/identity-agent-fails.journal" 2>&1
+	vm_stop identity-agent-fails
+	# assh-agent failed: the one failed unit, the system degraded.
+	expect identity-agent-fails combination="$first" hostkey_src=throwaway ca_login=no secure_boot=enabled* path_var=set usb_bootdev=1 \
+		root=/dev/mapper/root,erofs verity=verified state=degraded failed=1 lockdown=integrity slim=ok
+	# StandardOutput=journal+console: the journal here (the VM's /dev/console is its screen).
+	id_check identity-agent-fails "the fallback says the host key is a throwaway one, and why" "grep -q 'ssh host key: THROWAWAY (aSSH did not start' '$LOGS/identity-agent-fails.journal' && grep -q 'SAFEasshCA' '$LOGS/identity-agent-fails.journal'"
 }
 # Boot NAME once in COMBINATION: the selection written into the step's firmware
 # variables (virt-fw-vars), as select does it; the initrd deletes it.

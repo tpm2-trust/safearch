@@ -712,8 +712,8 @@ if wanted assh && need go; then
 	A=$REPO/mkosi.extra/usr/lib/systemd/system/assh-agent.service
 	check "the agent starts before systemd's PCR 15 units and sysinit (PCR 11 and 15 as the initrd left them)" \
 		bash -c 'grep -q "^Before=.*sysinit.target" "$1" && grep -q "^Before=.*systemd-pcrmachine.service" "$1" && grep -q "^Before=.*systemd-pcrfs-root.service" "$1"' _ "$A"
-	check "the agent is enabled, sshd includes the host key file it (or sshd-hostkeys without a TPM) writes" \
-		bash -c 'grep -qx "enable assh-agent.service" "$1" && grep -qx "Include /run/safespace/sshd-hostkey.conf" "$2" && grep -q "ConditionPathExists=!/dev/tpmrm0" "$3"' _ \
+	check "the agent is enabled, sshd includes the host key file it writes; the fallback runs after it, whatever came of it" \
+		bash -c 'grep -qx "enable assh-agent.service" "$1" && grep -qx "Include /run/safespace/sshd-hostkey.conf" "$2" && grep -qx "After=assh-agent.service" "$3" && ! grep -q "^Condition" "$3" && grep -q "\[ -s \"\$c\" \] && exit 0" "$3"' _ \
 		"$REPO/mkosi.extra/usr/lib/systemd/system-preset/10-safespace.preset" "$REPO/mkosi.extra/etc/ssh/sshd_config.d/10-safespace.conf" "$REPO/mkosi.extra/etc/systemd/system/sshd-hostkeys.service"
 	check "the initrd has no ssh (the host key is aSSH's, in the root)" bash -c '! grep -qE "^[[:space:]]+openssh$" <(sed -n "/^InitrdPackages=/,/^[A-Z]/p" "$1")' _ "$REPO/mkosi.conf"
 	if need swtpm; then
