@@ -16,20 +16,41 @@
 # Finally switch Secure Boot on in the firmware setup if it does not turn on by
 # itself, and set a firmware password.
 #
-#   sudo safespace-seal --assign NAME [--yes]
+#   sudo safespace-seal --identity-create [--pin-fd N] [--lockout-auth-fd N]
 #   safespace-seal --identity
+#   sudo safespace-seal --approve [--pin-fd N]
+#   sudo safespace-seal --move [--pin-fd N] [--yes]
 #
-# The machine's identity (SECURITY.md, "Machine identity"): on the first boot
-# with Secure Boot on, the initrd creates an ssh host key and machine-id and
-# seals them to this TPM, to Secure Boot with these keys and to the combination
-# that booted. From then on they are released whenever that combination boots,
-# also after updates; any other combination gets a throwaway host key and
-# machine-id.
-# --assign NAME: move this machine to the combination NAME: at the next boot,
-#   which boots NAME, the initrd replaces the identity with a new one (a new
-#   host key: ssh clients will notice). Needs Secure Boot on, with this stick's PK.
-# --identity: this boot's identity: combination, released or not, the host
-#   key's fingerprint and known_hosts line, the machine's inventory ID.
+# The machine's identity (SECURITY.md, "Machine identity"): its ssh host key is
+# aSSH's (assh-agent.service, /etc/assh/assh.conf): made in the TPM at every
+# boot and certified by the machine's CA, a key in the TPM whose file is the
+# EFI variable SAFEasshCA, only while the PCRs hold a state approved with the
+# PIN - the combination (PCR 15) included, so updates keep the identity and
+# another combination gets aSSH's temporary key (made in the TPM, not
+# certified). The machine-id: sealed in the initrd to the combination too
+# (the first boot with Secure Boot on creates it). Clients trust the CA once:
+# '@cert-authority <names> <key>' in known_hosts (--identity prints it).
+# --identity-create: the first identity, in the combination booted (Secure Boot
+#   on, this stick's keys): sets the TPM's lockout authorization if it has none
+#   (asked twice; it resets a PIN lockout and clears the TPM: keep it off the
+#   machine), asks a new PIN (twice), creates the CA and approves the state
+#   this boot's agent recorded. sshd serves the temporary key until the
+#   reboot; the next boot certifies.
+# --identity: the combination, the machine-id, the CA, its approvals and the
+#   known_hosts line, the host key of this boot (certified through which slot,
+#   or temporary).
+# --approve: after an update this boot was certified through slot 1 (the
+#   firmware, an option ROM or the UKI changed): approves this state in every
+#   slot (PIN). Only in a boot that was certified: another combination needs
+#   --move.
+# --move: moves the identity to the combination booted (after safespace-select
+#   and a reboot: the temporary key), or keeps it here after a Secure Boot
+#   change (PCR 7: no slot met): approves this boot's state with a new
+#   generation of the PIN's counter (PIN), which revokes every approval made
+#   before - the old combination loses the identity; gives this combination
+#   the machine-id at the next boot and keeps booting it.
+# --pin-fd N / --lockout-auth-fd N: the secret from a file descriptor (every
+#   byte; tests), never from the command line or the environment.
 set -Eeuo pipefail
 
 KEYS=/usr/share/safespace/secureboot
@@ -41,13 +62,18 @@ die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 warn() { printf '\e[1;33m==> WARNING:\e[0m %s\n' "$*" >&2; }
 
-REPLACE=0 CONFIRM=1 ASSIGN="" IDENTITY=0
+REPLACE=0 CONFIRM=1 IDENTITY="" PIN_FD="" LOCKOUT_FD=""
+fd_arg() { [[ ${1:-} =~ ^[0-9]+$ ]] || die "$2 needs a file descriptor number"; echo "$1"; }
 while (($#)); do
 	case $1 in
 		--replace) REPLACE=1; shift ;;
 		--yes) CONFIRM=0; shift ;;
-		--assign) ASSIGN=${2:-}; shift 2 || die "--assign needs a combination name" ;;
-		--identity) IDENTITY=1; shift ;;
+		--identity) IDENTITY=show; shift ;;
+		--identity-create) IDENTITY=create; shift ;;
+		--approve) IDENTITY=approve; shift ;;
+		--move) IDENTITY=move; shift ;;
+		--pin-fd) PIN_FD=$(fd_arg "${2:-}" --pin-fd); shift 2 ;;
+		--lockout-auth-fd) LOCKOUT_FD=$(fd_arg "${2:-}" --lockout-auth-fd); shift 2 ;;
 		-h|--help) sed -n '2,${/^#/!q;s/^# \?//;p}' "$0"; exit 0 ;;
 		*) die "unknown option $1" ;;
 	esac
@@ -59,27 +85,143 @@ SELECT_GUID=8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34
 # (machine-id(5): the machine-id itself stays confidential).
 APP_ID=eda1fc8c35e94e2087addff88d0b4e91
 
-if ((IDENTITY)); then
-	booted=$(cat /usr/lib/safespace/combination 2>/dev/null || echo "?")
-	echo "combination:   $booted"
-	for v in SafespaceIdHostKey SafespaceIdMachine; do
-		[[ -e $EFIVARS/$v-$SELECT_GUID ]] && st="sealed in the firmware" || st="none (not assigned)"
-		printf '%-14s %s\n' "${v#SafespaceId}:" "$st"
-	done
-	# Written by the initrd (identity): the slots it released this boot.
-	if grep -qx SafespaceIdHostKey /run/safespace/identity/released 2>/dev/null; then
-		echo "this boot:     identity released (this is the machine's assigned combination)"
-		echo "inventory ID:  $(systemd-id128 machine-id --app-specific=$APP_ID)"
+# --- the identity (aSSH) --------------------------------------------------------
+ASSH=/usr/bin/assh
+ASSH_CONF=/etc/assh/assh.conf
+# The CA's file: the EFI variable of assh.conf's ASSH_CA (aSSH's vendor GUID).
+CA_VAR=$EFIVARS/SAFEasshCA-24415b90-39be-45c0-a9a3-d547ebe28ea0
+# What the agent recorded at its start (ASSH_STATE), and its files.
+STATE=/run/assh/agent.pcrs.json
+CERT=/run/assh/host-cert.pub HOSTPUB=/run/assh/host.pub
+booted() { cat /usr/lib/safespace/combination 2>/dev/null || echo "?"; }
+
+# The slot that certified this boot's host key ("" for none), as the agent
+# logged it.
+certified_slot() {
+	[[ -s $CERT ]] || return 0
+	journalctl -b -u assh-agent.service -o cat 2>/dev/null | sed -n 's/.* through slot \([0-9]*\)$/\1/p' | tail -1
+}
+
+# A secret into the variable named $1: from the file descriptor $2 (every
+# byte), else asked on the terminal ($3, twice when $4 is "new"). It stays in
+# this shell's memory: assh gets it on a pipe (secret_fd), never on a command
+# line, in the environment or on disk.
+read_secret() { # VAR FD PROMPT [new]
+	local v="" again=""
+	if [[ -n $2 ]]; then
+		IFS= read -r -d '' -u "$2" v || true
 	else
-		echo "this boot:     no identity (throwaway host key and machine-id)"
+		[[ -r /dev/tty ]] || die "no terminal to ask the $3 on (or: --pin-fd / --lockout-auth-fd)"
+		IFS= read -rsp "$3: " v </dev/tty; echo >/dev/tty
+		if [[ ${4:-} == new ]]; then
+			IFS= read -rsp "$3 again: " again </dev/tty; echo >/dev/tty
+			[[ $v == "$again" ]] || die "the two entries differ"
+		fi
 	fi
-	k=/var/lib/sshd/etc/ssh/ssh_host_ed25519_key.pub
-	if [[ -r $k ]]; then
-		echo "host key:      $(ssh-keygen -lf "$k" | cut -d' ' -f2)"
-		echo "known_hosts:   $(uname -n) $(cut -d' ' -f1,2 "$k")"
+	[[ -n $v ]] || die "the $3 is empty"
+	printf -v "$1" '%s' "$v"
+}
+# assh with the secret in $1 on file descriptor 3 (printf is a builtin: the
+# secret is in no process's arguments).
+assh_with() { # VAR ASSH-ARGS...
+	local var=$1; shift
+	"$ASSH" "$@" 3< <(printf '%s' "${!var}")
+}
+
+identity_show() {
+	echo "combination:   $(booted)"
+	if [[ -e $EFIVARS/SafespaceIdMachine-$SELECT_GUID ]]; then
+		if grep -qx SafespaceIdMachine /run/safespace/identity/released 2>/dev/null; then
+			echo "machine-id:    the machine's (released in this combination); inventory ID $(systemd-id128 machine-id --app-specific=$APP_ID)"
+		else
+			echo "machine-id:    throwaway (the machine's is sealed to another combination)"
+		fi
+	else
+		echo "machine-id:    throwaway (none sealed yet: the first boot with Secure Boot on creates it)"
 	fi
+	if [[ ! -e $CA_VAR ]]; then
+		echo "identity:      none yet: sudo safespace-seal --identity-create"
+	else
+		echo "identity:      the CA in this TPM (SAFEasshCA):"
+		"$ASSH" ca show --config "$ASSH_CONF" 2>&1 | sed 's/^/  /'
+	fi
+	local slot fp
+	fp=$(ssh-keygen -lf "$HOSTPUB" 2>/dev/null | cut -d' ' -f2) || true
+	slot=$(certified_slot)
+	if [[ -n $slot ]]; then
+		echo "this boot:     host key ${fp:-?}, certified by the CA through slot $slot"
+		[[ $slot == 0 ]] || echo "               (slot 0 is not met: after an update, sudo safespace-seal --approve)"
+	elif [[ -s $HOSTPUB ]]; then
+		echo "this boot:     host key ${fp:-?} TEMPORARY (not certified: compare its fingerprint before trusting it)"
+		[[ -e $CA_VAR ]] && echo "               (another combination, or Secure Boot changed: sudo safespace-seal --move to have the identity here)"
+	else
+		echo "this boot:     no host key of aSSH (no TPM 2.0: a throwaway key)"
+	fi
+}
+
+identity() { # show | create | approve | move
+	[[ $1 == show ]] && { identity_show; exit 0; }
+	[[ -x $ASSH && -r $ASSH_CONF ]] || die "this image has no aSSH ($ASSH, $ASSH_CONF)"
+	[[ -e /dev/tpmrm0 ]] || die "no TPM 2.0 (/dev/tpmrm0): the identity is the TPM's"
+	# The state approved holds PCR 7: Secure Boot on, with this stick's keys.
+	[[ $setup == 0 && $sb == 1 ]] ||
+		die "Secure Boot is not on (SetupMode=${setup:-?} SecureBoot=${sb:-?}): seal first, switch it on, boot again"
+	[[ -s $STATE ]] || die "the agent recorded no state this boot ($STATE: systemctl status assh-agent)"
+	local name pin="" lockout=""
+	name=$(booted)
+	case $1 in
+		create)
+			[[ ! -e $CA_VAR ]] || die "this machine has an identity already (safespace-seal --identity); --move moves it here"
+			if "$ASSH" tpm da --config "$ASSH_CONF" 2>&1 | grep -q "no lockout authorization"; then
+				log "the TPM has no lockout authorization: set one now. It resets a PIN lockout and clears the TPM: keep it off this machine"
+				read_secret lockout "$LOCKOUT_FD" "new lockout authorization" new
+				assh_with lockout tpm da --config "$ASSH_CONF" --new-lockout-auth-fd 3 \
+					--max-tries 3 --recovery 1800 --lockout-recovery 1800 || die "setting the lockout authorization failed"
+				lockout=""
+			else
+				log "the TPM's lockout authorization is set already: kept"
+			fi
+			log "the identity's PIN: 3 wrong entries lock it for 30 minutes"
+			read_secret pin "$PIN_FD" "new PIN" new
+			assh_with pin ca create --config "$ASSH_CONF" --pin-fd 3 >/dev/null || die "creating the CA failed"
+			assh_with pin ca approve --config "$ASSH_CONF" --values "$STATE" --pin-fd 3 || die "approving this state failed"
+			pin=""
+			log "this machine's identity is created, for $name. The next boot certifies its host key; until then sshd serves the temporary one."
+			"$ASSH" ca show --config "$ASSH_CONF" | sed -n '/known_hosts line/,+1p'
+			;;
+		approve)
+			[[ -e $CA_VAR ]] || die "no identity yet: sudo safespace-seal --identity-create"
+			local slot
+			slot=$(certified_slot)
+			[[ -n $slot ]] || die "this boot was not certified: another combination, or a Secure Boot change - sudo safespace-seal --move"
+			[[ $slot != 0 ]] || { log "this boot was certified through slot 0: nothing to approve"; exit 0; }
+			read_secret pin "$PIN_FD" "PIN"
+			assh_with pin ca approve --config "$ASSH_CONF" --values "$STATE" --pin-fd 3 || die "approving this state failed"
+			pin=""
+			log "this state of $name is approved: the next boot certifies through slot 0"
+			;;
+		move)
+			[[ -e $CA_VAR ]] || die "no identity yet: sudo safespace-seal --identity-create"
+			[[ -z $(certified_slot) ]] || die "this boot was certified: $name holds the identity already (after an update: --approve)"
+			if ((CONFIRM)); then
+				read -rp "Move this machine's identity to '$name'? Every other combination loses it. Type YES: " answer
+				[[ $answer == YES ]] || die "aborted"
+			fi
+			read_secret pin "$PIN_FD" "PIN"
+			assh_with pin ca approve --config "$ASSH_CONF" --values "$STATE" --next-generation --pin-fd 3 || die "approving this state failed"
+			pin=""
+			# The machine-id follows, at the next boot (the initrd seals a new one
+			# for $name), and $name stays the combination booted.
+			f=$EFIVARS/SafespaceAssign-$SELECT_GUID
+			[[ -e $f ]] && { chattr -i "$f" 2>/dev/null || true; rm -f "$f"; }
+			printf '\x07\x00\x00\x00%s' "$name" >"$f" || die "could not write SafespaceAssign"
+			safespace-select set "$name" >/dev/null || warn "safespace-select set $name failed: select it to keep booting it"
+			log "the identity is $name's: every approval before is revoked. Reboot: the next boot certifies, and gets the machine-id"
+			;;
+	esac
 	exit 0
-fi
+}
+[[ $IDENTITY == show ]] && identity show
 
 [[ $EUID -eq 0 ]] || die "must run as root"
 [[ -d $EFIVARS ]] || die "not booted in UEFI mode"
@@ -109,35 +251,7 @@ setup=$(var_byte SetupMode)
 sb=$(var_byte SecureBoot)
 log "SetupMode=${setup:-?} SecureBoot=${sb:-?}"
 
-if [[ -n $ASSIGN ]]; then
-	[[ $ASSIGN =~ ^[a-z][a-z0-9-]{0,23}$ ]] || die "not a combination name: $ASSIGN"
-	[[ " $(cat /proc/cmdline) " == *" safespace.root.$ASSIGN="* ]] ||
-		die "'$ASSIGN' is not a combination of this build (safespace-select list)"
-	[[ $setup == 0 && $sb == 1 ]] ||
-		die "Secure Boot is not on (SetupMode=${setup:-?} SecureBoot=${sb:-?}): seal first, switch it on, then assign"
-	# The identity is bound to PCR 7, i.e. to the Secure Boot keys in the firmware:
-	# they must be this stick's, or the next build would not see the same values.
-	tail -c +5 "$EFIVARS/PK-$GLOBAL" >/tmp/.seal-PK.esl
-	sig-list-to-certs /tmp/.seal-PK.esl /tmp/.seal-PK >/dev/null 2>&1 || true
-	[[ -s /tmp/.seal-PK-0.der && $(sha256sum </tmp/.seal-PK-0.der) == "$(openssl x509 -in "$KEYS/PK.pem" -outform DER | sha256sum)" ]] ||
-		{ rm -f /tmp/.seal-PK*; die "the firmware's PK is not this stick's: seal with this stick first"; }
-	rm -f /tmp/.seal-PK*
-	if [[ -e $EFIVARS/SafespaceIdHostKey-$SELECT_GUID ]]; then
-		warn "this machine has an identity already: it is replaced (new host key and machine-id)"
-	fi
-	if ((CONFIRM)); then
-		read -rp "Assign this machine to '$ASSIGN'? Type YES: " answer
-		[[ $answer == YES ]] || die "aborted"
-	fi
-	for v in SafespaceAssign SafespaceSelectOnce; do
-		f=$EFIVARS/$v-$SELECT_GUID
-		[[ -e $f ]] && { chattr -i "$f" 2>/dev/null || true; rm -f "$f"; }
-		printf '\x07\x00\x00\x00%s' "$ASSIGN" >"$f" || die "could not write $v"
-	done
-	log "Assignment to $ASSIGN requested: reboot now. The initrd boots $ASSIGN once and seals the new identity."
-	echo "Then: safespace-seal --identity (fingerprint, inventory ID); safespace-select set $ASSIGN to keep booting it."
-	exit 0
-fi
+[[ -z $IDENTITY ]] || identity "$IDENTITY"
 [[ $setup == 1 ]] || die "the machine is not in Setup Mode. In the firmware setup choose \"Reset to Setup Mode\" or \"Clear Secure Boot keys\", then boot this stick again."
 
 echo "Currently enrolled:"
@@ -176,5 +290,6 @@ setup=$(var_byte SetupMode)
 [[ $setup == 0 ]] || die "SetupMode is still ${setup:-?}: the firmware did not accept PK"
 log "Sealed. The firmware is in User Mode with this stick's keys."
 echo "Next: reboot, make sure Secure Boot is ENABLED in the firmware setup, and set a firmware password."
-echo "The first boot with Secure Boot on gives this machine its identity, bound to the combination that boots"
-echo "(safespace-select set NAME before rebooting chooses it; safespace-seal --identity shows it)."
+echo "The first boot with Secure Boot on gives this machine its machine-id, bound to the combination that boots"
+echo "(safespace-select set NAME before rebooting chooses it). Then, in that boot: sudo safespace-seal --identity-create"
+echo "(the ssh host key's CA in the TPM, PIN)."

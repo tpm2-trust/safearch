@@ -1,38 +1,38 @@
 #!/bin/sh
-# The machine's identity: released only in its assigned combination
-# (SECURITY.md, "Machine identity"). Runs in the initrd after the boot path
+# The machine-id of the machine's identity: released only in its assigned
+# combination (SECURITY.md, "Machine identity"; the host key is aSSH's, in the
+# root: assh-agent.service). Runs in the initrd after the boot path
 # (usb-bootdev or netroot) chose and measured the combination (select: PCR 15
 # "safespace-combination:<name>", the name in /run/safespace/combination), before
 # the switch to the root; started by safespace-identity.service.
 #
-# Two slots, each a systemd-creds credential in an EFI variable of its own
-# (vendor GUID as select's; the value is the base64 credential):
-#   SafespaceIdHostKey   ssh_host_ed25519_key  (credential safespace-ssh-host-key)
+# One slot, a systemd-creds credential in an EFI variable (vendor GUID as
+# select's; the value is the base64 credential):
 #   SafespaceIdMachine   machine-id            (credential safespace-machine-id)
-# Both sealed to this TPM with the policy
+# Sealed to this TPM with the policy
 #   PCR 11 signed by the build host's identity key, for the phase enter-initrd
 #     only (identity.pem, appended to this initrd by lib/compose.sh): a safespace
 #     UKI, and only while its initrd runs: no process of a root can unseal
 #   PCR 7  as at the assignment: Secure Boot with exactly these keys
 #   PCR 15 as at the assignment: exactly one measurement, of the assigned name
 #
-# 1. Assignment: new host key and machine-id, generated here, sealed with the
-#    current PCR 7 and 15, checked (signed policy type; an empty signature must
-#    not unseal), written to the slots. When:
+# 1. Assignment: a new machine-id, generated here, sealed with the current
+#    PCR 7 and 15, checked (signed policy type; an empty signature must not
+#    unseal), written to the slot. When:
 #    - automatically, on the first boot with Secure Boot on (sealed) and no slot
 #      yet: the machine belongs to the combination it boots then;
-#    - SafespaceAssign=<name> (safespace-seal --assign, moving a machine) and
-#      <name> is what was measured. Another name: ignored. The variable is
-#      deleted either way.
-#    Slots that exist but do not unseal (another combination) never lead to a
-#    new identity.
-# 2. Unseal the slots into /run/safespace/identity/ (RAM; /run stays across the
-#    switch to the root; "released" lists the slots that were); the machine-id
-#    also to /run/machine-id, which PID 1 takes over. A slot that does not
-#    unseal is left alone: the root then makes a throwaway host key and
-#    machine-id, as without an assignment.
+#    - SafespaceAssign=<name> (safespace-seal --move, after the PIN approved the
+#      host key's move there) and <name> is what was measured. Another name:
+#      ignored. The variable is deleted either way.
+#    A slot that exists but does not unseal (another combination) never leads
+#    to a new machine-id.
+# 2. Unseal the slot into /run/safespace/identity/ (RAM; /run stays across the
+#    switch to the root; "released" lists it if it was) and to /run/machine-id,
+#    which PID 1 takes over. A slot that does not unseal is left alone: the root
+#    then has a throwaway machine-id, as without an assignment.
 # 3. Always, also on errors: extend PCR 15 with "safespace-identity:sealed", so
-#    nothing unseals again in this boot.
+#    nothing unseals again in this boot. aSSH's agent finds PCR 15 so (the
+#    combination, then this) at every boot of the combination.
 # The boot never depends on this: every failure only means no identity.
 #
 # SAFESPACE_EFIVARS, SAFESPACE_RUN, SAFESPACE_PCREXTEND, SAFESPACE_CREDS,
@@ -53,7 +53,7 @@ MACHINE_ID=${SAFESPACE_MACHINE_ID:-/run/machine-id}
 # --tpm2-public-key* options without a word and PCR 11 is not bound at all.
 SIGNED_TYPE=5e2d5c7603724eaf843c6fb5f64098f5
 # VARIABLE:CREDENTIAL:FILE
-SLOTS="SafespaceIdHostKey:safespace-ssh-host-key:ssh_host_ed25519_key SafespaceIdMachine:safespace-machine-id:machine-id"
+SLOTS="SafespaceIdMachine:safespace-machine-id:machine-id"
 
 close() {
 	"$SELECT_PCREXTEND" --graceful --pcr=15 "safespace-identity:sealed" >/dev/null 2>&1 ||
@@ -104,7 +104,7 @@ global_byte() { od -An -tu1 -j4 -N1 "$SELECT_VARS/$1-8be4df61-93ca-11d2-aa0d-00e
 
 assign=$(select_var SafespaceAssign)
 var_rm SafespaceAssign
-if [ -z "$assign" ] && [ ! -e "$(var_path SafespaceIdHostKey)" ] && [ ! -e "$(var_path SafespaceIdMachine)" ]; then
+if [ -z "$assign" ] && [ ! -e "$(var_path SafespaceIdMachine)" ]; then
 	if [ "$(global_byte SecureBoot)" = 1 ] && [ "$(global_byte SetupMode)" = 0 ]; then
 		msg "no identity yet, Secure Boot on: this machine belongs to $name from now on"
 		assign=$name
@@ -115,9 +115,8 @@ fi
 if [ -n "$assign" ] && [ "$assign" != "$name" ]; then
 	msg "ignoring SafespaceAssign=$assign: this boot measured $name"
 elif [ -n "$assign" ]; then
-	msg "assigning this machine to $name: new host key and machine-id"
+	msg "assigning this machine to $name: new machine-id"
 	ok=1
-	ssh-keygen -q -t ed25519 -N '' -C "safespace $name" -f "$OUT/.new/ssh_host_ed25519_key" >/dev/null 2>&1 || ok=0
 	systemd-id128 new >"$OUT/.new/machine-id" 2>/dev/null || ok=0
 	for s in $SLOTS; do
 		[ $ok = 1 ] || break

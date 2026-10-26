@@ -62,6 +62,12 @@ case ${1:-list} in
 			var_set SafespaceSelect "$2"
 		fi
 		echo "from the next boot on: $2"
+		# The identity (aSSH's CA, SECURITY.md) stays with the combination approved
+		# with the PIN: another one boots with the temporary host key until it is
+		# moved there.
+		if [[ -e $VARS/SAFEasshCA-24415b90-39be-45c0-a9a3-d547ebe28ea0 && $2 != "$(booted)" ]]; then
+			echo "the machine's identity stays where it is: after the reboot, sudo safespace-seal --move moves it to $2 (PIN)"
+		fi
 		;;
 	once)
 		check_name "${2:?once needs a name}"

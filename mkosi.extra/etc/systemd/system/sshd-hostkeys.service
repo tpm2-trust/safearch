@@ -1,22 +1,14 @@
 # Replaces Arch's sshdgenkeys.service, which writes to the read-only /etc/ssh.
-# The host key (ed25519 only) is the machine's own if the initrd released it
-# (/run/safespace/identity/, only in the combination the machine is assigned
-# to: SECURITY.md, "Machine identity"), otherwise a throwaway key, new on every
-# boot.
+# Only without a TPM 2.0: then aSSH (assh-agent.service) cannot make the host
+# key, and sshd gets a throwaway ed25519 key, new on every boot, in /var.
 [Unit]
-Description=SSH host key in /var (the machine's own, or a throwaway one)
+Description=SSH host key without a TPM: a throwaway one
 Before=sshd.service
 RequiresMountsFor=/var/lib
-ConditionPathExists=!/var/lib/sshd/etc/ssh/ssh_host_ed25519_key
+ConditionPathExists=!/dev/tpmrm0
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/install -d -m 0755 /var/lib/sshd/etc/ssh
-# Moved, not copied: one plaintext copy of the key, readable by root only.
-ExecStart=/bin/sh -c 'k=/var/lib/sshd/etc/ssh/ssh_host_ed25519_key; \
-	if [ -s /run/safespace/identity/ssh_host_ed25519_key ]; then \
-		mv /run/safespace/identity/ssh_host_ed25519_key "$k" && chmod 0600 "$k" && ssh-keygen -y -f "$k" >"$k.pub" && echo "host key: the machine'"'"'s own"; \
-	else \
-		ssh-keygen -q -t ed25519 -N "" -C "" -f "$k" && echo "host key: throwaway (no identity released)"; \
-	fi'
+ExecStart=/usr/bin/install -d -m 0755 /var/lib/sshd/etc/ssh /run/safespace
+ExecStart=/bin/sh -c 'k=/var/lib/sshd/etc/ssh/ssh_host_ed25519_key; [ -s "$k" ] || ssh-keygen -q -t ed25519 -N "" -C "" -f "$k"; echo "HostKey $k" >/run/safespace/sshd-hostkey.conf; echo "host key: throwaway (no TPM 2.0)"'

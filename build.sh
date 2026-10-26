@@ -70,6 +70,10 @@
 # Building needs root, because the UKI is signed with the sbctl db key in
 # /var/lib/sbctl, which is readable by root only.
 #
+# Every build builds aSSH (the submodule assh/, the machine's host key in the
+# TPM: lib/assh.sh) on this host with its Go into every root; the module cache
+# is mkosi.cache/go.
+#
 # Every build exports the public Secure Boot keys it signs with into the image
 # (mkosi.extra/usr/share/safespace/secureboot/), so safespace-seal works, and
 # creates the expected-PCR signing key on the first build (lib/keys.sh). The
@@ -192,7 +196,7 @@ mapfile -t REPO_ARGS < <(repos_mkosi_args)
 # Host tools that mkosi (without a tools tree) runs from the host, and what
 # composing and checking the build needs.
 missing=()
-for tool in cpio curl ukify sbctl sbverify objcopy objdump mkfs.erofs mkfs.vfat mcopy sfdisk zstd systemd-repart openssl cert-to-efi-sig-list sign-efi-sig-list; do
+for tool in cpio curl ukify sbctl sbverify objcopy objdump mkfs.erofs mkfs.vfat mcopy sfdisk zstd systemd-repart openssl cert-to-efi-sig-list sign-efi-sig-list go; do
 	command -v "$tool" >/dev/null || missing+=("$tool")
 done
 [[ -x /usr/lib/systemd/systemd-measure ]] || command -v systemd-measure >/dev/null || missing+=(systemd-measure)
@@ -258,8 +262,11 @@ EXTRA+=(${key_args[@]+"${key_args[@]}"})
 log "Secure Boot keys: $KEYS_SB_DIR$( ((KEYS_DEDICATED)) && echo ' (dedicated key set)')"
 DB_EXPORT=$HERE/mkosi.extra/usr/share/safespace/secureboot
 keys_export "$DB_EXPORT"
+# shellcheck source=lib/assh.sh
+source "$HERE/lib/assh.sh"
+assh_build "$HERE/mkosi.extra/usr/bin/assh"
 # Keep the project owned by its user, not by root.
-chown -R --reference="$HERE" "$HERE/mkosi.extra/usr/share/safespace"
+chown -R --reference="$HERE" "$HERE/mkosi.extra/usr/share/safespace" "$HERE/mkosi.extra/usr/bin/assh"
 keys_ensure_pcr
 [[ $SNAPSHOT == latest ]] && log "note: SNAPSHOT=latest reuses the cached image as long as the configuration is unchanged; -f installs the current packages"
 

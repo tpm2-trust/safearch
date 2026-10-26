@@ -17,6 +17,353 @@ T450s findings with usb/network aligned.
 
 ---
 
+# PLAN: the machine identity through aSSH (submodule `assh/`)
+
+Status: **confirmed 2026-10-26, done in QEMU** (decisions below); open: the hand test on the T450s, an update in QEMU (two builds). Goal: the host key of every
+safespace machine is aSSH's - made in the TPM at every boot, certified by a CA in the TPM
+that signs only in an approved state of the machine's combination - tested end to end in
+QEMU (`tests/vm.sh`), and ready to be booted and tested by hand on the T450s. It takes over
+the PIN plan below (its decisions 1-4 still apply). Go, as aSSH is Go.
+
+## What aSSH gives (assh `feat/slots`, 1d6c007; tpm2-kira uses the same, tested on VMs)
+
+- **The CA in the TPM**, its file in the EFI variable `SAFEasshCA` (`efi:SAFEasshCA`,
+  ~1.3 KB; nothing secret, the TPM checks every approval in it).
+- **The authority in the TPM, opened by a PIN**, with a counter: `--next-generation`
+  revokes every older approval (a move takes the identity from the old combination).
+  DA lockout: 3 tries, then one per 30 minutes.
+- **Slots and a window**: slot 0 = PCR 0, 2, 7, 11, 15 (higher confidence), slot 1 =
+  PCR 7, 15 (an update or a firmware change still certifies); PCR 15 = the combination
+  (select) and the window the agent closes.
+- **`assh.conf`**: every setting in one file; `assh agent` needs nothing else.
+- **`assh agent`**: a new host key in the TPM every boot, certified through the first
+  slot met, else aSSH's temporary key (TPM, no certificate); the PCR state at its start
+  recorded (`--state`) for `ca approve --values`; sshd uses it through `HostKeyAgent`.
+
+## Design
+
+```mermaid
+flowchart LR
+  subgraph initrd
+    S["select: PCR 15 += combination"] --> M["identity: unseal SafespaceIdMachine (machine-id)"]
+  end
+  subgraph root
+    A["assh agent (Before=sysinit.target, before systemd's PCR 15 units)"] -->|"slot 0: 0,2,7,11,15 / slot 1: 7,15 approved?"| CA[(CA in TPM, file in SAFEasshCA)]
+    CA -->|certifies| HK[(host key of this boot)]
+    A -->|no slot met, or no CA yet| TK[(temporary key) + state recorded]
+    A -->|"PCR 15 += assh: closed"| X[window closed]
+    D["sshd: HostKey/HostCertificate/HostKeyAgent"] --> A
+  end
+  P["safespace-seal (PIN)"] -.->|"approve the recorded state, slots 0,1"| CA
+```
+
+- **Image** (every root): `/usr/bin/assh` (static, built on the build host from the
+  submodule), `/etc/assh/assh.conf`:
+  `ASSH_CA=efi:SAFEasshCA`, `ASSH_AUTHORITY_TPM=yes`, `ASSH_CA_SLOT_0=0,2,7,11,15`,
+  `ASSH_CA_SLOT_1=7,15`, `ASSH_CA_WINDOW=15`, `ASSH_CA_REF="safespace identity"`,
+  `ASSH_KEY_ID=safespace`, `ASSH_STATE=/run/assh/agent.pcrs.json`;
+  `assh-agent.service` (`assh agent --config /etc/assh/assh.conf`), ordered before
+  `systemd-pcrmachine`/`systemd-pcrfs*` (PCR 15 must hold the combination alone when it
+  starts); sshd drop-in `HostKey /run/assh/host.pub`, `HostCertificate
+  /run/assh/host-cert.pub`, `HostKeyAgent /run/assh/agent.sock` (one configuration, with or
+  without a certificate). `sshd-hostkeys.service` and `ssh-keygen` at boot go.
+- **aSSH change (assh, with tests):** `agent` without a CA (no `SAFEasshCA` yet) serves the
+  temporary key and records the PCRs of `assh.conf`'s slots - so the first creation can
+  approve this boot's agent state without a reboot (question 4).
+- **`safespace-seal`**:
+  - `--identity-create`: the TPM's lockout authorization if it has none (`assh tpm da
+    --new-lockout-auth --max-tries 3 --recovery 1800 --lockout-recovery 1800`, asked twice,
+    kept by you), the PIN (asked twice), `assh ca create` (from assh.conf), `assh ca approve
+    --values /run/assh/agent.pcrs.json` (slots 0 and 1, one PIN); prints the
+    `@cert-authority` line. The next boot certifies.
+  - `--identity`: the CA's fingerprint, the `@cert-authority` line, which slot this boot
+    used, the approvals and the counter.
+  - `--approve`: after an update (slot 1 certified, slot 0 not): approve the recorded
+    state in slot 0 (PIN).
+  - `--move`: in the combination moved to (after `safespace-select set Y` and a reboot,
+    temporary key): approve the recorded state in slots 0 and 1 with `--next-generation`
+    (PIN): the old combination's approvals are revoked.
+- **initrd `identity`**: the machine-id alone (`SafespaceIdMachine`, systemd-creds, signed
+  PCR 11 for enter-initrd + PCR 7 + PCR 15, as today: per combination, kept by updates);
+  created on the first sealed boot as today, and for the combination moved to by
+  `safespace-seal --move` (`SafespaceAssign`, written only after the PIN approved the move).
+  No host key slot, no `ssh-keygen`/`openssh` in the initrd; `SafespaceIdHostKey` goes.
+- **Build**: `lib/assh.sh` builds `assh/cmd/assh` (`CGO_ENABLED=0 -trimpath
+  GOFLAGS=-mod=readonly GOTOOLCHAIN=local`, module cache `mkosi.cache/go`) into a gitignored
+  extra tree every root gets; `build.sh` and README name Go as a prerequisite (question 1).
+
+## Steps
+
+- [x] 1. assh: `agent` without a CA records `assh.conf`'s slots (test with swtpm); bump the
+      submodule here to it.
+- [x] 2. Build: `lib/assh.sh`, the extra tree, `build.sh`; `tests/run.sh` builds and checks it.
+- [x] 3. Image: assh.conf, the agent unit and its ordering, the sshd drop-in; `sshd-hostkeys`
+      and the host-key slot go; initrd `identity` for the machine-id alone.
+- [x] 4. `safespace-seal --identity-create | --identity | --approve | --move`;
+      `safespace-select set` names `--move` when an identity exists.
+- [x] 5. Tests: `tests/run.sh` (the glue, `go test ./...` in `assh/`, a SKIP names
+      go/swtpm); `tests/vm.sh` step `identity` rewritten (swtpm, PIN through a file
+      descriptor): first boot temporary key and state recorded; create; reboot: login
+      through `@cert-authority`, slot 0; agent restart: no certificate (window closed);
+      firmware changed (PCR 0, other OVMF vars): slot 1; another combination: temporary key,
+      refused by a strict client; `--move` there: certified, the old combination revoked
+      (temporary key there); `--approve` after slot 1; wrong PINs: lockout.
+- [x] 6. QEMU: the full `tests/vm.sh` run passes (run-20261026-115825, 36/36; found and fixed on the way: sshd keeps the old host key after an agent restart - `PartOf`; a restart overwrote the recorded state - assh keeps the first; the network boot differs in PCR 0 in QEMU - slot 1 plus `--approve`); then a hand test of the stick image with
+      `test-vm.sh --tpm` as on the T450s (creation, login, a reboot).
+- [x] 7. Docs: README (clients: `@cert-authority`; creation, move, update; the T450s
+      procedure), SECURITY.md ("Machine identity" rewritten: what is in the TPM, the
+      variable, the attacker table), AGENTS.md (map: `assh/`, the Go build).
+
+## What changes / breaks
+
+- 201c70c's identity is replaced: machines run `safespace-seal --identity-create` once (a
+  new CA, PIN, lockout authorization). Clients trust `@cert-authority` instead of a host key.
+- The host key is ECDSA P-256 and new every boot (no ed25519). Without an approved state
+  sshd serves aSSH's temporary key, which strict clients refuse.
+- PCR 15: the agent closes it; systemd's PCR 15 units run after it.
+- Build host: Go >= 1.26; every root grows by ~13 MB (assh's binary).
+
+## Decisions (2026-10-26)
+
+- **One command creates the identity** (question 4 a): `safespace-seal --identity-create`
+  creates the CA and approves the state this boot's agent recorded (assh: the agent records
+  `assh.conf`'s slots without a CA). sshd serves the temporary key meanwhile; the
+  certificate comes with the next boot - a certificate in the same boot would need the
+  window (PCR 15) open after the agent, which would let any process of that boot get one.
+- **Updates keep the identity, another combination needs the PIN** (question 5): the host
+  key through the CA's slots; the machine-id per combination as today, moved only by
+  `--move` after the PIN approved it. Root can still write `SafespaceAssign` by hand: that
+  gives the other combination a new machine-id (and takes the old one's), never the host
+  key - the machine-id is a label, not a credential (SECURITY.md says so).
+- **Lockout authorization per device**, typed at `--identity-create`, kept by the owner.
+- **Go on the build host.**
+
+## Open questions
+
+1. ~~The authority~~ (PIN in the TPM), 2. ~~revocation~~ (counter), 3. ~~old builds~~,
+   7. ~~slots~~, 8. ~~one PIN for several slots~~ (`--slot 0,1`), 9. ~~after an update~~
+   (`--approve`; the build host's predicted PCR 11 later): decided.
+4. **The first creation**: (a) the agent records `assh.conf`'s slots without a CA (assh
+   change) and `--identity-create` approves this boot's state - no reboot (proposed); (b)
+   create, reboot (temporary key, state recorded), then `--approve`.
+5. **Machine-id**: the same in every combination (sealed without PCR 15, created on the
+   first sealed boot; proposed), or per combination as today (then a move needs it too)?
+6. **Lockout authorization**: per device, typed at `--identity-create`, kept by you
+   (proposed); or one for the fleet?
+1b. **The Go build**: on the build host (proposed; Go is there) or in mkosi's sandbox?
+10. **The build host's sudo rule** names `/home/pix/safespace/safearch/build.sh`; the repo is
+    now `/home/pix/safespace/tpm2-trust/safearch`: `tests/vm.sh` needs the rule for this path.
+
+---
+
+# PLAN: the host key inside the TPM, moved to another combination only with a PIN
+
+Status: **superseded** (2026-10-24) by the aSSH plan above; its decisions 1–4 carry over. It needed an agent
+of our own. Decisions below stay valid. Replaces the identity of 201c70c (device-
+local, sealed in the initrd). A centrally managed identity was considered and **dropped**
+(2026-10-21): no private part leaves the device, no enrolment or issuing scripts.
+
+## Goal
+
+- The ssh host key is **generated inside the device's TPM and never leaves it** (not even
+  into the device's RAM): sshd signs through the TPM. ECDSA P-256 (decision 1: TPMs have no
+  ed25519).
+- The identity (host key, machine-id) is usable **only while the combination it is bound to
+  is booted** — also after updates, as today; any other combination boots without it.
+- **Moving it to another combination** is possible, but needs a **PIN** (re-authorizing the
+  binding); without the PIN no one, root included, can move it.
+- The machine-id: a small sealed TPM object in an EFI variable, unsealed in the initrd.
+
+## Design
+
+### 1. TPM objects of a device
+
+| Object | Where | Created | Auth |
+|---|---|---|---|
+| **Authority key A** (ECC P-256, sign) | wrapped blob in EFI variable `SafespaceIdAuthority` | at creation, inside the TPM | **the PIN** (authValue; TPM dictionary-attack lockout limits guesses) |
+| **Move counter** (NV counter, 8 bytes) | TPM NV index `0x01c1a001` (the only NV use) | at creation | the PIN |
+| **Host key** (ECC P-256, sign only) | persistent handle `0x81010001` | inside the TPM, `fixedTPM`+`fixedParent` (never duplicable) | policy P (3) |
+| **Machine-id** (sealed data) | wrapped blob in EFI variable `SafespaceIdMachine` | inside the TPM (from the TPM RNG) | policy P |
+| **Binding approval** | EFI variable `SafespaceIdApproval` (public): A's signature over the approved policy for combination X and counter value n | at creation and each move | — |
+
+### 2. Policies
+
+The two objects carry one fixed `authPolicy`, which names no combination; the combination is
+in an *approved* policy that A signs (TPM2_PolicyAuthorize), so it can change without new
+objects:
+
+```
+host key:   PolicyAuthorize(A, ref "safespace-binding") ; PolicyCommandCode(TPM2_Sign)
+machine-id: PolicyAuthorize(A, ref "safespace-binding") ; PolicyCommandCode(TPM2_Unseal)
+
+approved (signed by A, with the PIN) for combination X at move counter n:
+  PolicyPCR(7 = Secure Boot state, 15 = SHA256(0³² ‖ SHA256("safespace-combination:X")))
+  ; PolicyAuthorize(identity key, PCR 11, every phase)   ← only builds that measure PCR 15
+  ; PolicyNV(move counter == n)                          ← revokes every earlier approval
+```
+
+- **Booted X:** PCR 15 holds X → the approval for X is satisfied → sign / unseal work.
+- **Booted Y (no PIN):** PCR 15 holds Y → no approval matches → no host key, no machine-id
+  (throwaway ed25519 key, transient machine-id, as today). Booting X again restores it.
+- **Move to Y** (`safespace-seal --move` in a boot of Y, PIN asked): increment the counter
+  (PIN) → every old approval, X's included, is void; A signs the approval for Y at n+1 (PIN).
+  Same host key, same machine-id, now bound to Y. Without the PIN: refused by the TPM; after
+  a few wrong PINs the TPM locks out (dictionary-attack protection).
+- **PolicyCommandCode** keeps each object to its one operation (no other use).
+- **PCR 11 signed by the identity key** (as today, but for every phase): old db-signed builds,
+  whose initrd doesn't measure PCR 15, can't satisfy it.
+- **PCR 15 stays at the selection while the root runs** (sshd signs all the time):
+  `systemd-pcrmachine`, `systemd-pcrfs-root`, `systemd-pcrfs@` are masked (they measure a
+  volatile machine-id and file systems, of no use here); no "close" extend any more. In
+  return the initrd **stops the boot** when a TPM is present, the stub measured the UKI, and
+  the selection could not be measured (else a root could extend the bound name into an empty
+  PCR 15 itself).
+
+### 3. Lifecycle
+
+| Action | Where | PIN |
+|---|---|---|
+| **Create** (`safespace-seal --identity-create`): A with the PIN, counter = 0, host key, machine-id, approval for the booted combination | root of the combination to bind to, sealed machine (Secure Boot on) | set (twice) |
+| **Boot** the bound combination | initrd unseals the machine-id → `/run/machine-id`; the agent serves the host key to sshd | no |
+| **Boot** another combination | nothing usable; throwaway key | no |
+| **Move**: counter +1, approval for the new combination (its PCR 15 value is computed, so no boot of it is needed first). Asked by `safespace-select set Y` itself when an identity exists and is bound elsewhere (decline: Y boots without it); also `safespace-seal --move Y`. `safespace-select once Y` never moves | root of any combination | yes |
+| **Change PIN** (`--pin`): new authValue for A and the counter | any | old PIN |
+| **Show** (`--identity`): bound combination, released or not, fingerprint, `known_hosts` line, inventory ID | any | no |
+| **Forget** (TPM clear in the firmware, or `--identity-destroy` with the PIN) | — | — |
+
+Creation is explicit (not on the first sealed boot as in 201c70c): only a person can set a PIN.
+
+### 4. sshd and the agent
+
+sshd uses the host key through `HostKeyAgent` + `HostKey <public key file>`: no private key file.
+Each signature needs a policy session (PolicyPCR, two PolicyAuthorize with their tickets,
+PolicyNV, PolicyCommandCode). `ssh-tpm-agent` (Arch `extra`, 0.9.0) serves TPM host keys but,
+as far as known, only with a password/PIN, not with such a policy: **PoC 1b checks it**. If it
+can't, a small agent of our own is needed (open question 5 then does apply: language).
+
+### 5. initrd
+
+`select` measures as today, and stops the boot if it can't (2). `identity` (rewritten, tpm2-tools)
+only unseals the machine-id; no creation, no sealing, no `ssh-keygen` (openssh leaves the
+initrd, tpm2-tools comes in; the `.pcrsig` signature needs a JSON reader: `jq` or a few lines
+of sed).
+
+### 6. What is public, what is private
+
+| Item | Class |
+|---|---|
+| host private key | **inside the TPM only**, never extractable |
+| A's private part, machine-id | TPM-wrapped (EFI variables): usable only in this TPM, A only with the PIN |
+| the PIN | **only in the person's head**; never stored |
+| approval, counter value, public keys, `known_hosts` line, inventory ID | public |
+| build host | db/KEK/PK, `pcr.key`, `identity.key` (as today); **nothing per device** |
+
+### 7. What an attacker can do
+
+| Attacker | Result |
+|---|---|
+| root in another combination | can't sign, can't unseal; can't move without the PIN (TPM lockout after a few tries) |
+| root in the bound combination | can *use* the host key (sign) while it runs, can't take it out of the TPM; can't move it without the PIN |
+| copy the EFI variables to another machine | useless: bound to this TPM |
+| old signed build | no identity-key signature for PCR 11 → nothing |
+| deletes the variables / clears the TPM | identity gone (denial of service, visible); a new one needs `--identity-create` |
+| knows the PIN | can move the identity to another combination (that is what the PIN is for) |
+
+## PoC results (2026-10-21, swtpm 0.10.2, tpm2-tools 5.8, systemd 262; host only)
+
+Scripts in the session's scratchpad (`pin/poc1a.sh`, `pin/poc1a-pcr11.sh`), simulated boots as
+in the earlier PoC (PCR 7 stand-in, PCR 11 replayed as stub + pcrphase measure it).
+
+**1a, design as written (selection in PCR 15):** works as designed — bound combination signs,
+also at runtime (after leave-initrd/sysinit/ready) and after an update; refused: debug, debug
++ the bound name extended on top, changed Secure Boot (PCR 7), foreign kernel with signatures
+by another key, an approval signed by a forged authority key; TPM2_Duplicate of the host key
+refused; move with the PIN (counter 1 → 2, new approval) works, the old approval is revoked;
+wrong PIN refused, after 3 failures the TPM is in lockout (even the right PIN refused); the
+machine-id unseals only in the bound combination. **But:** the late-extend attack (initrd
+measured nothing, the root extends the bound name into PCR 15) **unseals** — PCR 15 can only
+be defended by the initrd stopping the boot.
+
+**1a′, the combination as a phase word in PCR 11 (proposed instead):** the initrd extends PCR
+11 with `safespace-combination-<name>` right after `enter-initrd`; the build host signs, per
+combination, the phase paths `enter-initrd:safespace-combination-<name>[:leave-initrd[:sysinit
+[:ready]]]` with the identity key and **policyRef `safespace-combination-<name>`**; the approval
+for X is `PolicyAuthorize(I, ref X) ; PolicyPCR(7) ; PolicyNV(counter)`. Result: bound
+combination works (also at runtime, after an update); refused: debug, debug's root extending
+the bound word, **the late-extend attack** (an unmeasured initrd plus the word extended by the
+root gives a PCR 11 value nobody signed), changed PCR 7, foreign kernel. So PCR 15, the masks
+of systemd's PCR 15 units and stopping the boot are no longer needed.
+
+**Pitfalls found:**
+- **DA lockout blocks every DA-protected object**, the SRK included: after 3 wrong PINs the
+  identity was unusable (no load under the SRK). The SRK, host key and machine-id must be
+  `noDA` (they have no password); only A and the counter are DA-protected. Retested: signing
+  and unsealing work while the PIN is locked out.
+- The counter must not be `no_da`, or wrong PINs on it wouldn't count (PIN guessing).
+- The counter must be readable without the PIN (`ownerread`, PolicyNV via the owner
+  hierarchy), or every signature would need the PIN; only writing needs it.
+- `TPM2_PolicyAuthorize` resets the session digest: the PCR 11 authorization comes first in
+  the approved policy.
+- systemd-measure's `--policyref=STRING` is `SHA256(STRING)` as the TPM policyRef (`ref` in the
+  JSON is the plain string); the signature covers `pol ‖ SHA256(ref)`.
+- An external public key (`tpm2_loadexternal`) has other attributes, hence another name, than
+  the loaded key: tickets and policies must use the same one (the real implementation loads A
+  itself; loading needs no PIN).
+- Swtpm on a socket has no resource manager (objects must be flushed); `/dev/tpmrm0` does that
+  on a machine.
+
+**1b, the agent:** `ssh-tpm-agent` 0.9.0 (inspected, not run) serves TPM host keys with a PIN or
+a policy stored in the key file; our policy needs, per signature, the current build's PCR 11
+signature and the device's current approval — not supported. **An agent of our own is needed**
+(ssh-agent protocol: list identities, sign; the policy session of 2): open question 5.
+
+- [x] 1a. swtpm: PIN, counter, approvals, lockout, duplicate (above).
+- [x] 1b. `ssh-tpm-agent`: not usable as is (above).
+- [ ] 1c. QEMU: create → X/Y/X → move → update; does the extra PCR 11 word break systemd's own
+      PCR 11 users (mkosi's `pcr.key` signatures, NvPCR units)? initrd size with tpm2-tools.
+
+## Steps (after the PoC and the answers)
+
+- [ ] 2. `compose_uki`/`compose_check`: identity key signs every phase (today: enter-initrd).
+- [ ] 3. initrd: `select` stops the boot if it can't measure; `identity` unseals the machine-id
+      (tpm2-tools); `openssh` out, `tpm2-tools` in; masks for pcrmachine/pcrfs.
+- [ ] 4. root: the agent, sshd `HostKeyAgent`/`HostKey`, throwaway ed25519 fallback.
+- [ ] 5. `safespace-seal --identity-create | --move | --pin | --identity | --identity-destroy`;
+      `--assign` goes.
+- [ ] 6. tests/run.sh, tests/vm.sh step `identity` (create, X/Y/X, move with PIN, wrong PIN,
+      update); SECURITY.md (everything of 2, 6, 7 and the tested variants), README, AGENTS.md.
+
+## What changes / breaks
+
+- **Replaces 201c70c's identity**: no creation on the first sealed boot any more, the slots
+  `SafespaceIdHostKey`/`SafespaceIdMachine`(systemd-creds) and `SafespaceAssign` go; machines
+  that have them need `--identity-create` (new host key).
+- Host key **ECDSA P-256** when the identity is in use; throwaway keys stay ed25519.
+- PCR 15 no longer closed; systemd's PCR 15 measurements masked; one TPM NV index used.
+- The boot stops if a TPM is present but the selection can't be measured.
+- A PIN to remember per machine (or per fleet, if you use the same one).
+
+## Decisions (2026-10-21)
+
+1. Another combination **withholds** the identity; back when the bound one boots again.
+2. Creation is explicit and sets the PIN (the fallback that moving needs). Use is automatic:
+   whenever the PCRs match (the bound combination, also after updates), sshd uses the key
+   without a PIN.
+3. Moving asks for the PIN, automatically when the selection is changed to another combination
+   (`safespace-select set`) and an identity exists; `--move` as well.
+4. Dictionary-attack lockout: **3 tries, then one try per 30 minutes** (set at creation).
+
+## Open questions (from the PoC)
+
+5. **The agent's language** (needed, see 1b): Go (go-tpm + x/crypto/ssh/agent, one static
+   binary, the stack ssh-tpm-agent uses; Go at build time, modules vendored), Python
+   (tpm2-pytss; Python in every root, ~60 MB), or C (tpm2-tss ESAPI; no new runtime, the most
+   code). Proposed: Go.
+6. **The combination in PCR 11** (1a′) instead of PCR 15? Proposed: yes (closes the late-extend
+   attack in the TPM; no masks, no boot stop).
+
+---
+
 # PLAN: TPM2 — the machine's identity only in its assigned combination
 
 Status: **confirmed**, in progress. Replaces PLAN-TPM2-BINDING.md: that

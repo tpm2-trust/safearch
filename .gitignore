@@ -33,6 +33,11 @@ server/server.conf
 # Generated into the image tree by fetch-images.sh and secureboot-export.sh.
 mkosi.profiles/docker/mkosi.extra/usr/share/safespace/docker-images/
 mkosi.extra/usr/share/safespace/secureboot/
+# Built by build.sh from the submodule assh/ (lib/assh.sh).
+mkosi.extra/usr/bin/assh
 
 # Test builds, VM disks, hwtest-image.sh output.
 mkosi.test/
+
+# Not part of this repository: a separate checkout lives here locally.
+/tpm2-kira/

@@ -96,7 +96,7 @@ An Arch Linux machine (not a container: the build needs loop devices and root).
 
 ```sh
 git clone <this repository> safearch && cd safearch
-sudo pacman -S --needed mkosi systemd-ukify sbctl efitools sbsigntools dosfstools mtools erofs-utils zstd cpio rsync skopeo
+sudo pacman -S --needed mkosi systemd-ukify sbctl efitools sbsigntools dosfstools mtools erofs-utils zstd cpio rsync skopeo go
 cp users.conf.example users.conf             # your users and their ssh public keys
 cp netboot.conf.example netboot.conf         # NETROOT_URL=http://<distribution server>/safespace/ (or none: sticks only)
 cp release.conf.example release.conf         # RELEASE_TARGETS="safespace@<distribution server>"
@@ -619,7 +619,7 @@ tests/vm.sh --no-build --jobs 2      # at most two VMs at a time
 | `seal` | Setup Mode → `safespace-seal` → the sealed firmware | Secure Boot `enabled (user)`, `verified`, `running` |
 | `net-sb` | network boot with enforced Secure Boot | Secure Boot enabled, `verified`, `running` |
 | `select` | on the sealed firmware, one VM, one boot after the other: no selection, `safespace-select set <second>`, `once <first>`, the second again (persistent), `clear`, the first again. Side by side, every further combination in a VM of its own: `SafespaceSelectOnce=<name>` written into a copy of the sealed variables (`virt-fw-vars`) | the booted combination's name (the initrd's choice, `/usr/lib/safespace/combination`, `PRETTY_NAME`, the login banner) and groups (`/usr/lib/safespace/groups`; the docker command exactly with the docker group); a preset `SafespaceSelectOnce` deleted by the initrd; `debug` has exactly the default's setuid/setgid files, file capabilities and enabled units; each Secure Boot enabled and `verified` |
-| `identity` | on a TPM of its own (swtpm, `test-vm.sh --tpm`) and a copy of the sealed firmware, one boot after the other: the first sealed boot, `debug` once, the default again, over the network, another db certificate, `safespace-seal --assign containers`, the default afterwards | the identity created for the default and released (one ed25519 host key); `debug`: nothing released or created, its root can't unseal the slot (also not after extending PCR 15 with the default's name); the default again and over the network: the same host key and machine-id, its root can't unseal after the boot; changed db (PCR 7): nothing released; moved: a new identity in `containers`, none in the default ([Machine identity](#machine-identity)) |
+| `identity` | on a TPM of its own (swtpm, `test-vm.sh --tpm`) and a copy of the sealed firmware, one boot after the other, with a client that trusts only the CA (`@cert-authority`, `StrictHostKeyChecking yes`): the first sealed boot and `safespace-seal --identity-create` in it, the default again, `debug` once, over the network, an option ROM more (PCR 2), another db certificate (PCR 7), `--move` to `containers`, the default afterwards | first boot: machine-id created, aSSH's temporary key, the client refused, the identity created; the default again: certified through slot 0, the client logs in, `--identity` says so, an agent restart gets no certificate (window closed; sshd restarts with it, the first state is kept), its root can't unseal the machine-id (also not after extending PCR 15); `debug`: temporary key, nothing released, `--approve` refused; network: slot 1 (PCR 0 differs in QEMU), `--approve`; PCR 2: slot 1, `--approve`, slot 0; PCR 7: temporary; moved: certified in `containers` with a new machine-id, 3 wrong PINs lock out, the default then temporary ([Machine identity](#machine-identity)) |
 
 **Kept apart from everything real**, in `mkosi.test/vm/` (gitignored): the test user
 `tester` and its key (created on the first run, used for nothing else), the test builds
@@ -641,7 +641,7 @@ exits with 2):
 
 - `qemu-desktop`, `edk2-ovmf`, `virt-firmware`, `openssh`, `curl`, `rsync`, `binutils`,
   `sbsigntools`, `cryptsetup`, `dosfstools`, `mtools`, `util-linux`, `python`; read/write
-  access to `/dev/kvm`
+  access to `/dev/kvm`; `swtpm` (step `identity`); `go` for a build (aSSH, `lib/assh.sh`)
 - with `--no-build` / `--build`: the public keys the test build was signed with (every
   build exports them)
 - `sudo` for `build.sh` (not with `--no-build`): asked once at the start, or for unattended
@@ -883,26 +883,61 @@ verifies the downloaded UKI against your `db`. See
 
 ### Machine identity
 
-A sealed machine with a TPM 2.0 gets an identity of its own: an ssh host key and a
-machine-id that stay the same across reboots and updates. It belongs to **one
-combination**: the one the machine boots the first time with Secure Boot on (so
-`safespace-select set NAME` before that reboot chooses it). Whenever that combination boots,
-from the stick or over the network, in this build or any later one signed with the same keys,
-the TPM releases the identity in the initrd. Any other combination boots normally, but with a
-throwaway host key and machine-id, new on every boot: ssh clients that know the machine warn
-"host key changed", and nothing in that combination can reach the identity. Details,
-measures and tests: [SECURITY.md](SECURITY.md#machine-identity).
+A sealed machine with a TPM 2.0 gets an identity of its own: its **ssh host key** is made in
+the TPM at every boot and certified by the machine's **CA**, a key in the TPM that signs only
+while the machine boots the combination it was approved for - and its machine-id stays the
+same across reboots and updates of that combination. The host key is
+[aSSH](assh/README.md)'s (the submodule `assh/`): `assh-agent.service`, configured by
+`/etc/assh/assh.conf`, lends it to sshd. Clients trust the CA, once:
+
+```
+@cert-authority host.example,192.0.2.10 ecdsa-sha2-nistp256 AAAA...   # in ~/.ssh/known_hosts
+```
+
+- **Updates** of the combination keep the identity. After one (or a firmware update, a new
+  option ROM) the CA still certifies through its second slot (Secure Boot state and the
+  combination); `sudo safespace-seal --approve` (PIN) approves the new state in the first.
+  The same for a second boot path: in QEMU a network boot differs from the stick boot in PCR
+  0, so a machine that boots both ways runs `--approve` once in each.
+- **Another combination** boots normally, with aSSH's temporary host key (made in the TPM,
+  not certified, its fingerprint in the journal) and a throwaway machine-id: clients that
+  trust only the CA refuse it. Moving the identity there takes the PIN, and takes it from
+  the old combination: `sudo safespace-seal --move`.
+- **The PIN** opens a key in the TPM that approves states; 3 wrong entries lock it for 30
+  minutes. The TPM's **lockout authorization** (set at the creation, asked twice) resets a
+  lockout and clears the TPM: keep it off the machine, in your password manager.
 
 | Command (on the machine) | Does |
 |---|---|
-| `safespace-seal --identity` | this boot's combination, whether the identity was released, the host key's fingerprint and `known_hosts` line, the inventory ID (the machine-id, hashed for safespace) |
-| `sudo safespace-seal --assign NAME` | move the machine to combination `NAME`: the next boot runs `NAME` and creates a **new** identity for it (new host key; the old one is gone) |
+| `sudo safespace-seal --identity-create` | the first identity, for the combination booted (Secure Boot on): sets the lockout authorization if the TPM has none, asks a new PIN, creates the CA, approves this boot's state, prints the `@cert-authority` line. sshd serves the temporary key until the reboot; the next boot certifies |
+| `safespace-seal --identity` | the combination, the machine-id, the CA with its approvals and the `@cert-authority` line, this boot's host key: certified through which slot, or temporary |
+| `sudo safespace-seal --approve` | after an update (certified through slot 1): approves this state in every slot (PIN) |
+| `sudo safespace-seal --move` | in a boot with the temporary key (`safespace-select set NAME`, reboot): moves the identity here (PIN), revokes every approval before, gives this combination the machine-id at the next boot and keeps booting it. Also after a Secure Boot key change (PCR 7) in the same combination |
 
-The identity is lost (a new one is created on the next sealed boot) when the TPM is cleared,
-and released no more after a change of the Secure Boot keys in the firmware (PCR 7): then
-`--assign` again. Machines without Secure Boot on, or without a TPM, get no identity.
-Try it in a VM: `./test-vm.sh --setup-mode --tpm --ssh 2222`, `sudo safespace-seal`, power off,
-`./test-vm.sh --sealed --tpm --ssh 2222` twice: the same host key both times.
+The CA's file is the EFI variable `SAFEasshCA` (nothing secret in it: the TPM checks every
+approval). The identity is lost when the TPM is cleared or the firmware's variables are wiped:
+`--identity-create` again, and the clients need the new line. Machines without a TPM 2.0
+get a throwaway ed25519 host key on every boot. Details, measures and tests:
+[SECURITY.md](SECURITY.md#machine-identity).
+
+#### Trying it by hand (QEMU, or a T450s)
+
+In QEMU, with a stick image of a build (`tests/vm.sh` makes one; `./burn.sh` for a real stick):
+
+```bash
+./test-vm.sh --setup-mode --tpm --ssh 2222   # sudo safespace-seal, power off
+./test-vm.sh --sealed --tpm --ssh 2222       # first sealed boot: machine-id created
+ssh -p 2222 you@127.0.0.1 sudo safespace-seal --identity-create   # PIN, lockout auth.; prints the line
+#   put the line into ~/.ssh/known_hosts as "@cert-authority [127.0.0.1]:2222 ecdsa-sha2-nistp256 AAAA..."
+#   power off, boot again (--sealed --tpm): ssh -o StrictHostKeyChecking=yes -p 2222 you@127.0.0.1
+```
+
+On a T450s: the security chip must be a TPM 2.0 (booted, `ls /dev/tpmrm0`; if not, look at
+the firmware setup's security chip settings), seal with the stick (`sudo safespace-seal` in Setup Mode, then Secure Boot
+on), boot it once sealed, then `sudo safespace-seal --identity-create` and reboot. Check:
+`safespace-seal --identity` says "certified by the CA through slot 0", and a client with only
+the `@cert-authority` line logs in. Then: another combination (`safespace-select once NAME`) is
+refused by that client; an update keeps the login (slot 1 until `--approve`).
 
 ## Docker
 

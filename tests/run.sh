@@ -8,7 +8,7 @@
 #   --keep   keep the temporary directory (printed at the end)
 #   TEST     run only these (default: all): syntax groups keys builds
 #            release server stick upload netroot initrd compose dnsmasq nginx
-#            units
+#            assh units
 #
 # Needs the build host's tools (README.md, "Build host"): sbsigntools,
 # efitools, sbctl, cryptsetup, zstd, mtools, dosfstools, util-linux, binutils,
@@ -582,54 +582,57 @@ if wanted compose && fixtures; then
 	slot() { tail -c +5 "$EV/$1-$SG" 2>/dev/null | sha256sum | cut -c1-16; }
 	t_id_first() {
 		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" &&
-			[[ -e $EV/SafespaceIdHostKey-$SG && -e $EV/SafespaceIdMachine-$SG ]] &&
-			[[ -s $IR/run/identity/ssh_host_ed25519_key && -s $IR/machine-id ]] &&
+			[[ -e $EV/SafespaceIdMachine-$SG && ! -e $EV/SafespaceIdHostKey-$SG ]] &&
+			[[ -s $IR/machine-id && ! -e $IR/run/identity/ssh_host_ed25519_key ]] &&
 			cmp -s "$IR/machine-id" "$IR/run/identity/machine-id" &&
+			[[ $(cat "$IR/run/identity/released") == SafespaceIdMachine ]] &&
 			[[ $(tail -1 "$W/pcrextend.log") == "--graceful --pcr=15 safespace-identity:sealed" ]]
 	}
-	check "identity: the first sealed boot creates both slots, releases them, closes PCR 15" t_id_first
-	t_id_sboff() { rm -rf "$EV"; t_id containers 0 0 "$W/sig-good.json"; [[ ! -e $EV/SafespaceIdHostKey-$SG && ! -e $IR/run/identity/ssh_host_ed25519_key ]] && grep -q 'identity:sealed' "$W/pcrextend.log"; }
+	check "identity: the first sealed boot creates the machine-id slot (no host key: aSSH's), releases it, closes PCR 15" t_id_first
+	t_id_sboff() { rm -rf "$EV"; t_id containers 0 0 "$W/sig-good.json"; [[ ! -e $EV/SafespaceIdMachine-$SG && ! -e $IR/machine-id ]] && grep -q 'identity:sealed' "$W/pcrextend.log"; }
 	check "identity: no identity with Secure Boot off (and PCR 15 closed)" t_id_sboff
-	t_id_setup() { rm -rf "$EV"; t_id containers 1 1 "$W/sig-good.json"; [[ ! -e $EV/SafespaceIdHostKey-$SG ]]; }
+	t_id_setup() { rm -rf "$EV"; t_id containers 1 1 "$W/sig-good.json"; [[ ! -e $EV/SafespaceIdMachine-$SG ]]; }
 	check "identity: no identity in Setup Mode" t_id_setup
 	t_id_other() {
 		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" || return 1
-		local h=$(slot SafespaceIdHostKey)
+		local h=$(slot SafespaceIdMachine)
 		t_id root 1 0 "$W/sig-bad.json"
-		[[ ! -e $IR/run/identity/ssh_host_ed25519_key && ! -e $IR/machine-id && $(slot SafespaceIdHostKey) == "$h" ]] && grep -q 'identity:sealed' "$W/pcrextend.log"
+		[[ ! -e $IR/machine-id && $(slot SafespaceIdMachine) == "$h" ]] && grep -q 'identity:sealed' "$W/pcrextend.log"
 	}
 	check "identity: another combination: not released, no new identity, PCR 15 closed" t_id_other
 	t_id_update() { rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" && cp "$IR/machine-id" "$W/mid1" && t_id containers 1 0 "$W/sig-good.json" && cmp -s "$IR/machine-id" "$W/mid1"; }
 	check "identity: the assigned combination again: the same machine-id" t_id_update
 	t_id_mismatch() {
 		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" || return 1
-		local h=$(slot SafespaceIdHostKey)
+		local h=$(slot SafespaceIdMachine)
 		printf '\x07\x00\x00\x00root' >"$EV/SafespaceAssign-$SG"
 		t_id containers 1 0 "$W/sig-good.json"
-		[[ $(slot SafespaceIdHostKey) == "$h" && ! -e $EV/SafespaceAssign-$SG ]] && grep -q "ignoring SafespaceAssign=root" "$IR/log"
+		[[ $(slot SafespaceIdMachine) == "$h" && ! -e $EV/SafespaceAssign-$SG ]] && grep -q "ignoring SafespaceAssign=root" "$IR/log"
 	}
 	check "identity: SafespaceAssign for another combination than measured: ignored, deleted" t_id_mismatch
 	t_id_move() {
 		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" || return 1
-		local h=$(slot SafespaceIdHostKey)
+		local h=$(slot SafespaceIdMachine) m=$(cat "$IR/machine-id")
 		printf '\x07\x00\x00\x00containers' >"$EV/SafespaceAssign-$SG"
 		t_id containers 1 0 "$W/sig-good.json"
-		[[ $(slot SafespaceIdHostKey) != "$h" && -s $IR/run/identity/ssh_host_ed25519_key && ! -e $EV/SafespaceAssign-$SG ]]
+		[[ $(slot SafespaceIdMachine) != "$h" && -s $IR/machine-id && $(cat "$IR/machine-id") != "$m" && ! -e $EV/SafespaceAssign-$SG ]]
 	}
-	check "identity: SafespaceAssign for the measured combination: a new identity" t_id_move
-	t_id_plain() { rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" STUB_TYPE=plain; [[ ! -e $EV/SafespaceIdHostKey-$SG ]] && grep -q "not bound to the signed policy" "$IR/log"; }
+	check "identity: SafespaceAssign for the measured combination (safespace-seal --move): a new machine-id" t_id_move
+	t_id_plain() { rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" STUB_TYPE=plain; [[ ! -e $EV/SafespaceIdMachine-$SG ]] && grep -q "not bound to the signed policy" "$IR/log"; }
 	check "identity: a slot without the signed policy type is not written" t_id_plain
-	t_id_nosig() { rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" STUB_NOSIG_OK=1; [[ ! -e $EV/SafespaceIdHostKey-$SG ]] && grep -q "not bound to the signed policy" "$IR/log"; }
+	t_id_nosig() { rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" STUB_NOSIG_OK=1; [[ ! -e $EV/SafespaceIdMachine-$SG ]] && grep -q "not bound to the signed policy" "$IR/log"; }
 	check "identity: a slot that unseals without a signature is not written" t_id_nosig
-	t_id_none() { rm -rf "$EV"; t_id "" 1 0 "$W/sig-good.json"; [[ ! -e $EV/SafespaceIdHostKey-$SG ]] && grep -q 'identity:sealed' "$W/pcrextend.log"; }
+	t_id_none() { rm -rf "$EV"; t_id "" 1 0 "$W/sig-good.json"; [[ ! -e $EV/SafespaceIdMachine-$SG ]] && grep -q 'identity:sealed' "$W/pcrextend.log"; }
 	check "identity: nothing measured: no identity, PCR 15 closed" t_id_none
 	t_id_swap() {
 		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" || return 1
-		cp "$EV/SafespaceIdHostKey-$SG" "$W/hk" && cp "$EV/SafespaceIdMachine-$SG" "$EV/SafespaceIdHostKey-$SG"
+		echo 0123456789abcdef0123456789abcdef >"$W/other"
+		"$CS" encrypt --with-key=tpm2-with-public-key --name=safespace-ssh-host-key "$W/other" "$W/other.cred" &&
+			{ printf '\x07\x00\x00\x00'; cat "$W/other.cred"; } >"$EV/SafespaceIdMachine-$SG"
 		t_id containers 1 0 "$W/sig-good.json"
-		[[ ! -e $IR/run/identity/ssh_host_ed25519_key ]]
+		[[ ! -e $IR/machine-id ]]
 	}
-	check "identity: one slot passed off as the other is not released" t_id_swap
+	check "identity: a credential of another name in the slot is not released" t_id_swap
 	check "identity: every sealing uses tpm2-with-public-key" bash -c '! grep -nE "(creds|CREDS\"?) encrypt" "$@" | grep -v "with-key=tpm2-with-public-key"' _ "$ID" "$REPO/mkosi.extra/usr/local/sbin/safespace-seal"
 fi
 
@@ -688,6 +691,36 @@ if wanted nginx && shared && need nginx curl; then
 fi
 
 # --- units ------------------------------------------------------------------------------------
+# --- aSSH: the machine's host key (lib/assh.sh, the image's assh.conf) ----------------------
+if wanted assh && need go; then
+	section assh
+	AB=$W/assh-bin/assh
+	t_assh_build() {
+		HERE=$REPO SAFESPACE_GOCACHE=${XDG_CACHE_HOME:-$HOME/.cache}/safespace-tests/go bash -c \
+			'die() { echo "$*" >&2; exit 1; }; log() { echo "$*"; }; . "$HERE/lib/assh.sh"; assh_build "$1"' _ "$AB" &&
+			go version -m "$AB" | grep -q 'CGO_ENABLED=0' && go version -m "$AB" | grep -q -- '-trimpath=true'
+	}
+	check "lib/assh.sh builds a static aSSH from the submodule" t_assh_build
+	C=$REPO/mkosi.extra/etc/assh/assh.conf
+	t_assh_conf() { # assh parses it: the CA file is what is missing, not a line
+		local out; out=$("$AB" ca show --config "$C" --ca "$W/no-ca" 2>&1) && return 1
+		[[ $out == *no-ca*"no such file"* && $out != *line* ]]
+	}
+	check "the image's assh.conf is aSSH's (it parses it)" t_assh_conf
+	check "assh.conf: the CA in SAFEasshCA, the authority in the TPM" bash -c 'grep -qx "ASSH_CA=efi:SAFEasshCA" "$1" && grep -qx "ASSH_AUTHORITY_TPM=yes" "$1"' _ "$C"
+	check "assh.conf: slot 0 = 0,2,7,11,15, slot 1 = 7,15, window 15" bash -c 'grep -qx "ASSH_CA_SLOT_0=0,2,7,11,15" "$1" && grep -qx "ASSH_CA_SLOT_1=7,15" "$1" && grep -qx "ASSH_CA_WINDOW=15" "$1" && [[ $(grep -c "^ASSH_CA_SLOT_" "$1") == 2 ]]' _ "$C"
+	A=$REPO/mkosi.extra/usr/lib/systemd/system/assh-agent.service
+	check "the agent starts before systemd's PCR 15 units and sysinit (PCR 11 and 15 as the initrd left them)" \
+		bash -c 'grep -q "^Before=.*sysinit.target" "$1" && grep -q "^Before=.*systemd-pcrmachine.service" "$1" && grep -q "^Before=.*systemd-pcrfs-root.service" "$1"' _ "$A"
+	check "the agent is enabled, sshd includes the host key file it (or sshd-hostkeys without a TPM) writes" \
+		bash -c 'grep -qx "enable assh-agent.service" "$1" && grep -qx "Include /run/safespace/sshd-hostkey.conf" "$2" && grep -q "ConditionPathExists=!/dev/tpmrm0" "$3"' _ \
+		"$REPO/mkosi.extra/usr/lib/systemd/system-preset/10-safespace.preset" "$REPO/mkosi.extra/etc/ssh/sshd_config.d/10-safespace.conf" "$REPO/mkosi.extra/etc/systemd/system/sshd-hostkeys.service"
+	check "the initrd has no ssh (the host key is aSSH's, in the root)" bash -c '! grep -qE "^[[:space:]]+openssh$" <(sed -n "/^InitrdPackages=/,/^[A-Z]/p" "$1")' _ "$REPO/mkosi.conf"
+	if need swtpm; then
+		check "aSSH's own tests (swtpm)" bash -c 'cd "$1" && GOTOOLCHAIN=local go test -count=1 ./...' _ "$REPO/assh"
+	fi
+fi
+
 if wanted units && need systemd-analyze; then
 	section units
 	U=$W/units
