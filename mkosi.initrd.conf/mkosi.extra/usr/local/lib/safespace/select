@@ -1,21 +1,24 @@
 # Which root to open (POSIX sh, initrd), sourced: choose (safespace-select.service)
 # decides it once with select_root; usb-bootdev and netroot take it with
 # select_chosen; identity reads the names below. Expects $cmdline and msg().
-# Both set SELECT_NAME and SELECT_HASH (the root hash to open), or return 1
-# with a message.
+# Both set SELECT_NAME and SELECT_LAYERS (its layers, bottom first; each one's
+# root hash: select_layer_hash), or return 1 with a message.
 #
-# The build names every combination on the signed command line:
-# safespace.root.<name>=<root hash>. The choice, first match:
+# The build names every layer and every combination on the signed command line
+# (lib/compose.sh): safespace.layer.<layer>=<root hash>, and
+# safespace.root.<name>=<layer>,<layer>... - a combination is a chain of layers,
+# the base first, stacked read-only. The choice, first match:
 #   1. safespace.select=<name> on the command line (a boot menu entry)
 #   2. EFI variable SafespaceSelectOnce-<GUID>: for this boot only, deleted here
 #   3. EFI variable SafespaceSelect-<GUID>: the persistent preselection
 #   4. the first combination on the command line (combinations.conf's first)
 # (set with safespace select on the running system). The variables only name a
-# combination; its root hash always comes from the signed command line, so a
-# changed variable can select another signed root, never an unsigned one. An
-# unknown name stops the boot: a wrong preselection must not go unnoticed.
-# Without any safespace.root.* there is nothing to open: the boot stops too
-# (roothash= is never used, so no other root hash can come into play).
+# combination; its layers and their root hashes always come from the signed
+# command line, so a changed variable can select another signed combination,
+# never an unsigned layer or another stack. An unknown name, or a combination
+# naming a layer without a hash, stops the boot: a wrong preselection must not
+# go unnoticed. Without any safespace.root.* there is nothing to open: the boot
+# stops too (roothash= is never used, so no other root hash can come into play).
 #
 # The decided name is measured into PCR 15 ("safespace-combination:<name>")
 # before it is used, and recorded in /run/safespace/combination: the machine's
@@ -49,9 +52,31 @@ select_var() { # NAME
 	printf '%s' "$v"
 }
 
+# A layer's root hash from the signed command line; "" for none.
+select_layer_hash() { # LAYER
+	h=$(select_arg "safespace.layer.$1")
+	case $h in
+		*[!0-9a-f]* | '') return 0 ;;
+	esac
+	[ ${#h} -eq 64 ] && printf '%s' "$h"
+	return 0
+}
+
+# SELECT_LAYERS for combination NAME: its chain, every layer with a root hash.
+select_layers() { # NAME
+	chain=$(select_arg "safespace.root.$1")
+	case $chain in
+		'' | *[!a-z0-9,-]* | ,* | *, | *,,*) msg "ERROR: combination '$1' is not in this build (it has: $names)"; return 1 ;;
+	esac
+	SELECT_LAYERS=$(printf '%s' "$chain" | tr ',' ' ')
+	for l in $SELECT_LAYERS; do
+		[ -n "$(select_layer_hash "$l")" ] || { msg "ERROR: combination '$1' names layer '$l', which has no root hash on the signed command line"; return 1; }
+	done
+}
+
 select_root() {
-	SELECT_NAME="" SELECT_HASH=""
-	names=$(printf '%s\n' "$cmdline" | tr ' ' '\n' | sed -n 's/^safespace\.root\.\([a-z][a-z0-9-]*\)=[0-9a-f]\{64\}$/\1/p' | tr '\n' ' ')
+	SELECT_NAME="" SELECT_LAYERS=""
+	names=$(printf '%s\n' "$cmdline" | tr ' ' '\n' | sed -n 's/^safespace\.root\.\([a-z][a-z0-9-]*\)=[a-z][a-z0-9,-]*$/\1/p' | tr '\n' ' ')
 	if [ -z "$names" ]; then
 		msg "ERROR: no safespace.root.<name>= on the signed command line"
 		return 1
@@ -72,25 +97,20 @@ select_root() {
 	case $want in
 		*[!a-z0-9-]*) msg "ERROR: invalid combination name '$want' ($from)"; return 1 ;;
 	esac
-	SELECT_HASH=$(select_arg "safespace.root.$want")
-	if [ -z "$SELECT_HASH" ]; then
-		msg "ERROR: combination '$want' ($from) is not in this build (it has: $names)"
-		return 1
-	fi
+	select_layers "$want" || { msg "($from)"; return 1; }
 	SELECT_NAME=$want
-	msg "combination $want ($from), roothash=$(printf %.12s "$SELECT_HASH")..."
+	msg "combination $want ($from), layers $SELECT_LAYERS"
 	select_measure "$want"
 }
 
-# The combination choose decided and measured this boot, its root hash from the
+# The combination choose decided and measured this boot, its layers from the
 # signed command line.
 select_chosen() {
-	SELECT_NAME=$(cat "$SELECT_RUN/combination" 2>/dev/null) SELECT_HASH=""
+	SELECT_NAME=$(cat "$SELECT_RUN/combination" 2>/dev/null) SELECT_LAYERS=""
 	case $SELECT_NAME in
 		'' | *[!a-z0-9-]*) msg "ERROR: no combination chosen this boot (safespace-select.service)"; return 1 ;;
 	esac
-	SELECT_HASH=$(select_arg "safespace.root.$SELECT_NAME")
-	[ -n "$SELECT_HASH" ] || { msg "ERROR: combination '$SELECT_NAME' is not in this build"; return 1; }
+	select_layers "$SELECT_NAME"
 }
 
 # Exactly once per boot: a second measurement no longer matches the sealed value.

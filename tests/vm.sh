@@ -330,11 +330,22 @@ vm_stop() { # NAME: power off, then make sure QEMU is gone
 PROBE='
 v=/sys/firmware/efi/efivars/LoaderDevicePartUUID-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
 [ -e $v ] && echo path_var=set || echo path_var=unset
-echo usb_bootdev=$(sudo dmesg | grep -c "usb-bootdev: root opened")
-echo netroot=$(sudo dmesg | grep -c "netroot: root opened")
-echo root=$(findmnt -no SOURCE,FSTYPE / | tr -s " " ,)
-echo verity=$(sudo veritysetup status root | sed -n "s/^ *status: *//p")
-data=$(sudo veritysetup status root | sed -n "s/^ *data device: *//p")
+echo usb_bootdev=$(sudo dmesg | grep -c "usb-bootdev: root: layer")
+echo netroot=$(sudo dmesg | grep -c "netroot: root: layer")
+# The layers the boot path stacked (bottom first), / as they imply it (one: its
+# erofs; more: a read-only overlayfs), every opened layer verified.
+lay=$(sudo dmesg | sed -n "s/.*: root: layer \([a-z0-9-]*\) (erofs.*/\1/p; s/.*: root: layers \(.*\) stacked read-only.*/\1/p" | tail -1)
+echo layers=$(echo $lay | tr " " ,)
+root=$(findmnt -no SOURCE,FSTYPE,OPTIONS / | tr -s " " ,)
+case $lay in
+	*" "*) case $root in overlay,overlay,ro,*lowerdir=*) echo root_ok=yes ;; *) echo root_ok="no:$root" ;; esac ;;
+	?*) case $root in /dev/mapper/layer-$lay,erofs,ro,*) echo root_ok=yes ;; *) echo root_ok="no:$root" ;; esac ;;
+	*) echo root_ok="no:$root" ;;
+esac
+v=verified
+for l in $lay; do [ "$(sudo veritysetup status layer-$l | sed -n "s/^ *status: *//p")" = verified ] || v="layer-$l:unverified"; done
+echo verity=$v
+data=$(sudo veritysetup status layer-${lay%% *} | sed -n "s/^ *data device: *//p")
 disk=$(lsblk -no PKNAME "$data" 2>/dev/null | head -1)
 if [ -n "$disk" ]; then
 	ro=1; for d in /dev/$disk /dev/$disk?*; do [ "$(sudo blockdev --getro $d)" = 1 ] || ro=0; done
@@ -404,7 +415,13 @@ val() { sed -n "s/^$2=//p" "$LOGS/$1.probe" 2>/dev/null | head -1; }
 
 # expect NAME KEY=VALUE...: every key has the value (VALUE* = starts with)
 expect() {
-	local name=$1 kv k v got bad=""; shift
+	local name=$1 kv k v got c bad=""; shift
+	# Every boot: the layers stacked are its combination's chain (build.json).
+	for c in "${COMBOS[@]}"; do
+		[[ ${c%%:*} == "$(val "$name" combination)" ]] || continue
+		got=$(val "$name" layers)
+		[[ $got == "$(tr + , <<<"${c#*:}")" ]] || bad+="layers=$got (want $(tr + , <<<"${c#*:}")) "
+	done
 	for kv in "$@"; do
 		k=${kv%%=*} v=${kv#*=} got=$(val "$name" "$k")
 		if [[ $v == *'*' ]]; then [[ $got == "${v%\*}"* ]] || bad+="$k=$got (want $v) "
@@ -413,7 +430,7 @@ expect() {
 	if [[ -z $bad ]]; then result PASS "$name"; else result FAIL "$name" "$bad"; return 1; fi
 }
 
-COMMON=(root=/dev/mapper/root,erofs verity=verified state=running failed=0 lockdown=integrity slim=ok)
+COMMON=(root_ok=yes verity=verified state=running failed=0 lockdown=integrity slim=ok)
 SEALED=(secure_boot=enabled* path_var=set usb_bootdev=1 "${COMMON[@]}")
 STICK=$RUN/stick.raw
 
@@ -722,7 +739,7 @@ step_identity_fails() {
 	vm_stop identity-agent-fails
 	# assh-agent failed: the one failed unit, the system degraded.
 	expect identity-agent-fails combination="$first" hostkey_src=throwaway ca_login=no secure_boot=enabled* path_var=set usb_bootdev=1 \
-		root=/dev/mapper/root,erofs verity=verified state=degraded failed=1 lockdown=integrity slim=ok
+		root_ok=yes verity=verified state=degraded failed=1 lockdown=integrity slim=ok
 	# StandardOutput=journal+console: the journal here (the VM's /dev/console is its screen).
 	id_check identity-agent-fails "the fallback says the host key is a throwaway one, and why" "grep -q 'ssh host key: THROWAWAY (aSSH did not start' '$LOGS/identity-agent-fails.journal' && grep -q 'SAFEasshCA' '$LOGS/identity-agent-fails.journal'"
 }
@@ -819,9 +836,11 @@ id_boot_once() { # NAME COMBINATION
 # KEY orders the report and names the step's work directory (short: qga.sock is a
 # unix socket).
 JOB_PID=""
+# VMs running: the shell's background jobs but the build of B and C (BUILD_B_PID).
+vms() { jobs -rp | grep -cvx "${BUILD_B_PID:-none}" || true; }
 job() {
 	local key=$1; shift
-	while (($(jobs -rp | wc -l) >= JOBS)); do wait -n; done
+	while (($(vms) >= JOBS)); do wait -n; done
 	(
 		KEY=$key WORK=$RUN/w/${key%%-*}
 		mkdir -p "$WORK"
@@ -846,7 +865,7 @@ fi
 # How many VMs at once: a network boot holds its root in RAM (test-vm.sh: largest
 # root + 2 GiB), each VM has 2 CPUs; at most 4.
 if [[ -z $JOBS ]]; then
-	root_mib=$(($(stat -c %s "$DIR"/root-*.img | sort -n | tail -1) / 1048576))
+	root_mib=$((($(stat -c %s "$DIR"/root-*.img | paste -sd+)) / 1048576))
 	avail_mib=$(awk '/^MemAvailable:/ { print int($2 / 1024) }' /proc/meminfo)
 	JOBS=$((avail_mib / (root_mib + 2560)))
 	((JOBS > $(nproc) / 2)) && JOBS=$(($(nproc) / 2))

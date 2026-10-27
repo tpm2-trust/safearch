@@ -29,6 +29,9 @@ SETTINGS_ASSH_GUID=24415b90-39be-45c0-a9a3-d547ebe28ea0
 SETTINGS_PCR=15
 SETTINGS_COMBINATION_EVENT=safespace-combination:
 SETTINGS_SEALED_EVENT=safespace-identity:sealed
+# How the initrd stacks a combination's layers, and the build proves the stack:
+# read-only overlayfs, no upper layer, nothing it would follow across layers.
+SETTINGS_OVERLAY=ro,metacopy=off,redirect_dir=off,index=off
 # The inventory ID: the machine-id hashed for this application (machine-id(5)).
 SETTINGS_APP_ID=eda1fc8c35e94e2087addff88d0b4e91
 
@@ -119,6 +122,8 @@ settings_write() { # DIR
 		SAFESPACE_MID_PCRS=$mid_plain
 		SAFESPACE_MID_SIGNED_PCRS=$mid_signed
 		SAFESPACE_APP_ID=$SETTINGS_APP_ID
+		# overlayfs' options for a combination's layers (the initrd's stack).
+		SAFESPACE_OVERLAY=$SETTINGS_OVERLAY
 		# The policy this image was built with (safespace.conf).
 		SAFESPACE_POLICY="$(settings_policy)"
 	EOF

@@ -96,9 +96,9 @@ CMDLINE=$(uki_section "$UKI" .cmdline)
 	bad "systemd.volatile=state missing: /var would be on the read-only root"
 opts=(systemd.credentials_boot_policy=strict systemd.sysext=0 systemd.confext=0
 	rd.systemd.sysext=0 rd.systemd.confext=0)
-# The initrd opens root itself (usb-bootdev, --panic-on-corruption) as
-# /dev/mapper/root; systemd's verity generator stays out of it.
-opts+=(root=/dev/mapper/root systemd.verity=no rd.systemd.verity=no)
+# The initrd opens the layers itself (usb-bootdev, --panic-on-corruption) and
+# stacks them at /sysroot; systemd's verity and partition generators stay out.
+opts+=(systemd.verity=no rd.systemd.verity=no systemd.gpt_auto=0 rd.systemd.gpt_auto=0)
 for opt in "${opts[@]}"; do
 	[[ " $CMDLINE " == *" $opt "* ]] && ok "$opt" || bad "$opt missing from the kernel command line"
 done
@@ -108,24 +108,20 @@ extra=$(cd "$TMP/esp" && find . -type f ! -ipath './efi/boot/bootx64.efi' ! -ipa
 [[ -z $extra ]] && ok "ESP holds nothing but systemd-boot and the UKI" || { bad "unexpected files on the ESP:"; sed 's/^/       /' <<<"$extra"; }
 
 [[ " $CMDLINE " == *" lockdown=integrity "* ]] && ok "lockdown=integrity" || bad "lockdown=integrity missing from the kernel command line"
-[[ " $CMDLINE " != *" roothash="* ]] && ok "no roothash= (the roots are named per combination)" || bad "roothash= on the command line"
+[[ " $CMDLINE " != *" roothash="* && " $CMDLINE " != *" root="* ]] && ok "no roothash=, no root= (the initrd stacks the layers)" || bad "roothash= or root= on the command line"
 mapfile -t COMBOS < <(verify_combinations "$CMDLINE")
 ((${#COMBOS[@]})) && ok "combinations: ${COMBOS[*]} (default ${COMBOS[0]})" || { bad "no safespace.root.<name>= on the kernel command line"; exit 1; }
-((NPARTS == 1 + 2 * ${#COMBOS[@]})) && ok "exactly $NPARTS partitions (ESP + a root/verity pair per combination), nothing writable on the stick" ||
-	bad "$NPARTS partitions, expected $((1 + 2 * ${#COMBOS[@]})) (ESP, root-<name> and root-<name>-verity per combination)"
+mapfile -t LAYERS < <(verify_layers "$CMDLINE")
+((${#LAYERS[@]})) && ok "layers: ${LAYERS[*]}" || { bad "no safespace.layer.<layer>= on the kernel command line"; exit 1; }
+for C in "${COMBOS[@]}"; do ok "  $C: $(verify_chain "$CMDLINE" "$C")"; done
+((NPARTS == 1 + 2 * ${#LAYERS[@]})) && ok "exactly $NPARTS partitions (ESP + a root/verity pair per layer), nothing writable on the stick" ||
+	bad "$NPARTS partitions, expected $((1 + 2 * ${#LAYERS[@]})) (ESP, root-<layer> and root-<layer>-verity per layer)"
 
-check_root() { # NAME PARTITION: what is inside a root (read-only)
-	local C=$1 ROOT=$2 list root_fs root_bs f l
+check_root() { # NAME: what is inside a combination's root, mounted at $TMP/root (read-only)
+	local C=$1 list f l
 	hdr "Root content of $C (read-only)"
-	# udev's blkid must recognise root, or systemd never marks /dev/mapper/root
-	# ready (99-systemd.rules) and the initrd times out. libblkid does not detect
-	# erofs with 512-byte blocks.
-	root_fs=$(blkid -p -s TYPE -o value "$ROOT")
-	root_bs=$(blkid -p -s FSBLOCKSIZE -o value "$ROOT")
-	[[ $root_fs == erofs && $root_bs == 4096 ]] && ok "blkid sees erofs, block size 4096" ||
-		bad "blkid sees '${root_fs:-nothing}' (block size ${root_bs:-?}): the initrd will wait for /dev/mapper/root forever"
-	if mount -o ro "$ROOT" "$TMP/root"; then
-		ok "root mounted ($(blkid -p -s TYPE -o value "$ROOT"))"
+	if mountpoint -q "$TMP/root"; then
+		ok "root of $C: its layers stacked as the initrd stacks them"
 		for f in etc/fstab etc/machine-id; do
 			[[ -e $TMP/root/$f ]] && { ok "/$f"; sed 's/^/       /' "$TMP/root/$f"; } || bad "/$f missing"
 		done
@@ -159,12 +155,13 @@ check_root() { # NAME PARTITION: what is inside a root (read-only)
 }
 
 part_by_uuid() { lsblk -lnpo NAME,PARTUUID "$DISK" | awk -v u="$1" 'tolower($2) == u { print $1; exit }'; }
-# The roots, each checked as the initrd opens it: partitions by the UUIDs
+# The layers, each checked as the initrd opens it: partitions by the UUIDs
 # derived from its signed hash, every block against that hash.
-for C in "${COMBOS[@]}"; do
-	ROOTHASH=$(tr ' ' '\n' <<<"$CMDLINE" | sed -n "s/^safespace\.root\.$C=//p")
-	hdr "dm-verity root of $C"
-	ok "safespace.root.$C=$ROOTHASH"
+declare -A LAYER_PART=()
+for C in "${LAYERS[@]}"; do
+	ROOTHASH=$(verify_layer_hash "$CMDLINE" "$C")
+	hdr "dm-verity layer $C"
+	ok "safespace.layer.$C=$ROOTHASH"
 	# The build on this host with that root hash, if any.
 	build=$(grep -lx "$ROOTHASH" "$HERE"/mkosi.output/*/roothash-"$C" 2>/dev/null | head -1)
 	if [[ -n $build ]]; then
@@ -176,12 +173,36 @@ for C in "${COMBOS[@]}"; do
 	VERITY=$(part_by_uuid "$(layout_uuid "${ROOTHASH: -32}")")
 	[[ -n $ROOT ]] && ok "root partition $ROOT: UUID from the root hash" || { bad "no partition with the root UUID $(layout_uuid "${ROOTHASH:0:32}")"; continue; }
 	[[ -n $VERITY ]] && ok "verity partition $VERITY: UUID from the root hash" || { bad "no partition with the verity UUID $(layout_uuid "${ROOTHASH: -32}")"; continue; }
-	echo "  verifying every block of root against the root hash (takes a while)..."
+	# The initrd mounts each layer as erofs: libblkid does not detect erofs with
+	# 512-byte blocks.
+	[[ $(blkid -p -s TYPE -o value "$ROOT") == erofs && $(blkid -p -s FSBLOCKSIZE -o value "$ROOT") == 4096 ]] &&
+		ok "blkid sees erofs, block size 4096" || bad "layer $C is no erofs with 4096-byte blocks"
+	echo "  verifying every block of the layer against the root hash (takes a while)..."
 	if veritysetup verify "$ROOT" "$VERITY" "$ROOTHASH"; then
-		ok "root of $C is exactly what was signed"
+		ok "layer $C is exactly what was signed"
+		LAYER_PART[$C]=$ROOT
 	else
-		bad "verity verification FAILED: root of $C was modified or the write is damaged"
+		bad "verity verification FAILED: layer $C was modified or the write is damaged"
 	fi
-	check_root "$C" "$ROOT"
 done
+# Each combination as the initrd stacks it (lib/settings.sh: its overlayfs options).
+# shellcheck source=lib/settings.sh
+source "$HERE/lib/settings.sh"
+for C in "${COMBOS[@]}"; do
+	lower="" stacked=1
+	for L in $(verify_chain "$CMDLINE" "$C"); do
+		[[ -n ${LAYER_PART[$L]:-} ]] || { bad "$C: layer $L did not verify, not stacked"; stacked=0; break; }
+		mkdir -p "$TMP/layer-$L"
+		mountpoint -q "$TMP/layer-$L" || mount -t erofs -o ro "${LAYER_PART[$L]}" "$TMP/layer-$L" || { bad "cannot mount layer $L"; stacked=0; break; }
+		lower=$TMP/layer-$L${lower:+:$lower}
+	done
+	((stacked)) || continue
+	if [[ $lower == *:* ]]; then
+		mount -t overlay overlay -o "$SETTINGS_OVERLAY,lowerdir=$lower" "$TMP/root" || { bad "cannot stack $C"; continue; }
+	else
+		mount --bind -o ro "$lower" "$TMP/root" || { bad "cannot mount $C"; continue; }
+	fi
+	check_root "$C"
+done
+for L in "${LAYERS[@]}"; do umount -q "$TMP/layer-$L" 2>/dev/null; done
 

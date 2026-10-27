@@ -5,8 +5,10 @@
 #
 #   verify_release DIR DB_CERT
 #       boot.efi systemd-boot.efi layout.sfdisk cmdline release SHA256SUMS,
-#       per combination root-<name>.img root-<name>.verity roothash-<name>
+#       per layer root-<layer>.img root-<layer>.verity roothash-<layer>
 #   verify_combinations CMDLINE  the combination names on a signed command line
+#   verify_chain CMDLINE NAME    a combination's layers, bottom first
+#   verify_layers CMDLINE        the layers, verify_layer_hash CMDLINE LAYER its root hash
 #   release_get FILE KEY        value of KEY=... in a release file (not sourced)
 #   verify_name_version VALUE
 #   uki_section FILE SECTION    a section of a UKI (.cmdline, .uname, .osrel)
@@ -14,9 +16,10 @@
 #                               a stick's partition table, as systemd-repart makes it
 #
 # What is trusted: only DB_CERT, the public Secure Boot db certificate. The
-# UKI and systemd-boot must carry a valid signature from it; the root hashes
-# are taken from the UKI's signed command line (safespace.root.<name>=), and
-# each root image must match its hash block by block. The partition table for
+# UKI and systemd-boot must carry a valid signature from it; the layers' root
+# hashes are taken from the UKI's signed command line (safespace.layer.<layer>=),
+# each layer's image must match its hash block by block, and every combination
+# (safespace.root.<name>=<layer>,...) must consist of those layers. The partition table for
 # sticks must name the partitions by those root hashes, as the initrd finds
 # them. So a release that
 # passes was built and signed by the holder of the db key, whatever path it
@@ -73,8 +76,20 @@ verify_sums() { # DIR
 	(cd "$dir" && sha256sum --quiet --strict -c SHA256SUMS) >&2 || vfail "SHA256SUMS does not match (broken or incomplete transfer)"
 }
 
+# On a signed command line (lib/compose.sh): safespace.layer.<layer>=<root hash>
+# per layer, safespace.root.<name>=<layer>,<layer>... per combination, its chain
+# bottom first. The initrd (select) reads them alike.
 verify_combinations() { # CMDLINE
-	tr ' ' '\n' <<<"$1" | sed -n 's/^safespace\.root\.\([a-z][a-z0-9-]*\)=[0-9a-f]\{64\}$/\1/p'
+	tr ' ' '\n' <<<"$1" | sed -n 's/^safespace\.root\.\([a-z][a-z0-9-]*\)=[a-z][a-z0-9,-]*$/\1/p'
+}
+verify_chain() { # CMDLINE NAME
+	tr ' ' '\n' <<<"$1" | sed -n "s/^safespace\.root\.$2=\([a-z][a-z0-9,-]*\)\$/\1/p" | tail -1 | tr ',' ' '
+}
+verify_layers() { # CMDLINE
+	tr ' ' '\n' <<<"$1" | sed -n 's/^safespace\.layer\.\([a-z][a-z0-9-]*\)=[0-9a-f]\{64\}$/\1/p'
+}
+verify_layer_hash() { # CMDLINE LAYER
+	tr ' ' '\n' <<<"$1" | sed -n "s/^safespace\.layer\.$2=\([0-9a-f]\{64\}\)\$/\1/p" | tail -1
 }
 
 # The release file's signature (release.p7s, detached CMS) by the db key:
@@ -85,7 +100,7 @@ verify_release_file() { # RELEASE P7S DB_CERT
 }
 
 verify_release() { # DIR DB_CERT
-	local dir=$1 cert=$2 f version cmdline url urls=0 n h names=() pairs=()
+	local dir=$1 cert=$2 f version cmdline url urls=0 n l h names=() layers=() pairs=()
 	[[ -f $cert ]] || vfail "no db certificate $cert" || return
 	[[ -d $dir ]] || vfail "no release directory $dir" || return
 	for f in boot.efi systemd-boot.efi layout.sfdisk cmdline release release.p7s SHA256SUMS; do
@@ -111,29 +126,42 @@ verify_release() { # DIR DB_CERT
 	done
 	((urls)) || vinfo "no safespace.netroot= in the UKI: this release boots from sticks only"
 
-	# One root per combination, its hash from the signed command line.
+	# The combinations, each a chain of the layers on the signed command line.
 	mapfile -t names < <(verify_combinations "$cmdline")
 	((${#names[@]})) || vfail "the UKI's signed command line names no combination (safespace.root.<name>=)" || return
 	[[ $(release_get "$dir/release" COMBINATIONS) == "$(IFS=,; echo "${names[*]}")" ]] ||
 		vfail "release names COMBINATIONS=$(release_get "$dir/release" COMBINATIONS), the signed command line ${names[*]}" || return
-	vinfo "combinations on the signed command line: ${names[*]} (default ${names[0]})"
+	mapfile -t layers < <(verify_layers "$cmdline")
+	((${#layers[@]})) || vfail "the UKI's signed command line names no layer (safespace.layer.<layer>=)" || return
+	[[ $(release_get "$dir/release" LAYERS) == "$(IFS=,; echo "${layers[*]}")" ]] ||
+		vfail "release names LAYERS=$(release_get "$dir/release" LAYERS), the signed command line ${layers[*]}" || return
 	for n in "${names[@]}"; do
-		h=$(tr ' ' '\n' <<<"$cmdline" | sed -n "s/^safespace\.root\.$n=//p")
-		for f in "root-$n.img" "root-$n.verity" "roothash-$n"; do
+		h=$(verify_chain "$cmdline" "$n")
+		[[ -n $h ]] || vfail "combination $n has no layers" || return
+		for l in $h; do
+			[[ " ${layers[*]} " == *" $l "* ]] || vfail "combination $n names layer $l, which the signed command line does not have" || return
+		done
+		vinfo "combination $n: $h"
+	done
+	vinfo "default: ${names[0]}"
+	# One image per layer, its hash from the signed command line.
+	for l in "${layers[@]}"; do
+		h=$(verify_layer_hash "$cmdline" "$l")
+		for f in "root-$l.img" "root-$l.verity" "roothash-$l"; do
 			[[ -f $dir/$f && ! -L $dir/$f ]] || vfail "$f missing" || return
 		done
-		[[ $(tr -d '[:space:]' <"$dir/roothash-$n") == "$h" ]] ||
-			vfail "roothash-$n is not the root hash on the UKI's signed command line" || return
-		veritysetup verify "$dir/root-$n.img" "$dir/root-$n.verity" "$h" >&2 ||
-			vfail "root-$n.img does not match the signed root hash" || return
-		vinfo "root-$n.img matches the signed root hash"
-		pairs+=("$n $h")
+		[[ $(tr -d '[:space:]' <"$dir/roothash-$l") == "$h" ]] ||
+			vfail "roothash-$l is not the root hash on the UKI's signed command line" || return
+		veritysetup verify "$dir/root-$l.img" "$dir/root-$l.verity" "$h" >&2 ||
+			vfail "root-$l.img does not match the signed root hash" || return
+		vinfo "root-$l.img matches the signed root hash"
+		pairs+=("$l $h")
 	done
 	verify_layout "$dir" "${pairs[@]}" || return
 }
 
-# The stick's partition table: an ESP, and for each combination a root and a
-# verity partition (root-<name>, root-<name>-verity) with the UUIDs the initrd
+# The stick's partition table: an ESP, and for each layer a root and a verity
+# partition (root-<layer>, root-<layer>-verity) with the UUIDs the initrd
 # looks for (the two halves of the root hash, as systemd-repart derives them),
 # large enough for the files.
 verify_layout() { # DIR "NAME HASH"...

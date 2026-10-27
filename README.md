@@ -6,8 +6,9 @@ UEFI machines (no legacy BIOS), built with
 **read-only**: nothing is written to the boot medium at runtime. The root is protected by
 dm-verity, `/var` lives in RAM, and only disks mounted at runtime are writable. A build holds
 several **combinations** of **package groups** on top of the base system (Docker with its
-storage on a data disk, an XFCE desktop over VNC, diagnostic tools), each a complete root of
-its own; a machine boots one of them and loads only that one.
+storage on a data disk, an XFCE desktop over VNC, diagnostic tools): every group a
+dm-verity protected layer, built and shipped once, a combination a chain of layers stacked
+read-only; a machine boots one of them and loads only its layers.
 
 Arch Linux only: the images, the build host and the distribution servers.
 
@@ -18,8 +19,8 @@ and over the network; the initrd tells them apart at boot:
 |---|---|---|
 | How the firmware starts the UKI | systemd-boot on the stick (`\EFI\BOOT\BOOTX64.EFI`) starts it from the ESP | the firmware downloads it itself (UEFI HTTP boot, or PXE/TFTP) |
 | How the initrd knows | `LoaderDevicePartUUID` is set (started from a partition) | it is not |
-| Where the root comes from | `usb-bootdev`: the selected combination's root and hash partitions on the stick, found by the UUIDs derived from its signed root hash; the stick is set read-only at block level | `netroot`: the selected combination's `root-<name>.img` and `root-<name>.verity` over HTTP from `safespace.netroot=` into a tmpfs |
-| Opened as | `/dev/mapper/root` through dm-verity with the signed root hash, `--panic-on-corruption` | the same |
+| Where the root comes from | `usb-bootdev`: the layers of the selected combination, each a data and a hash partition on the stick, found by the UUIDs derived from its signed root hash; the stick is set read-only at block level | `netroot`: the selected combination's layers, `root-<layer>.img` and `root-<layer>.verity`, over HTTP from `safespace.netroot=` into a tmpfs |
+| Opened as | every layer through dm-verity with its signed root hash, `--panic-on-corruption`, stacked read-only at `/sysroot` (one layer: its erofs; more: overlayfs without an upper layer) | the same |
 | USB devices | only the path to the stick is authorized | nothing on USB is authorized (the NIC must be PCI/PCIe) |
 | Gets to the machines | `sudo ./burn.sh /dev/sdX` (on the build host, or anywhere from a distribution server) | `./release.sh` to the distribution servers |
 
@@ -70,8 +71,8 @@ flowchart LR
 
 **One release per server.** A distribution server serves the newest release under fixed
 names: `boot.efi` (the signed UKI), `systemd-boot.efi`, `layout.sfdisk` (the partition table
-for sticks), per combination `root-<name>.img`, `root-<name>.verity`, `roothash-<name>`,
-`manifest-<name>.json`, plus `cmdline`, `release`, `SHA256SUMS`. No disk image is stored or shipped anywhere: `burn.sh` assembles a
+for sticks), per layer `root-<layer>.img`, `root-<layer>.verity`, `roothash-<layer>`, per
+combination `manifest-<name>.json`, plus `cmdline`, `release`, `SHA256SUMS`. No disk image is stored or shipped anywhere: `burn.sh` assembles a
 stick from the parts. `release.sh` replaces a release with `rsync --delay-updates`: the new
 files are collected in a temp directory and renamed in one go at the end, and a download
 already running finishes on the old file. There are no versions, channels or links to
@@ -236,28 +237,42 @@ separated. The default holds three; others are a line in `safespace.local.conf` 
 | `remotedesktop` | base, xfce4-headless-vnc | no |
 | `remote-workstation` | base, docker, xfce4-headless-vnc | no |
 
-`sudo ./build.sh` builds every combination with a mkosi run of its own (the groups as
-profiles) and composes them into one build, `mkosi.output/combined_<version>/`:
+**Each group is a layer, built once** (`lib/layers.sh`). A combination is a chain of layers,
+the base first, then its groups in the order `COMBINATIONS` names them; a group lies on the
+same layer in every combination (otherwise `build.sh` refuses), so `root=base`,
+`containers=base,docker` and `debug=base,debug` are three layers: base, docker on base, debug
+on base. `sudo ./build.sh`:
 
-- one signed UKI (`boot.efi`): kernel, initrd and microcode of the first combination, built
-  with ukify from the image's own systemd-stub, signed with the db key and with signed
-  expected PCRs. Its command line names every combination with its root hash,
-  `safespace.root.<name>=<hash>` (no `roothash=`); its os-release is named
-  `safespace <version>`, without a combination (systemd-boot shows that name);
-- per combination `root-<name>.img`, `root-<name>.verity`, `roothash-<name>`,
-  `manifest-<name>.json`; one `layout.sfdisk` with the ESP and a root/verity pair per
-  combination (partitions `root-<name>`, `root-<name>-verity`, UUIDs from each root hash).
+1. builds the base as a tree (pacman's database kept), then the base's image on a copy of
+   that tree: the UKI, the initrd and systemd-boot (every combination's), and the base's own
+   erofs root with its dm-verity tree;
+2. builds every further layer as a tree on a copy of the one below it (mkosi `BaseTrees=`,
+   the chain's groups as profiles), and takes as the layer exactly what is new or differs
+   from the tree below (type, mode, owner, content, xattrs; `lib/layertree.py`) - the base
+   as the machine gets it: its image, unpacked;
+3. refuses a layer that changes a package below it, deletes a path of it, or touches the
+   kernel; **proves** that the layers stacked as the initrd stacks them are the combination
+   built in full, file for file; and makes each layer an erofs image with its dm-verity tree;
+4. composes the build, `mkosi.output/combined_<version>/`:
+   - one signed UKI (`boot.efi`): kernel, initrd and microcode of the base, built with ukify
+     from the image's own systemd-stub, signed with the db key and with signed expected PCRs.
+     Its command line names every layer with its root hash, `safespace.layer.<layer>=<hash>`,
+     and every combination as its chain, `safespace.root.<name>=<layer>,<layer>...` (no
+     `roothash=`, no `root=`); its os-release is named `safespace <version>`, without a
+     combination (systemd-boot shows that name);
+   - per layer `root-<layer>.img`, `root-<layer>.verity`, `roothash-<layer>`; per combination
+     `manifest-<name>.json`; one `layout.sfdisk` with the ESP and a data/verity pair per layer
+     (partitions `root-<layer>`, `root-<layer>-verity`, UUIDs from each root hash).
 
-Every combination is a complete root; nothing is shared between roots or layered at runtime.
-Only the UKI is common (all combinations run the same kernel; the build refuses otherwise).
-Before the build counts as built, `build.sh` checks the composed UKI again, since
-`mkosi.postoutput` only saw the per-combination ones: signed by exactly the exported
-`db.pem`, `lockdown=integrity` on its command line, no `roothash=`, every combination with
-its own hash in order, signed expected PCRs, and a partition table that names every pair by
-its hash. `release.sh` releases it (`COMBINATIONS=` in `release`), the server checks every
-root against its signed hash, `burn.sh` writes all pairs onto the stick (the stick must hold
-all roots). Over the network a machine downloads only the root it boots; from a stick only
-that pair is opened.
+The roots are not shipped whole: the base once, each group's layer once. All combinations run
+the same kernel and initrd (the base's). Before the build counts as built, `build.sh` checks
+the composed UKI again: signed by exactly the exported `db.pem`, `lockdown=integrity` on its
+command line, no `roothash=` or `root=`, every layer with its own hash and every combination
+with its chain, in order, signed expected PCRs, and a partition table that names every pair
+by its hash. `release.sh` releases it (`COMBINATIONS=` and `LAYERS=` in `release`), the
+server checks every layer against its signed hash, `burn.sh` writes all pairs onto the stick.
+Over the network a machine downloads only the layers it boots; from a stick only those pairs
+are opened.
 
 **Which root boots** is decided in the initrd (`mkosi.initrd.conf/.../select`), first match:
 
@@ -357,11 +372,11 @@ mkosi.output/
 │   ├── boot.efi                     the signed UKI (sticks and network), all combinations
 │   ├── systemd-boot.efi             the signed systemd-boot, \EFI\BOOT\BOOTX64.EFI on a stick
 │   ├── layout.sfdisk                a stick's partition table (UUIDs derived from the root hashes)
-│   ├── root-<name>.img, .verity     per combination: the root partition and its dm-verity hash tree
-│   ├── roothash-<name>              its root hash (also on the UKI's signed command line)
-│   ├── manifest-<name>.json         its packages
+│   ├── root-<layer>.img, .verity    per layer: its erofs image and its dm-verity hash tree
+│   ├── roothash-<layer>             its root hash (also on the UKI's signed command line)
+│   ├── manifest-<name>.json         per combination: its packages
 │   ├── vnc-password-<name>          (xfce4-headless-vnc) the generated VNC password, 0600
-│   ├── build.json                   combinations, start/end, snapshot + mirror, commit
+│   ├── build.json                   combinations, layers, start/end, snapshot + mirror, commit
 │   │                                (+ uncommitted changes?), signing certificate, packages, sizes
 │   └── released.log                 one line per push: time, target
 └── combined_20261019-1012/ …
@@ -372,12 +387,14 @@ servers' `status` show it. The image version inside stays the timestamp; a secon
 same minute gets the seconds too. After the build the directory belongs to the user who ran
 `sudo`, so everything below works without root.
 
-**The parts:** for each combination mkosi builds a disk image as usual (ESP, root, verity) in
-`mkosi.output/.parts-<version>/<name>/`; right after its run `build.sh` keeps only the parts
-(`builds_finalize` in `lib/builds.sh`), uncompressed (the root is erofs, compressed already):
-it takes the signed systemd-boot and the partition table (`sfdisk -d`) out of the image, then
-deletes the image and mkosi's separate initrd copy. `lib/compose.sh` then makes the build
-from them and the parts directory goes. A build is ~2 GB per combination.
+**The parts:** in `mkosi.output/.parts-<version>/` - every mkosi run with its log there, every
+step's time in `build.sh`'s output. For the base mkosi builds a disk image as usual (ESP,
+root, verity); right after its run `build.sh` keeps only the parts (`builds_finalize` in
+`lib/builds.sh`): it takes the signed systemd-boot and the partition table (`sfdisk -d`) out
+of the image, then deletes the image and mkosi's separate initrd copy. The layers' trees and
+images are made next to it (`lib/layers.sh`). `lib/compose.sh` then makes the build from them
+and the parts directory goes. A build is the base (~400 MiB) plus its layers (docker ~100 MiB,
+debug a few MiB).
 
 ```sh
 ./build.sh list                              # all builds: built at, snapshot, packages, size, last release
@@ -422,8 +439,8 @@ has everything in RAM.
 (`./build.sh list` shows them, with their last release).
 
 **A machine that downloads during a release:** it may get the old `boot.efi` and then the new
-`root-<name>.img`. dm-verity refuses that, as it must; the initrd sees that the server now has
-another release (its `roothash-<name>`) and reboots after 10 s, and the firmware loads the new
+`root-<layer>.img`. dm-verity refuses that, as it must; the initrd sees that the server now has
+another release (a `roothash-<layer>` that is not the signed one) and reboots after 10 s, and the firmware loads the new
 `boot.efi`. If no server answers with this UKI's release and the image is refused anyway, it
 stops with an error instead (no reboot loop).
 
@@ -815,19 +832,20 @@ Partitions of the `usb` image (what `burn.sh` writes):
 | # | Partition | Content |
 |---|---|---|
 | 1 | ESP, 512 MiB, FAT | signed systemd-boot `\EFI\BOOT\BOOTX64.EFI`, signed UKI `\EFI\Linux\*.efi` |
-| 2, 4, … | `root-<name>`, erofs (zstd), one per combination | `/usr`, `/etc`, factory `/var`, shipped Docker images |
-| 3, 5, … | `root-<name>-verity` | dm-verity hash tree of the partition before it |
+| 2, 4, … | `root-<layer>`, erofs (zstd), one per layer | the base: `/usr`, `/etc`, factory `/var`; a further layer: what its group adds or changes (e.g. docker, shipped Docker images) |
+| 3, 5, … | `root-<layer>-verity` | dm-verity hash tree of the partition before it |
 
-Each mkosi run lays out ESP, root, verity (`mkosi.repart/`); `lib/compose.sh` writes the
-stick's table with one pair per combination. Over the network the same pairs are published as
-separate files (`root-<name>.img`, `root-<name>.verity`) and the UKI is served on its own. See
+The base's mkosi run lays out ESP, root, verity (`mkosi.repart/`); `lib/compose.sh` writes the
+stick's table with one pair per layer. Over the network the same pairs are published as
+separate files (`root-<layer>.img`, `root-<layer>.verity`) and the UKI is served on its own. See
 [NETBOOT.md](NETBOOT.md).
 
 ## How the integrity protection works
 
-dm-verity itself uses **no keys**. It's a sha256 hash tree over root, and its only anchor of
-trust is the **root hash**. That hash (one per combination, `safespace.root.<name>=`) sits in
-the kernel command line inside the UKI, and
+dm-verity itself uses **no keys**. It's a sha256 hash tree over a layer, and its only anchor
+of trust is the **root hash**. That hash (one per layer, `safespace.layer.<layer>=`) sits in
+the kernel command line inside the UKI, with every combination's chain of layers
+(`safespace.root.<name>=`), and
 the UKI is signed with your sbctl **`db` key**. So everything rests on the Secure Boot
 signature:
 
@@ -836,14 +854,18 @@ signature:
    uses `db.key`).
 2. The command line is part of the signed file. Under Secure Boot, systemd-stub ignores any
    command line passed from outside.
-3. The initrd (also signed) picks the combination and reads its hash from the command line
-   (an EFI variable can only name a combination, never supply a hash). usb: it finds the root
-   and hash partitions by the UUIDs derived from it. network: it downloads
-   `root-<name>.img` and `root-<name>.verity` from the URL on the signed command line and
-   opens them with that hash. Either way the result is
-   `/dev/mapper/root`, and a wrong or manipulated root is rejected before it is mounted.
-4. The kernel checks every block read from root against the tree. A mismatch stops the system
-   (`panic-on-corruption`).
+3. The initrd (also signed) picks the combination and reads its layers and their hashes from
+   the command line (an EFI variable can only name a combination, never supply a hash or a
+   layer). usb: it finds each layer's data and hash partitions by the UUIDs derived from its
+   hash. network: it downloads `root-<layer>.img` and `root-<layer>.verity` from the URL on
+   the signed command line and opens them with that hash. Either way each layer is a dm-verity
+   device, and a wrong or manipulated layer is rejected before anything is mounted.
+4. The layers are stacked read-only at `/sysroot`: one layer is its erofs, more are overlayfs
+   without an upper layer (`ro,metacopy=off,redirect_dir=off,index=off`) - every file comes
+   from a verified layer, nothing is writable, the build proved the stack equal to the
+   combination built in full.
+5. The kernel checks every block read from a layer against its tree. A mismatch stops the
+   system (`panic-on-corruption`).
 
 The ESP itself isn't covered by dm-verity, and systemd-stub reads more than the UKI from it.
 Those paths are closed on the signed command line:
@@ -1076,16 +1098,17 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 | `systemd.sysext=0`, `systemd.confext=0`, `rd.systemd.sysext=0`, `rd.systemd.confext=0` | no extension images over `/usr` and `/etc` |
 | `systemd.firstboot=off` | no first-boot questions |
 | `lockdown=integrity` | kernel lockdown: no unsigned kexec or modules, no `/dev/mem`, MSR writes, `iopl`, hibernation; the Arch kernel does not enable it under Secure Boot by itself. `mkosi.postoutput` refuses a UKI without it ([SECURITY.md](SECURITY.md)) |
-| `root=/dev/mapper/root`, `rootfstype=erofs`, `ro`, `systemd.verity=no`, `rd.systemd.verity=no` | the initrd opens the verity device itself under that name, on either path (`usb-bootdev` or `netroot`, both with `--panic-on-corruption`), so systemd's verity generator stays out of it |
-| `safespace.netroot=<url>/` | where `netroot` fetches `roothash-<name>`, `root-<name>.verity` and `root-<name>.img` (from `NETROOT_URL`); signed, so it cannot be redirected. Without it the build boots from sticks only |
-| `safespace.root.<name>=<hash>` | one per combination, set by `lib/compose.sh` instead of mkosi's `roothash=`; the initrd opens only a root named here, with this hash |
+| `ro`, `systemd.verity=no`, `rd.systemd.verity=no`, `systemd.gpt_auto=0`, `rd.systemd.gpt_auto=0`; no `root=` | the initrd opens the layers itself and mounts their stack at `/sysroot`, on either path (`usb-bootdev` or `netroot`, both with `--panic-on-corruption`), so systemd's verity and partition generators stay out of it |
+| `safespace.netroot=<url>/` | where `netroot` fetches `roothash-<layer>`, `root-<layer>.verity` and `root-<layer>.img` (from `NETROOT_URL`); signed, so it cannot be redirected. Without it the build boots from sticks only |
+| `safespace.layer.<layer>=<hash>` | one per layer, set by `lib/compose.sh` instead of mkosi's `roothash=`; the initrd opens only a layer named here, with this hash |
+| `safespace.root.<name>=<layer>,<layer>...` | one per combination: its chain of layers, bottom first; the initrd stacks exactly these |
 
 ### Initrd (`mkosi.initrd.conf/`, `InitrdPackages=`, `KernelInitrdModules=`)
 
 - One initrd for both paths: `coreutils`, `sed`, `kmod`, `curl`, `cryptsetup`, `iproute2`,
   `openssh` (`ssh-keygen`, for the machine identity) for the scripts below; sysext/confext units masked in the initrd as well;
   `CompressLevel=19`. Drivers: one explicit list instead of mkosi's default set (dm-verity,
-  loop, erofs, crypto, virtio for QEMU, USB host controllers, USB storage, MMC and card
+  loop, erofs, overlay, crypto, virtio for QEMU, USB host controllers, USB storage, MMC and card
   readers, client ethernet and PHY, in `mkosi.conf`). Removed, to keep the UKI small
   (NETBOOT.md, "Size of the network UKI"): filesystem tools, systemd tools without a job in
   the initrd, glibc's charset converters, sanitizer runtimes, certificate CLIs, sqlite
@@ -1094,14 +1117,15 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 - **The path is chosen at boot** by `LoaderDevicePartUUID` (`mkosi.initrd.conf/mkosi.extra/`):
   - set (systemd-boot started the UKI from a partition): `usb-bootdev.service` +
     `/usr/local/lib/safespace/usb-bootdev`: authorizes the USB path to the stick (see "USB
-    lockdown"), waits for the chosen combination's root and hash partitions by the UUIDs
-    derived from its root hash, sets the stick read-only and opens the root with the signed root hash as
-    `/dev/mapper/root` (`--panic-on-corruption`).
+    lockdown"), waits for the data and hash partitions of the chosen combination's layers by
+    the UUIDs derived from their root hashes, sets the stick read-only, opens each layer with
+    its signed root hash (`--panic-on-corruption`) and stacks them at `/sysroot` (`stack`).
   - not set (the firmware loaded the UKI over the network): `20-netboot.network` (DHCP on
     physical ethernet) and `netroot.service` + `/usr/local/lib/safespace/netroot`, which
-    waits for DHCP, checks the server's `roothash-<name>`, downloads `root-<name>.verity` and
-    `root-<name>.img` of the chosen combination into a tmpfs under `/run/netroot` (checking `MemAvailable` first), and opens them the same
-    way. The tmpfs stays after switch-root: that file *is* the root filesystem. Several
+    waits for DHCP, checks the server's `roothash-<layer>` of each layer, downloads
+    `root-<layer>.verity` and `root-<layer>.img` of the chosen combination's layers into a
+    tmpfs under `/run/netroot` (checking `MemAvailable` first), and opens and stacks them the
+    same way. The tmpfs stays after switch-root: those files *are* the root filesystem. Several
     `safespace.netroot=` URLs are tried in order.
   - Setting the variable from outside only switches to the other path, which then finds no
     root: the machine does not boot, but cannot boot anything unverified either.
@@ -1123,7 +1147,7 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 |---|---|
 | `mkosi.postinst` | users from `users.conf` without password (`*`) and with groups from `safespace.env`; their ssh keys into the read-only `/etc/ssh/authorized_keys/<user>`; root locked; `/home` → `/var/home`, `/root` → `/var/roothome`; sudoers check; usbguard daemon settings (block new devices, keep present ones, IPC for `wheel`); mount points `/efi`, `/var`; per group: VNC password (random per build, saved next to the image; xfce4-headless-vnc), the `docker` user group, `/opt/docker` and its fstab entry (docker); records the groups |
 | `mkosi.finalize` | `resolv.conf` → systemd-resolved stub; moves the built `/var` to `/usr/share/factory/var` (caches and logs dropped); reruns `depmod` after the module filter (mkosi 27 skips it, so `modules.dep`/`modules.alias` would still name the removed drivers) and fails the build if a Wi-Fi/Bluetooth stack or nouveau is left |
-| `mkosi.postoutput` | per combination: prints the UKI's size and parts, warns above 85 MiB (network boot on old firmware), fails above 128 MiB, fails if it is signed by another key than the exported `db.pem` or lacks `lockdown=integrity`, and says when there is no `safespace.netroot=` URL (sticks only). The composed UKI is checked again by `compose_check` in `lib/compose.sh` |
+| `mkosi.postoutput` | per mkosi run: prints the UKI's size and parts, warns above 85 MiB (network boot on old firmware), fails above 128 MiB, fails if it is signed by another key than the exported `db.pem` or lacks `lockdown=integrity`, and says when there is no `safespace.netroot=` URL (sticks only). The composed UKI is checked again by `compose_check` in `lib/compose.sh` |
 
 ### Files in the system (`mkosi.extra/`)
 
@@ -1166,7 +1190,7 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 
 | File | Purpose |
 |---|---|
-| `build.sh` | the build entry point (build host): fixes the version, puts the netboot URL on the signed command line, runs mkosi once per combination, keeps the parts, composes and checks the build |
+| `build.sh` | the build entry point (build host): fixes the version, puts the netboot URL on the signed command line, builds the base and every further layer once (`lib/layers.sh`, `lib/layertree.py`: the difference, the checks, the proof), keeps the parts, composes and checks the build |
 | `safespace.conf`, `lib/conf.sh` | the build host's configuration, every key with its default; this host's in `safespace.local.conf` (gitignored); parsed, not sourced |
 | `lib/settings.sh`, `lib/assh.conf.in` | the identity's policy checked and written into the image (`/etc/assh/assh.conf`, `/usr/local/lib/safespace/settings`: the scripts' shared constants), root and initrd |
 | `lib/compose.sh` | the combinations a build holds (the first is the default); composing them into one UKI and build, and checking it |

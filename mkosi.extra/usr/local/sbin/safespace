@@ -111,7 +111,7 @@ set -- ${ARGS[@]+"${ARGS[@]}"}
 
 # --- common ------------------------------------------------------------------------
 # The combinations on the signed command line; the first is the default.
-mapfile -t NAMES < <(tr ' ' '\n' </proc/cmdline | sed -n 's/^safespace\.root\.\([a-z][a-z0-9-]*\)=[0-9a-f]\{64\}$/\1/p')
+mapfile -t NAMES < <(tr ' ' '\n' </proc/cmdline | sed -n 's/^safespace\.root\.\([a-z][a-z0-9-]*\)=[a-z][a-z0-9,-]*$/\1/p')
 FIRST=${NAMES[0]:-}
 # The root names itself (mkosi.postinst): the verified root, so what booted.
 booted() { cat /usr/lib/safespace/combination 2>/dev/null || echo "?"; }

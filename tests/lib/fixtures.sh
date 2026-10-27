@@ -61,7 +61,7 @@ fx_checkout() {
 	cp "$2/release.sh" "$2/build.sh" "$2/burn.sh" "$2/safespace.conf" "$1/"
 	# Nothing of this checkout goes anywhere, whatever safespace.conf's defaults say.
 	printf 'RELEASE_TARGETS=\nNETROOT_URL=\n' >"$1/safespace.local.conf"
-	cp "$2/lib/"*.sh "$1/lib/"
+	cp "$2/lib/"* "$1/lib/"
 }
 
 # fx_manifest FILE PACKAGES...: a mkosi manifest with name=version pairs.
@@ -147,21 +147,33 @@ fx_part() {
 	)
 }
 
+# fx_layer DIR: a layer as build.sh leaves it (lib/layers.sh: root.img,
+# root.verity, roothash).
+fx_layer() {
+	mkdir -p "$1"
+	fx_root "$1" >"$1/roothash"
+}
 # fx_build CHECKOUT VERSION KEYDIR URL (NAME GROUPS "PACKAGES")...: a build as
-# build.sh makes it: one part per combination (fx_part, kept in
-# CHECKOUT/parts-VERSION/<name>/ for the tests), composed and checked by the
-# real lib/compose.sh (ukify, signed expected PCRs with a throwaway key) into
+# build.sh makes it: the base's image (fx_part, finalized), one image per
+# further layer (fx_layer), a manifest per combination (its PACKAGES), in
+# CHECKOUT/parts-VERSION/ (kept for the tests), composed and checked by the real
+# lib/compose.sh (ukify, signed expected PCRs with a throwaway key) into
 # CHECKOUT/mkosi.output/combined_VERSION/, with build.json.
 fx_build() {
-	local co=$1 v=$2 kd=$3 url=$4 names=() groups=() dirs=() combos=""; shift 4
+	local co=$1 v=$2 kd=$3 url=$4 p=$1/parts-$2 combos="" list="" l; shift 4
 	[[ -f $kd/pcr.key ]] || openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=pcr/ \
 		-keyout "$kd/pcr.key" -out "$kd/pcr.crt" 2>/dev/null || return 1
 	[[ -f $kd/identity.key ]] || openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=identity/ \
 		-keyout "$kd/identity.key" -out "$kd/identity.crt" 2>/dev/null || return 1
+	fx_part "$p/base" "$v" "$kd" "$url" linux=1 || return 1
 	while (($# >= 3)); do
+		mkdir -p "$p/combo-$1"
 		# shellcheck disable=SC2086 # the packages are words
-		fx_part "$co/parts-$v/$1" "$v" "$kd" "$url" $3 || return 1
-		names+=("$1") groups+=("$2") dirs+=("$co/parts-$v/$1") combos+="$1:${2//,/+},"
+		fx_manifest "$p/combo-$1/manifest.json" ${3:-linux=1}
+		list+="$1=$2 " combos+="$1:${2//,/+},"
+		for l in ${2//,/ }; do
+			[[ $l == base || -d $p/$l ]] || fx_layer "$p/$l"
+		done
 		shift 3
 	done
 	(
@@ -170,16 +182,15 @@ fx_build() {
 		log() { :; }
 		HERE=$co
 		source "$co/lib/groups.sh"; source "$co/lib/builds.sh"; source "$co/lib/verify.sh"; source "$co/lib/compose.sh"
-		COMBO_NAMES=("${names[@]}") COMBO_GROUPS=("${groups[@]}")
+		combos_load "$list"
 		KEYS_SB_DIR=$kd KEYS_PCR_KEY=$kd/pcr.key KEYS_PCR_CERT=$kd/pcr.crt
 		KEYS_ID_KEY=$kd/identity.key KEYS_ID_CERT=$kd/identity.crt
-		compose_build "$co/mkosi.output/combined_$v" "${dirs[@]}"
+		compose_build "$co/mkosi.output/combined_$v" "$p"
 		compose_check "$co/mkosi.output/combined_$v" "$kd/db/db.pem"
 	) || return 1
 	fx_info "$co" "$v" "${combos%,}"
 	fx_release "$co/mkosi.output/combined_$v" "$kd"
 }
-
 # fx_release DIR KEYDIR: the release file and its db signature, by build.sh's code.
 fx_release() {
 	(HERE=${1%/mkosi.output/*}; source "$HERE/lib/builds.sh"; builds_sign_release "$1" "$2/db/db.pem" "$2/db/db.key")

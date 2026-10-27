@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Build safespace-arch with mkosi, and keep track of the builds on this host.
-# A build is the whole stack: every combination of safespace.conf as a
-# complete, dm-verity protected root of its own (one mkosi run each), and one
-# signed UKI that names them all (lib/compose.sh). The same build boots from a
+# A build is the whole stack: every group of safespace.conf's combinations as a
+# dm-verity protected layer, built once (lib/layers.sh), a combination a chain
+# of them from the base up, and one signed UKI that names the layers and the
+# combinations (lib/compose.sh). The same build boots from a
 # USB stick / SD card (./burn.sh) and over the network (./release.sh to the
 # distribution servers, NETBOOT.md); a machine boots the first combination
 # unless safespace select preselects another (an EFI variable).
@@ -25,17 +26,15 @@
 #
 # Each build gets a directory of its own, named by its build time:
 #   mkosi.output/combined_<version>/   e.g. mkosi.output/combined_20261019-0930/
-# with the parts (boot.efi, systemd-boot.efi, layout.sfdisk; per combination
-# root-<name>.img, root-<name>.verity, roothash-<name>, manifest-<name>.json;
-# lib/compose.sh), build.json (what, when, from which package snapshot and
-# commit); release.sh adds released.log. BUILD in the commands above is that
-# directory name. While building, each combination's mkosi run has its own
-# directory under mkosi.output/.parts-<version>/ (removed when composed). The
-# first combination is built first, alone: its initrd is every combination's
-# (the composed UKI carries it). The others then run side by side - as many as
-# /var/tmp has room for (~8 GiB each) - each with its log in .parts-<version>/,
-# printed when it ends; a combination with no cached image yet (or -f) runs on
-# its own, as it installs packages into the shared package cache.
+# with the parts (boot.efi, systemd-boot.efi, layout.sfdisk; per layer
+# root-<layer>.img, root-<layer>.verity, roothash-<layer>; per combination
+# manifest-<name>.json; lib/compose.sh), build.json (what, when, from which
+# package snapshot and commit); release.sh adds released.log. BUILD in the
+# commands above is that directory name. While building, the mkosi runs and
+# the layers' trees are in mkosi.output/.parts-<version>/ (removed when
+# composed), each run with its log there: the base's tree, the base's image on
+# it (the UKI, the initrd, systemd-boot - every combination's), then each
+# further layer's tree on the one below, one after the other.
 #
 # What is built, from what, for whom: safespace.conf (every key, its default),
 # safespace.local.conf (this host's choices, gitignored), lib/conf.sh. The
@@ -186,6 +185,10 @@ source "$HERE/lib/groups.sh"
 source "$HERE/lib/verify.sh"
 # shellcheck source=lib/compose.sh
 source "$HERE/lib/compose.sh"
+# shellcheck source=lib/layers.sh
+source "$HERE/lib/layers.sh"
+# shellcheck source=lib/factory.sh
+source "$HERE/lib/factory.sh"
 combos_load "$COMBINATIONS"
 # shellcheck source=lib/repos.sh
 source "$HERE/lib/repos.sh"
@@ -288,69 +291,86 @@ keys_ensure_pcr
 find "$BUILDS_ROOT" -mindepth 1 -maxdepth 1 -type d -name '.parts-*' -exec rm -rf -- {} + 2>/dev/null || true
 STARTED=$(date -Is)
 
-# One combination: its own complete mkosi run with its groups as profiles,
-# finalized into its parts (lib/builds.sh). INITRD: the first combination's
-# initrd, given to the others instead of building the same one again.
-build_combination() { # NAME GROUPS DIR [INITRD]
-	local name=$1 groups=$2 dir=$3 initrd=${4:-} profiles
-	groups_parse "$groups"
-	mapfile -t profiles < <(groups_profiles)
-	log "--- combination $name (groups $groups)"
-	mkdir -p "$dir"
-	# Its own cache key: each combination keeps its installed image (Incremental=)
-	# and finds it unchanged at the next build. With one key for all, every run
-	# found the previous combination's image, re-synced the package metadata and
-	# dropped every cache: each build installed every package three times.
-	# (Called in a condition, where set -e does not apply: every step returns.)
-	(set -x; mkosi ${profiles[@]+"${profiles[@]}"} "${EXTRA[@]}" --cache-key="&d~&r~&a~&I~$name" ${initrd:+--initrd="$initrd"} \
-		--environment="SAFESPACE_COMBINATION=$name" --output-directory="$dir" ${MKOSI_ARGS[@]+"${MKOSI_ARGS[@]}"} build) || return 1
-	[[ -n $initrd ]] || cp "$dir/initrd.cpio.zst" "$PARTS/initrd.cpio.zst" || return 1
-	(builds_finalize "$dir" "$VERSION")
+# The layers (lib/layers.sh, PLAN.md): the base as a tree with pacman's
+# database (Format=directory, /var kept), the base's image on a copy of that
+# tree (the UKI, the initrd, systemd-boot, the base's root as today), each
+# further layer as a tree on a copy of the one below (its chain's groups as
+# profiles), then per layer: /var into the factory copy, its difference to the
+# tree below, the checks, the proof, its erofs and dm-verity. A step's time is
+# logged with it.
+# A tree: pacman's database kept. The base's with the image's boot steps (the
+# signed systemd-boot, kernel-install's files), so that the layers start from
+# what the base's image holds; a layer's tree without them (it only adds
+# packages): the build refuses a layer that lacks a path of the one below.
+TREE_ARGS=(--format=directory --clean-package-metadata=no --environment=SAFESPACE_KEEP_VAR=1)
+LAYER_ARGS=(--bootable=no --secure-boot=no --sign-expected-pcr=no)
+mkosi_run() { # LOG ARGS...: one mkosi run with what every run gets
+	local log=$1; shift
+	(set -x; mkosi "${EXTRA[@]}" "$@" ${MKOSI_ARGS[@]+"${MKOSI_ARGS[@]}"} build) >"$log" 2>&1 ||
+		{ tail -25 "$log" >&2; return 1; }
 }
-# Whether NAME has an installed image in mkosi's cache (and no -f asks for a new one).
-cached() { # NAME
-	compgen -G "$HERE/mkosi.cache/*~main~$1.manifest" >/dev/null || return 1
-	local a
-	for a in ${MKOSI_ARGS[@]+"${MKOSI_ARGS[@]}"}; do [[ $a == -f* || $a == --force ]] && return 1; done
-	return 0
-}
-first=${COMBO_NAMES[0]}
-build_combination "$first" "${COMBO_GROUPS[0]}" "$PARTS/$first" ||
-	die "the build of $first failed (parts in ${PARTS#"$HERE"/})"
-# The others: those without a cached image one after the other, then the
-# rest side by side.
-JOBS=$(($(free_gib /var/tmp) / 8))
-((JOBS >= 1)) || JOBS=1
-pids=() names=()
+since() { echo "$((SECONDS - $1)) s"; }
+mkdir -p "$PARTS"
+t=$SECONDS
+log "--- layer base (tree)"
+mkosi_run "$PARTS/base.tree.log" "${TREE_ARGS[@]}" --cache-key="&d~&r~&a~&I~base" \
+	--environment="SAFESPACE_COMBINATION=$(layers_combination base)" --output-directory="$PARTS/base.tree" --output=tree ||
+	die "the base's tree failed (log: ${PARTS#"$HERE"/}/base.tree.log)"
+log "    base tree: $(since "$t")"
+t=$SECONDS
+log "--- layer base (image: UKI, initrd, systemd-boot, the base's root)"
+mkosi_run "$PARTS/base.log" --base-tree="$PARTS/base.tree/tree" --incremental=no \
+	--environment="SAFESPACE_COMBINATION=$(layers_combination base)" --output-directory="$PARTS/base" ||
+	die "the base's image failed (log: ${PARTS#"$HERE"/}/base.log)"
+(builds_finalize "$PARTS/base" "$VERSION")
+log "    base image: $(since "$t")"
+for l in "${LAYER_NAMES[@]:1}"; do
+	t=$SECONDS
+	log "--- layer $l (on ${LAYER_PARENT[$l]}: $(layers_combination "$l"))"
+	mapfile -t profiles < <(layers_profiles "$l")
+	mkosi_run "$PARTS/$l.tree.log" "${TREE_ARGS[@]}" "${LAYER_ARGS[@]}" "${profiles[@]}" --incremental=no \
+		--base-tree="$PARTS/${LAYER_PARENT[$l]}.tree/tree" --environment="SAFESPACE_COMBINATION=$(layers_combination "$l")" \
+		--output-directory="$PARTS/$l.tree" --output=tree ||
+		die "the layer $l failed (log: ${PARTS#"$HERE"/}/$l.tree.log)"
+	log "    $l tree: $(since "$t")"
+done
+# The base as the machine gets it: its image, unpacked. Every layer is the
+# difference to what lies below it on the machine.
+t=$SECONDS
+fsck.erofs --extract="$PARTS/base.ref" --preserve --xattrs "$PARTS/base/root.img" >/dev/null ||
+	die "unpacking the base's image failed"
+lower_of() { [[ $1 == base ]] && echo "$PARTS/base.ref" || echo "$PARTS/$1.tree/tree"; }
+manifest_of() { [[ $1 == base ]] && echo "$PARTS/base/manifest.json" || echo "$PARTS/$1.tree/tree.manifest"; }
+for l in "${LAYER_NAMES[@]:1}"; do
+	factory_var "$PARTS/$l.tree/tree" >/dev/null
+done
+for l in "${LAYER_NAMES[@]:1}"; do
+	t=$SECONDS
+	p=${LAYER_PARENT[$l]}
+	layers_packages "$(manifest_of "$p")" "$(manifest_of "$l")"
+	n=$(layers_diff "$(lower_of "$p")" "$PARTS/$l.tree/tree" "$PARTS/$l/tree")
+	stack=()
+	for c in $(layers_chain "$l" | tr ' ' '\n' | tac); do
+		[[ $c == base ]] && stack+=("$PARTS/base.ref") || stack+=("$PARTS/$c/tree")
+	done
+	layers_prove "$PARTS/$l.tree/tree" "${stack[@]}" >/dev/null
+	layers_image "$PARTS/$l/tree" "$PARTS/$l" "$WORKERS"
+	log "    $l: $n; $(layers_chain "$l") stacked = $(layers_combination "$l") built in full; $(($(stat -c %s "$PARTS/$l/root.img") / 1048576)) MiB: $(since "$t")"
+done
+# Per combination: its packages (the manifest of its top layer's tree) and the
+# VNC password of the nearest layer below that made one.
 for i in "${!COMBO_NAMES[@]}"; do
-	((i > 0)) || continue
-	n=${COMBO_NAMES[i]}
-	if ! cached "$n"; then
-		build_combination "$n" "${COMBO_GROUPS[i]}" "$PARTS/$n" "$PARTS/initrd.cpio.zst" ||
-			die "the build of $n failed (parts in ${PARTS#"$HERE"/})"
-	fi
+	n=${COMBO_NAMES[i]} top=${COMBO_GROUPS[i]##*,}
+	install -d "$PARTS/combo-$n"
+	cp "$(manifest_of "$top")" "$PARTS/combo-$n/manifest.json"
+	for c in $(layers_chain "$top" | tr ' ' '\n' | tac); do
+		v=$(compgen -G "$PARTS/$c.tree/*.vnc-password" | head -1) || true
+		[[ -n $v ]] && { cp "$v" "$PARTS/combo-$n/vnc-password"; break; }
+	done
 done
-for i in "${!COMBO_NAMES[@]}"; do
-	((i > 0)) || continue
-	n=${COMBO_NAMES[i]}
-	[[ ! -d $PARTS/$n ]] || continue
-	while (($(jobs -rp | wc -l) >= JOBS)); do wait -n || true; done
-	build_combination "$n" "${COMBO_GROUPS[i]}" "$PARTS/$n" "$PARTS/initrd.cpio.zst" >"$PARTS/$n.log" 2>&1 &
-	pids+=($!) names+=("$n")
-done
-((${#pids[@]} == 0)) || log "building ${names[*]} side by side (up to $JOBS at a time; logs in ${PARTS#"$HERE"/}/NAME.log)"
-failed=()
-for i in "${!pids[@]}"; do
-	wait "${pids[i]}" || failed+=("${names[i]}")
-	cat "$PARTS/${names[i]}.log"
-done
-((${#failed[@]} == 0)) || die "the build of ${failed[*]} failed (parts and logs in ${PARTS#"$HERE"/})"
-dirs=()
-for n in "${COMBO_NAMES[@]}"; do dirs+=("$PARTS/$n"); done
-rm -f "$PARTS/initrd.cpio.zst"
 
 log "composing $BUILD"
-compose_build "$OUTDIR" "${dirs[@]}"
+compose_build "$OUTDIR" "$PARTS"
 compose_check "$OUTDIR" "$DB_EXPORT/db.pem"
 
 # What was built, from what (build.json marks the build as complete).
@@ -362,7 +382,7 @@ builds_write_info "$OUTDIR" build="$BUILD" version="$VERSION" combinations="${co
 	commit="$("${git[@]}" rev-parse --short HEAD 2>/dev/null || echo none)" \
 	uncommitted_changes="$([[ -z $("${git[@]}" status --porcelain 2>/dev/null) ]] && echo no || echo yes)" \
 	signer="$(keys_fingerprint "$KEYS_SB_CERT")" netroot="$(IFS=,; echo "${NETROOT[*]-}")" \
-	builder="$(uname -n)" users="$USERS_FILE" policy="$(settings_policy)"
+	builder="$(uname -n)" users="$USERS_FILE" policy="$(settings_policy)" layers="$(IFS=,; echo "${LAYER_NAMES[*]}")"
 # The release file, signed by the db key (safespace update checks it).
 builds_sign_release "$OUTDIR" "$KEYS_SB_DIR/db/db.pem" "$KEYS_SB_DIR/db/db.key" ||
 	die "signing the release file with the db key failed"

@@ -6,7 +6,7 @@
 #   tests/run.sh [--keep] [TEST...]
 #
 #   --keep   keep the temporary directory (printed at the end)
-#   TEST     run only these (default: all): syntax conf groups keys builds
+#   TEST     run only these (default: all): syntax conf layers groups keys builds
 #            release server stick upload netroot initrd compose dnsmasq nginx
 #            assh units
 #
@@ -214,6 +214,86 @@ if wanted conf; then
 	check "settings: the generated files are not tracked" bash -c 'cd "$1" && [[ $(git check-ignore mkosi.extra/etc/assh/assh.conf mkosi.extra/usr/local/lib/safespace/settings mkosi.initrd.conf/mkosi.extra/etc/assh/assh.conf mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/settings safespace.local.conf | wc -l) == 5 ]]' _ "$REPO"
 fi
 
+# --- layers: the tree difference, the checks, the proof, the image (lib/layers.sh) ----------
+if wanted layers && need python3 tar mkfs.erofs veritysetup unshare; then
+	section layers
+	LT=$REPO/lib/layertree.py LW=$W/layers
+	t_tree() { # make $LW/lower and $LW/full: full = lower + a new file, a changed one, a new mode, a new directory
+		rm -rf "$LW" && mkdir -p "$LW/lower/etc" "$LW/lower/usr/bin" "$LW/lower/var" "$LW/lower/usr/lib/modules/6.0"
+		echo root:x:0: >"$LW/lower/etc/group" && echo a >"$LW/lower/usr/bin/a" && echo m >"$LW/lower/usr/lib/modules/6.0/m"
+		chmod 0755 "$LW/lower/usr/bin/a"
+		cp -a "$LW/lower" "$LW/full"
+		echo docker:x:970: >>"$LW/full/etc/group"
+		echo d >"$LW/full/usr/bin/docker" && chmod 0644 "$LW/full/usr/bin/a"
+		mkdir -p "$LW/full/opt/docker" "$LW/full/var/lib/x" && echo junk >"$LW/full/var/lib/x/f"
+	}
+	t_tree
+	python3 -I "$LT" diff "$LW/lower" "$LW/full" "$LW/list" >/dev/null
+	check "layertree diff: the new, the changed (content, mode) and their directories; not /var's contents" bash -c '[[ $(tr "\0" " " <"$1") == "etc etc/group opt opt/docker usr usr/bin usr/bin/a usr/bin/docker " ]]' _ "$LW/list"
+	t_deleted() { t_tree; rm "$LW/full/usr/bin/a"; python3 -I "$LT" diff "$LW/lower" "$LW/full" "$LW/list" 2>/dev/null; [[ $? == 2 ]]; }
+	check "layertree diff: a path of the layer below deleted: refused (exit 2)" t_deleted
+	t_kernel() { t_tree; echo x >"$LW/full/usr/lib/modules/6.0/new.ko"; python3 -I "$LT" diff "$LW/lower" "$LW/full" "$LW/list" 2>/dev/null; [[ $? == 3 ]]; }
+	check "layertree diff: the kernel's modules touched: refused (exit 3)" t_kernel
+	t_tree
+	check "layertree compare: the same tree" python3 -I "$LT" compare "$LW/full" "$LW/full"
+	refuse "layertree compare: another content" python3 -I "$LT" compare "$LW/lower" "$LW/full"
+	t_mode() { cp -a "$LW/full" "$LW/full2" && chmod 0600 "$LW/full2/usr/bin/docker" && python3 -I "$LT" compare "$LW/full" "$LW/full2"; }
+	refuse "layertree compare: only a mode differs" t_mode
+	# The build's steps on these trees: the layer, the proof through a read-only
+	# overlay mount as the initrd makes it (in a user namespace), the image.
+	t_build() (
+		set -Eeuo pipefail
+		die() { echo "DIE: $*" >&2; exit 1; }; log() { :; }
+		HERE=$REPO; source "$REPO/lib/settings.sh"; source "$REPO/lib/layers.sh"
+		t_tree
+		layers_diff "$LW/lower" "$LW/full" "$LW/docker/tree" >/dev/null
+		layers_prove "$LW/full" "$LW/docker/tree" "$LW/lower"
+	)
+	export -f t_build t_tree; export LW LT REPO
+	check "layers: the layer stacked on the tree below (ro overlayfs, the settings' options) is the full tree" unshare --user --map-root-user --mount bash -c t_build
+	t_badproof() (
+		set -Eeuo pipefail
+		die() { echo "DIE: $*" >&2; exit 1; }; log() { :; }
+		HERE=$REPO; source "$REPO/lib/settings.sh"; source "$REPO/lib/layers.sh"
+		t_tree
+		layers_diff "$LW/lower" "$LW/full" "$LW/docker/tree" >/dev/null
+		rm "$LW/docker/tree/usr/bin/docker"
+		layers_prove "$LW/full" "$LW/docker/tree" "$LW/lower"
+	)
+	export -f t_badproof
+	refuse "layers: a layer missing a file does not pass the proof" unshare --user --map-root-user --mount bash -c t_badproof
+	t_image() (
+		set -Eeuo pipefail
+		die() { echo "DIE: $*" >&2; exit 1; }
+		source "$REPO/lib/layers.sh"
+		t_tree; rm -rf "$LW/img"
+		layers_image "$LW/full" "$LW/img" 2
+		h=$(cat "$LW/img/roothash")
+		[[ $h =~ ^[0-9a-f]{64}$ ]] && veritysetup verify "$LW/img/root.img" "$LW/img/root.verity" "$h" &&
+			fsck.erofs --extract="$LW/img/x" "$LW/img/root.img" >/dev/null 2>&1 &&
+			[[ -d $LW/img/x/var && -z $(ls -A "$LW/img/x/var") && -f $LW/img/x/usr/bin/docker ]]
+	)
+	check "layers: a layer's image - erofs, dm-verity, its root hash verifies; /var's contents left out" t_image
+	t_packages() { # LOWER FULL (name=version lists)
+		(die() { echo "$*"; exit 1; }; source "$REPO/tests/lib/fixtures.sh"; source "$REPO/lib/layers.sh"
+			fx_manifest "$LW/m1" $1; fx_manifest "$LW/m2" $2; layers_packages "$LW/m1" "$LW/m2")
+	}
+	check "layers: a layer that only adds packages passes" t_packages "bash=5 glibc=2.44" "bash=5 glibc=2.44 docker=29"
+	refuse "layers: a layer that upgrades a package below is refused" t_packages "bash=5 glibc=2.44" "bash=5 glibc=2.45 docker=29"
+	refuse "layers: a layer that removes a package below is refused" t_packages "bash=5 glibc=2.44" "glibc=2.44 docker=29"
+	t_factory() { # factory_var: /var into the factory copy, caches and logs dropped
+		rm -rf "$LW/f" && mkdir -p "$LW/f/var/lib/pacman/local/x" "$LW/f/var/lib/pacman/sync" "$LW/f/var/cache/c" "$LW/f/var/home/u" "$LW/f/usr/share" &&
+			(source "$REPO/lib/factory.sh"; factory_var "$LW/f" >/dev/null) &&
+			[[ -z $(ls -A "$LW/f/var") && -d $LW/f/usr/share/factory/var/lib/pacman/local/x && -d $LW/f/usr/share/factory/var/home/u &&
+				! -e $LW/f/usr/share/factory/var/lib/pacman/sync && ! -e $LW/f/usr/share/factory/var/cache/c ]]
+	}
+	check "factory_var: /var into /usr/share/factory/var, without caches and sync databases" t_factory
+	check "mkosi.finalize moves /var with factory_var, not for a layer's tree (SAFESPACE_KEEP_VAR)" bash -c 'grep -q "source \"\$SRCDIR/lib/factory.sh\"" "$1" && grep -qx "\[\[ \${SAFESPACE_KEEP_VAR:-} == 1 \]\] || factory_var \"\$BUILDROOT\"" "$1"' _ "$REPO/mkosi.finalize"
+	check "mkosi.postinst on a layer's tree: existing users only get the group's memberships; the docker fstab line once" bash -c 'grep -q "mkosi-chroot usermod -a -G \"\$user_groups\" \"\$user\"" "$1" && grep -q "grep -q .\^LABEL=safespace-docker" "$1"' _ "$REPO/mkosi.postinst"
+	check "mkosi.conf: no root=, no rootfstype= (the initrd stacks the layers); systemd's partition discovery off" bash -c '! sed -n "/^KernelCommandLine=/,/^[A-Z]/p" "$1" | grep -qE "^[[:space:]]+(root|rootfstype)=" && sed -n "/^KernelCommandLine=/,/^[A-Z]/p" "$1" | grep -qx "[[:space:]]*systemd.gpt_auto=0" && sed -n "/^KernelCommandLine=/,/^[A-Z]/p" "$1" | grep -qx "[[:space:]]*rd.systemd.gpt_auto=0"' _ "$REPO/mkosi.conf"
+	check "mkosi.conf: the initrd has erofs and overlay" bash -c 'sed -n "/^KernelInitrdModules=/,/^\$/p" "$1" | grep -qx "[[:space:]]*erofs" && sed -n "/^KernelInitrdModules=/,/^\$/p" "$1" | grep -qx "[[:space:]]*overlay"' _ "$REPO/mkosi.conf"
+fi
+
 # --- groups and combinations -----------------------------------------------------------------
 if wanted groups; then
 	section groups
@@ -245,6 +325,22 @@ if wanted groups; then
 	refuse "an unknown group" t_combos 'base=base x=foo' ""
 	refuse "no combination" t_combos '' ""
 	refuse "a glob is no combination" t_combos '*' ""
+	# The layers: a group is built once, on one layer below it.
+	t_layers() { # COMBINATIONS EXPECTED("layer<parent ...")
+		(die() { exit 1; }; source "$REPO/lib/groups.sh"; source "$REPO/lib/compose.sh"; combos_load "$1" &&
+			local l out=""; for l in "${LAYER_NAMES[@]}"; do out+="$l<${LAYER_PARENT[$l]} "; done; [[ $out == "$2" ]])
+	}
+	check "layers: every group once, each on the layer below it" t_layers "root=base containers=base,docker debug=base,debug" "base< docker<base debug<base "
+	check "layers: a chain of three, the middle shared" t_layers "c=base,docker w=base,docker,xfce4-headless-vnc" "base< docker<base xfce4-headless-vnc<docker "
+	refuse "layers: a group on two different layers (one place per layer)" t_layers "a=base,docker b=base,xfce4-headless-vnc,docker" ""
+	refuse "layers: two combinations of the same chain" t_layers "a=base,docker b=docker" ""
+	t_chain() { # COMBINATIONS LAYER CHAIN COMBINATION PROFILES
+		(die() { exit 1; }; source "$REPO/lib/groups.sh"; source "$REPO/lib/compose.sh"; source "$REPO/lib/layers.sh"; combos_load "$1" &&
+			[[ $(layers_chain "$2") == "$3" && $(layers_combination "$2") == "$4" && $(layers_profiles "$2" | tr "\n" " ") == "$5" ]])
+	}
+	check "layers: a layer's chain, combination and profiles" t_chain "c=base,docker w=base,docker,xfce4-headless-vnc" xfce4-headless-vnc "base docker xfce4-headless-vnc" w "--profile=docker --profile=xfce4-headless-vnc "
+	check "layers: a layer that is no combination's top is built as the first that has it" t_chain "w=base,docker,xfce4-headless-vnc" docker "base docker" w "--profile=docker "
+	check "layers: base is the base-only combination, wherever it is listed" t_chain "c=base,docker r=base" base base r ""
 	for a in "--groups base" --debug --combined "--version 1" summary shell "--users x" "--combinations x"; do
 		check "build.sh: '$a' is refused (safespace.conf decides, build.sh only builds)" \
 			bash -c '! "$1" $2 >"$3" 2>&1 && grep -Eq "in safespace.conf|only builds" "$3"' _ "$REPO/build.sh" "$a" "$W/refused.log"
@@ -315,7 +411,7 @@ if wanted builds && fixtures; then
 	section builds
 	fx_part "$W/part" 20990102-0000 "$KD" "" linux=1 >/dev/null 2>&1
 	check "finalize: a combination keeps exactly its parts, no disk image, no initrd copy" bash -c '[[ $(LC_ALL=C ls "$1" | tr "\n" " ") == "boot.efi layout.sfdisk manifest.json root.img root.verity roothash systemd-boot.efi systemd-stub.efi " ]]' _ "$W/part"
-	check "a build: one UKI, one pair per combination, the signed release file, nothing else" bash -c '[[ $(LC_ALL=C ls "$1" | tr "\n" " ") == "boot.efi build.json layout.sfdisk manifest-containers.json manifest-root.json release release.p7s root-containers.img root-containers.verity root-root.img root-root.verity roothash-containers roothash-root systemd-boot.efi " ]]' _ "$B"
+	check "a build: one UKI, one pair per layer (base, docker), a manifest per combination, the signed release file, nothing else" bash -c '[[ $(LC_ALL=C ls "$1" | tr "\n" " ") == "boot.efi build.json layout.sfdisk manifest-containers.json manifest-root.json release release.p7s root-base.img root-base.verity root-docker.img root-docker.verity roothash-base roothash-docker systemd-boot.efi " ]]' _ "$B"
 	BS=$CO/build.sh
 	"$BS" list >"$W/list.txt" 2>&1
 	check "list: every build, oldest first" bash -c '[[ $(grep -Eo "^combined_[0-9-]+" "$1" | tr "\n" "|") == "combined_20990101-0000|combined_20990101-0100|" ]]' _ "$W/list.txt"
@@ -333,7 +429,7 @@ if wanted builds && fixtures; then
 		check "the release carries build, combinations, built, snapshot, commit, packages" bash -c 'grep -q "^COMBINATIONS=root,remotedesktop$" $1 && grep -q "^BUILT=2099-01-01T00:00" $1 && grep -q "^SNAPSHOT=2099/01/01" $1 && grep -q "^COMMIT=abc1234$" $1 && grep -q "^PACKAGES=5$" $1' _ "$W/pick/release"
 		check "release without a choice takes the newest build" bash -c '"$1" >/dev/null 2>&1 && grep -q "^BUILD=combined_20990101-0100$" "$2/release"' _ "$CO/release.sh" "$CO/mkosi.release"
 		refuse "release --groups is gone" "$CO/release.sh" --groups base
-		check "staged as hardlinks of the build (nothing copied)" bash -c '[[ $(stat -c %i "$1/root-root.img") == $(stat -c %i "$2/root-root.img") ]]' _ "$CO/mkosi.release" "$B"
+		check "staged as hardlinks of the build (nothing copied)" bash -c '[[ $(stat -c %i "$1/root-base.img") == $(stat -c %i "$2/root-base.img") ]]' _ "$CO/mkosi.release" "$B"
 	fi
 	# prune: five builds, the oldest of them released last to a target.
 	P=$W/prunetest
@@ -351,7 +447,7 @@ if wanted release && fixtures && need rsync; then
 	section release
 	check "the test checkout pushes nowhere by itself (RELEASE_TARGETS cleared)" bash -c '[[ $(sed -n "s/^RELEASE_TARGETS=//p" "$1/safespace.local.conf") == "" ]]' _ "$CO"
 	check "release.sh stages and passes its own checks" "$CO/release.sh"
-	check "staged: all parts, combinations recorded" bash -c 'for f in boot.efi systemd-boot.efi layout.sfdisk cmdline release SHA256SUMS root-root.img root-root.verity roothash-root manifest-root.json root-containers.img root-containers.verity roothash-containers manifest-containers.json; do [[ -f $1/$f ]] || exit 1; done; [[ $(grep ^COMBINATIONS= $1/release) == COMBINATIONS=root,containers ]]' _ "$CO/mkosi.release"
+	check "staged: all parts, combinations and layers recorded" bash -c 'for f in boot.efi systemd-boot.efi layout.sfdisk cmdline release SHA256SUMS root-base.img root-base.verity roothash-base manifest-root.json root-docker.img root-docker.verity roothash-docker manifest-containers.json; do [[ -f $1/$f ]] || exit 1; done; [[ $(grep ^COMBINATIONS= $1/release) == COMBINATIONS=root,containers && $(grep ^LAYERS= $1/release) == LAYERS=base,docker ]]' _ "$CO/mkosi.release"
 	check "release.sh --push into a share" "$CO/release.sh" --push "$SHARE"
 	check "the share serves the newest release" bash -c '[[ $(grep ^BUILD= $1/release) == BUILD=combined_20990101-0100 ]]' _ "$SHARE"
 	check "server status shows build, combinations, snapshot" bash -c '"$1" status | grep -q "combinations root,containers, built 2099-01-01T01:00:00+00:00, snapshot 2099/01/01, commit abc1234, 5 packages"' _ "$NB"
@@ -379,26 +475,27 @@ if wanted server && shared; then
 		refuse "verify detects: $1" "$NB" verify
 	}
 	resum="source $REPO/tests/lib/fixtures.sh; fx_resum \$1"
-	tamper "a manipulated hash tree (SHA256SUMS recomputed)" 'source '"$REPO"'/tests/lib/fixtures.sh; fx_flip $1/root-root.verity 8192; '"$resum"
+	tamper "a manipulated hash tree (SHA256SUMS recomputed)" 'source '"$REPO"'/tests/lib/fixtures.sh; fx_flip $1/root-base.verity 8192; '"$resum"
 	tamper "a release file changed after the build (SHA256SUMS recomputed, not signed)" 'sed -i "s/^PACKAGES=.*/PACKAGES=1/" $1/release; '"$resum"
-	tamper "a manipulated root image" 'source '"$REPO"'/tests/lib/fixtures.sh; fx_flip $1/root-root.img 4096; '"$resum"
-	tamper "a manipulated root image of another combination" 'source '"$REPO"'/tests/lib/fixtures.sh; fx_flip $1/root-containers.img 4096; '"$resum"
+	tamper "a manipulated base layer" 'source '"$REPO"'/tests/lib/fixtures.sh; fx_flip $1/root-base.img 4096; '"$resum"
+	tamper "a manipulated layer above it" 'source '"$REPO"'/tests/lib/fixtures.sh; fx_flip $1/root-docker.img 4096; '"$resum"
 	tamper "a UKI signed by another key" 'sbattach --remove $1/boot.efi >/dev/null; sbsign --key '"$KD"'/KEK/KEK.key --cert '"$KD"'/KEK/KEK.pem --output $1/boot.efi $1/boot.efi >/dev/null 2>&1; '"$resum"
 	tamper "an unsigned UKI" 'sbattach --remove $1/boot.efi >/dev/null; '"$resum"
 	tamper "systemd-boot signed by another key" 'sbattach --remove $1/systemd-boot.efi >/dev/null; sbsign --key '"$KD"'/KEK/KEK.key --cert '"$KD"'/KEK/KEK.pem --output $1/systemd-boot.efi $1/systemd-boot.efi >/dev/null 2>&1; '"$resum"
-	tamper "a roothash that is not the signed one" 'echo 0000000000000000000000000000000000000000000000000000000000000000 >$1/roothash-containers; '"$resum"
+	tamper "a roothash that is not the signed one" 'echo 0000000000000000000000000000000000000000000000000000000000000000 >$1/roothash-docker; '"$resum"
 	tamper "COMBINATIONS= that differs from the signed command line" 'sed -i "s/^COMBINATIONS=.*/COMBINATIONS=root/" $1/release; '"$resum"
 	# Validly signed by the db key, but not what a build makes:
 	resign="source $REPO/tests/lib/fixtures.sh; fx_uki \$1/boot.efi \"\$2\" $KD/db/db.key $KD/db/db.pem; $resum"
-	h=$(cat "$SHARE/roothash-root")
+	h=$(cat "$SHARE/roothash-base")
 	tamper "a single-root UKI (roothash=, no safespace.root.*), signed by the db key" "set -- \$1 'roothash=$h systemd.volatile=state lockdown=integrity'; $resign"
-	tamper "a UKI without lockdown=integrity, signed by the db key" "set -- \$1 'systemd.volatile=state $(grep -o 'safespace\.root\.[^ ]*' "$SHARE/cmdline" | tr '\n' ' ')'; $resign"
+	tamper "a UKI without lockdown=integrity, signed by the db key" "set -- \$1 'systemd.volatile=state $(grep -oE 'safespace\.(root|layer)\.[^ ]*' "$SHARE/cmdline" | tr '\n' ' ')'; $resign"
 	tamper "a partition table with another root partition UUID" 'sed -i "/'"$GPT_ROOT"'/s/uuid=[0-9A-F-]*/uuid=11111111-2222-3333-4444-555555555555/" $1/layout.sfdisk; '"$resum"
 	tamper "a partition too small for the root image" 'sed -i "/'"$GPT_ROOT"'/s/size= *[0-9]*/size=8/" $1/layout.sfdisk; '"$resum"
 	tamper "a file not in SHA256SUMS" 'echo x >$1/extra'
-	tamper "a broken transfer" 'truncate -s 1M $1/root-root.img'
+	tamper "a combination naming a layer the command line does not have, signed by the db key" "set -- \$1 '$(sed 's/safespace\.root\.containers=base,docker/safespace.root.containers=base,xfce4-headless-vnc/' "$SHARE/cmdline")'; $resign"
+	tamper "a broken transfer" 'truncate -s 1M $1/root-base.img'
 	check "status says BROKEN" bash -c '"$1" status | grep -q BROKEN' _ "$NB"
-	check "verify never changes the share (the broken file is still there)" bash -c '[[ $(stat -c %s "$1/root-root.img") == 1048576 ]]' _ "$SHARE"
+	check "verify never changes the share (the broken file is still there)" bash -c '[[ $(stat -c %s "$1/root-base.img") == 1048576 ]]' _ "$SHARE"
 	rm -rf "$SHARE"
 	cp -a "$W/share.good" "$SHARE"
 fi
@@ -418,23 +515,23 @@ if wanted stick && shared && need mkfs.fat mmd mcopy sfdisk; then
 		mcopy -n -i "$img@@$((2048 * 512))" ::/EFI/BOOT/BOOTX64.EFI "$W/st.boot" && cmp -s "$W/st.boot" "$B/systemd-boot.efi" || { echo "BOOTX64.EFI differs"; return 1; }
 		mcopy -n -i "$img@@$((2048 * 512))" ::/EFI/Linux/safespace-arch.efi "$W/st.uki" && cmp -s "$W/st.uki" "$B/boot.efi" || { echo "UKI differs"; return 1; }
 		[[ $(od -An -tu2 -j$((2048 * 512 + 11)) -N2 "$img" | tr -d ' ') == 512 ]] || { echo "FAT sector size is not 512"; return 1; }
-		for n in root containers; do
+		for n in base docker; do
 			cut_part "$img" "root-$n" "$W/st.root" && cut_part "$img" "root-$n-verity" "$W/st.verity" &&
 				veritysetup verify "$W/st.root" "$W/st.verity" "$(cat "$B/roothash-$n")" || { echo "root-$n does not verify"; return 1; }
 		done
 	}
 	check "burn.sh --image from a build" "$CO/burn.sh" combined_20990101-0100 --image "$W/stick1.raw"
-	check "... is the build: table, ESP, signed files, every root block by block" stick_ok "$W/stick1.raw"
+	check "... is the build: table, ESP, signed files, every layer block by block" stick_ok "$W/stick1.raw"
 	check "burn.sh --image from a share directory (SHA256SUMS checked)" "$CO/burn.sh" "$SHARE" --image "$W/stick2.raw"
 	SP=$(port)
 	serve "$SHARE" "$SP"
 	check "burn.sh --image from a server URL (every root streamed)" "$CO/burn.sh" "http://127.0.0.1:$SP/" --image "$W/stick3.raw"
 	check "... is the build too" stick_ok "$W/stick3.raw"
-	cp "$SHARE/root-containers.img" "$W/root.good"
-	printf '\xff' | dd of="$SHARE/root-containers.img" bs=1 seek=4096 conv=notrunc status=none
+	cp "$SHARE/root-docker.img" "$W/root.good"
+	printf '\xff' | dd of="$SHARE/root-docker.img" bs=1 seek=4096 conv=notrunc status=none
 	refuse "a root image that does not match SHA256SUMS is refused while streaming" "$CO/burn.sh" "http://127.0.0.1:$SP/" --image "$W/stick4.raw"
 	check "... and nothing is left behind" test ! -e "$W/stick4.raw"
-	cp "$W/root.good" "$SHARE/root-containers.img"
+	cp "$W/root.good" "$SHARE/root-docker.img"
 fi
 
 # --- upload through rrsync ------------------------------------------------------------------
@@ -456,9 +553,9 @@ if wanted upload && fixtures && [[ -z ${ONLY_SKIP:-} ]] && command -v rrsync >/d
 	up() { RSYNC_RSH="$W/fake-ssh" "$CO/release.sh" --push "safespace@server"; }
 	check "upload through rrsync" up
 	check "a second upload replaces the release" up
-	check "uploaded files arrived" bash -c 'cmp -s "$1/rshare/root-root.img" "$2/mkosi.release/root-root.img"' _ "$W" "$CO"
+	check "uploaded files arrived" bash -c 'cmp -s "$1/rshare/root-base.img" "$2/mkosi.release/root-base.img"' _ "$W" "$CO"
 	refuse "rrsync refuses deleting" env RSYNC_RSH="$W/fake-ssh" rsync -r --delete "$W/empty/" "safespace@server:"
-	check "... and the release is still there" test -f "$W/rshare/root-root.img"
+	check "... and the release is still there" test -f "$W/rshare/root-base.img"
 	refuse "rrsync refuses reading" env RSYNC_RSH="$W/fake-ssh" rsync -r "safespace@server:" "$W/readback/"
 	refuse "rrsync refuses paths outside the share" env RSYNC_RSH="$W/fake-ssh" rsync "$W/server.conf" "safespace@server:../escape"
 	check "nothing escaped the share" test ! -e "$W/escape"
@@ -472,34 +569,36 @@ if wanted netroot && shared && need curl; then
 	mkdir -p "$S"
 	for c in modprobe udevadm umount sleep; do printf '#!/bin/sh\nexit 0\n' >"$S/$c"; done
 	printf '#!/bin/sh\necho /dev/loop9\n' >"$S/losetup"
-	printf '#!/bin/sh\nshift $(($# - 1)); mkdir -p "$1"\n' >"$S/mount"
+	printf '#!/bin/sh\necho "$*" >>"%s/mount.calls"\nshift $(($# - 1)); mkdir -p "$1"\n' "$W" >"$S/mount"
 	printf '#!/bin/sh\necho "$*" >>"%s/systemctl.calls"\n' "$W" >"$S/systemctl"
 	printf '#!/bin/sh\necho "$*" >>"%s/veritysetup.calls"\n[ -f "%s/veritysetup.fail" ] && exit 1\nexit 0\n' "$W" "$W" >"$S/veritysetup"
 	chmod +x "$S"/*
-	served=$(tr -d '[:space:]' <"$SHARE/roothash-root")
-	mkdir -p "$W/old" && echo 1111111111111111111111111111111111111111111111111111111111111111 >"$W/old/roothash-root"
-	cp "$SHARE/root-root.img" "$SHARE/root-root.verity" "$W/old/"
+	served=$(tr -d '[:space:]' <"$SHARE/roothash-base")
+	mkdir -p "$W/old" && echo 1111111111111111111111111111111111111111111111111111111111111111 >"$W/old/roothash-base"
+	cp "$SHARE/root-base.img" "$SHARE/root-base.verity" "$W/old/"
 	P1=$(port) P2=$(port)
 	serve "$W/old" "$P1"
 	serve "$SHARE" "$P2"
 	EV=$W/efivars SG=8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34
 	nr_cmd() { # CMDLINE: choose the combination (safespace-select.service), then run netroot with it (efivars in a directory of the test)
-		rm -rf "$W/systemctl.calls" "$W/veritysetup.calls" "$W/nr-run"
+		rm -rf "$W/systemctl.calls" "$W/veritysetup.calls" "$W/mount.calls" "$W/nr-run" "$W/sysroot"
 		mkdir -p "$EV"
 		cmdline=$1 SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$W/nr-run SAFESPACE_PCREXTEND=true sh -c 'msg() { :; }; . "$0"; select_root' "${NR%/*}/select" || return 1
-		NETROOT_CMDLINE="$1" NETROOT_DIR=$W/nr SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$W/nr-run PATH="$S:$PATH" sh "$NR" >"$W/nr.log" 2>&1
+		NETROOT_CMDLINE="$1" NETROOT_DIR=$W/nr SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$W/nr-run SAFESPACE_SYSROOT=$W/sysroot \
+			PATH="$S:$PATH" sh "$NR" >"$W/nr.log" 2>&1
 	}
-	nr() { # ROOTHASH URL...: netroot against the servers, the hash as combination root
+	nr() { # ROOTHASH URL...: netroot against the servers, one combination of one layer with that hash
 		local h=$1; shift
-		nr_cmd "lockdown=integrity safespace.root.root=$h $(printf 'safespace.netroot=%s ' "$@")" || true
+		nr_cmd "lockdown=integrity safespace.layer.base=$h safespace.root.root=base $(printf 'safespace.netroot=%s ' "$@")" || true
 	}
 	nr "$served" "http://127.0.0.1:$P2/"
 	check "the matching release is opened with the signed root hash" grep -q "$served" "$W/veritysetup.calls"
+	check "... one layer: its erofs is the root, read-only" grep -qx -- "-t erofs -o ro /dev/mapper/layer-base $W/sysroot" "$W/mount.calls"
 	check "... and no reboot" test ! -e "$W/systemctl.calls"
 	: >"$W/http-$P1.log"
 	nr "$served" "http://127.0.0.1:$P1/"
 	check "only another release served: reboot to load the new boot.efi" grep -qx reboot "$W/systemctl.calls"
-	check "... without downloading the root image" bash -c '! grep -q "GET /root-root.img" "$1"' _ "$W/http-$P1.log"
+	check "... without downloading the root image" bash -c '! grep -q "GET /root-base.img" "$1"' _ "$W/http-$P1.log"
 	nr "$served" "http://127.0.0.1:$P1/" "http://127.0.0.1:$P2/"
 	check "a stale first server and a matching second one: no reboot" test ! -e "$W/systemctl.calls"
 	check "... the second one is used" grep -q "$served" "$W/veritysetup.calls"
@@ -510,14 +609,20 @@ if wanted netroot && shared && need curl; then
 	refuse "a single-root command line (roothash=, no safespace.root.*) opens nothing" nr_cmd "roothash=$served safespace.netroot=http://127.0.0.1:$P2/"
 	check "... nothing opened, nothing downloaded" test ! -e "$W/veritysetup.calls"
 	# The share's own signed command line, a combination preselected.
-	ccmd=$(cat "$SHARE/cmdline") hc=$(cat "$SHARE/roothash-containers")
+	ccmd=$(cat "$SHARE/cmdline") hb=$(cat "$SHARE/roothash-base") hd=$(cat "$SHARE/roothash-docker")
+	ccmd=${ccmd//safespace.netroot=http:\/\/127.0.0.1:$NETPORT\//safespace.netroot=http://127.0.0.1:$P2/}
 	printf '\x07\x00\x00\x00containers' >"$EV/SafespaceSelect-$SG"
 	: >"$W/http-$P2.log"
-	nr_cmd "${ccmd//safespace.netroot=http:\/\/127.0.0.1:$NETPORT\//safespace.netroot=http://127.0.0.1:$P2/}" || true
-	check "SafespaceSelect=containers opens that root with its signed hash" grep -q "$hc" "$W/veritysetup.calls"
-	check "... downloads only root-containers.img" bash -c 'grep -q "GET /root-containers.img" "$1" && ! grep -q "GET /root-root.img" "$1"' _ "$W/http-$P2.log"
+	nr_cmd "$ccmd" || true
+	check "SafespaceSelect=containers opens both its layers, each with its signed hash" bash -c 'grep -q "layer-base .*$1" "$3" && grep -q "layer-docker .*$2" "$3"' _ "$hb" "$hd" "$W/veritysetup.calls"
+	check "... downloads them" bash -c 'grep -q "GET /root-base.img" "$1" && grep -q "GET /root-docker.img" "$1"' _ "$W/http-$P2.log"
+	check "... stacks them read-only at /sysroot, docker on base, with the build's overlayfs options" grep -qx -- \
+		"-t overlay overlay -o $(. "$SAFESPACE_SETTINGS"; echo "$SAFESPACE_OVERLAY"),lowerdir=$W/nr-run/layers/docker:$W/nr-run/layers/base $W/sysroot" "$W/mount.calls"
 	check "... no reboot" test ! -e "$W/systemctl.calls"
 	rm -f "$EV/SafespaceSelect-$SG"
+	: >"$W/http-$P2.log"
+	nr_cmd "$ccmd" || true
+	check "the default (root, the base alone) downloads only root-base.img" bash -c 'grep -q "GET /root-base.img" "$1" && ! grep -q "GET /root-docker.img" "$1"' _ "$W/http-$P2.log"
 fi
 
 # --- initrd: the scripts only call what the initrd has ------------------------------------
@@ -534,13 +639,13 @@ if wanted initrd; then
 		zstd -dc "$W/initrd.img" 2>/dev/null | cpio -t 2>/dev/null >"$W/initrd.list" || true
 		IS=$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace
 		for f in choose usb-bootdev netroot; do
-			# with select, which all source
-			cat "$IS/select" "$IS/$f" >"$W/initrd.$f"
+			# with select and stack, which they source
+			cat "$IS/select" "$IS/stack" "$IS/$f" >"$W/initrd.$f"
 			missing=$(python3 -I "$REPO/tests/lib/shcmds.py" "$W/initrd.$f" | while IFS= read -r c; do
 				if [[ $c == /* ]]; then grep -qxF "${c#/}" "$W/initrd.list" || echo "$c"
 				else grep -qE "^(usr/)?s?bin/$c$" "$W/initrd.list" || echo "$c"; fi
 			done | tr '\n' ' ')
-			check "$f (+ select) calls only programs in the initrd ($(basename "$(dirname "$uki")"))${missing:+: missing $missing}" test -z "$missing"
+			check "$f (+ select, stack) calls only programs in the initrd ($(basename "$(dirname "$uki")"))${missing:+: missing $missing}" test -z "$missing"
 		done
 	fi
 fi
@@ -563,9 +668,9 @@ if wanted compose && fixtures; then
 	check "builds_finalize: the linux-firmware meta package fails the build" t_fw_refused linux-firmware linux=7 linux-firmware=1 linux-firmware-intel=1
 	check "builds_finalize: linux-firmware-nvidia pulled in fails the build" t_fw_refused linux-firmware-nvidia linux=7 linux-firmware-intel=1 linux-firmware-nvidia=1
 	ccmd=$(objcopy -O binary --only-section=.cmdline "$B/boot.efi" /dev/stdout 2>/dev/null | tr -d '\0')
-	hr=$(cat "$B/roothash-root") hc=$(cat "$B/roothash-containers")
-	check "the UKI names every root in order, without roothash=" \
-		bash -c '[[ " $1 " == *" safespace.root.root=$2 safespace.root.containers=$3 "* && " $1 " != *" roothash="* && " $1 " == *" safespace.netroot="* && " $1 " == *" lockdown=integrity "* ]]' _ "$ccmd" "$hr" "$hc"
+	hb=$(cat "$B/roothash-base") hd=$(cat "$B/roothash-docker")
+	check "the UKI names every layer with its root hash and every combination as its chain, in order; no roothash=, no root=" \
+		bash -c '[[ " $1 " == *" safespace.layer.base=$2 safespace.layer.docker=$3 safespace.root.root=base safespace.root.containers=base,docker "* && " $1 " != *" roothash="* && " $1 " != *" root="* && " $1 " != *" rootfstype="* && " $1 " == *" safespace.netroot="* && " $1 " == *" lockdown=integrity "* ]]' _ "$ccmd" "$hb" "$hd"
 	check "... signed by the db key, with signed expected PCRs (.pcrsig)" bash -c 'sbverify --cert "$2" "$1" && objdump -h "$1" | grep -q "\.pcrsig"' _ "$B/boot.efi" "$KD/db/db.pem"
 	t_initrd() { # COMPOSED FIRST: the first one's initrd, then only the identity key's cpio
 		local a b
@@ -575,7 +680,7 @@ if wanted compose && fixtures; then
 			[[ $(objcopy -O binary --only-section=.initrd "$1" /dev/stdout | tail -c +$((b + 1)) | cpio -t --quiet 2>/dev/null | tr '\n' ' ') == "usr usr/local usr/local/lib usr/local/lib/safespace usr/local/lib/safespace/identity.pem usr/local/lib/safespace/pcr.pem " ]] &&
 			((a > b))
 	}
-	check "... the kernel and initrd of the first combination, plus the identity key" t_initrd "$B/boot.efi" "$CO/parts-20990101-0100/root/boot.efi"
+	check "... the kernel and initrd of the base's image, plus the identity key" t_initrd "$B/boot.efi" "$CO/parts-20990101-0100/base/boot.efi"
 	# The appended archive's two keys, in order: the identity key's, the PCR key's.
 	t_keys() { # UKI KEYDIR
 		local pems
@@ -593,8 +698,8 @@ if wanted compose && fixtures; then
 		set -Eeuo pipefail
 		die() { echo "DIE: $*" >&2; exit 1; }
 		log() { :; }
-		source "$REPO/lib/verify.sh"; source "$REPO/lib/compose.sh"
-		COMBO_NAMES=(root containers)
+		source "$REPO/lib/verify.sh"; source "$REPO/lib/groups.sh"; source "$REPO/lib/compose.sh"
+		combos_load "root=base containers=base,docker"
 		compose_check "$1" "$KD/db/db.pem"
 	)
 	check "compose_check passes the build" t_check "$B"
@@ -607,7 +712,8 @@ if wanted compose && fixtures; then
 	cuki="source $REPO/tests/lib/fixtures.sh; fx_uki \$1/boot.efi"
 	R="not signed by" ctamper "a UKI signed by another key" - 'sbattach --remove $1/boot.efi >/dev/null; sbsign --key '"$KD"'/KEK/KEK.key --cert '"$KD"'/KEK/KEK.pem --output $1/boot.efi $1/boot.efi >/dev/null 2>&1'
 	R="lacks lockdown=integrity" ctamper "a UKI without lockdown=integrity" - "$cuki '${ccmd/ lockdown=integrity/}' $KD/db/db.key $KD/db/db.pem"
-	R="still carries roothash=" ctamper "a UKI that still carries roothash=" - "$cuki '$ccmd roothash=$hr' $KD/db/db.key $KD/db/db.pem"
+	R="still names a root" ctamper "a UKI that still carries roothash=" - "$cuki '$ccmd roothash=$hb' $KD/db/db.key $KD/db/db.pem"
+	R="still names a root" ctamper "a UKI that names root= (the initrd stacks the layers)" - "$cuki 'root=/dev/mapper/root $ccmd' $KD/db/db.key $KD/db/db.pem"
 	R="names a combination" ctamper "a UKI named after one combination" - "$cuki '$ccmd' $KD/db/db.key $KD/db/db.pem 'PRETTY_NAME=\"safespace 20990101-0100 root\"'"
 	R="no AuthenticAMD microcode" ctamper "a UKI without AMD microcode" - "export FX_UCODE_VENDORS=GenuineIntel; $cuki '$ccmd' $KD/db/db.key $KD/db/db.pem 'PRETTY_NAME=\"safespace 20990101-0100\"'"
 	R="no signed expected PCRs" ctamper "a UKI without signed expected PCRs" - "$cuki '$ccmd' $KD/db/db.key $KD/db/db.pem 'PRETTY_NAME=\"safespace 20990101-0100\"'"
@@ -616,52 +722,59 @@ if wanted compose && fixtures; then
 	R="not exactly one identity signature for enter-initrd" ctamper "a UKI whose identity signature is for leave-initrd" - "source $REPO/tests/lib/fixtures.sh; fx_reuki \$1 $KD 'enter-initrd:leave-initrd'"
 	R="not exactly one identity signature for enter-initrd (sha1)" ctamper "a UKI whose identity signature is for SHA-256 only (SHA-1 TPMs)" - "source $REPO/tests/lib/fixtures.sh; fx_reuki \$1 $KD enter-initrd sha256"
 	check "compose_check passes a UKI rebuilt with the identity key for enter-initrd" bash -c 'rm -rf "$W/creuki" && cp -a "$1" "$W/creuki" && source "$REPO/tests/lib/fixtures.sh" && fx_reuki "$W/creuki" "$KD" enter-initrd && t_check "$W/creuki" >/dev/null 2>&1' _ "$B"
-	R="roothash-containers is not" ctamper "a roothash-<name> that is not the signed one" - 'echo 0000000000000000000000000000000000000000000000000000000000000000 >$1/roothash-containers'
-	R="not the combinations" ctamper "combinations in another order" - "$cuki '${ccmd/safespace.root.root=$hr safespace.root.containers=$hc/safespace.root.containers=$hc safespace.root.root=$hr}' $KD/db/db.key $KD/db/db.pem"
+	R="roothash-docker is not" ctamper "a roothash-<layer> that is not the signed one" - 'echo 0000000000000000000000000000000000000000000000000000000000000000 >$1/roothash-docker'
+	R="not the combinations" ctamper "combinations in another order" - "$cuki '${ccmd/safespace.root.root=base safespace.root.containers=base,docker/safespace.root.containers=base,docker safespace.root.root=base}' $KD/db/db.key $KD/db/db.pem"
+	R="chain of containers is not" ctamper "a combination with another chain of layers" - "$cuki '${ccmd/safespace.root.containers=base,docker/safespace.root.containers=base}' $KD/db/db.key $KD/db/db.pem"
+	R="layers are not" ctamper "layers in another order" - "$cuki '${ccmd/safespace.layer.base=$hb safespace.layer.docker=$hd/safespace.layer.docker=$hd safespace.layer.base=$hb}' $KD/db/db.key $KD/db/db.pem"
 	R="systemd-boot.efi is not signed" ctamper "systemd-boot signed by another key" - 'sbattach --remove $1/systemd-boot.efi >/dev/null; sbsign --key '"$KD"'/KEK/KEK.key --cert '"$KD"'/KEK/KEK.pem --output $1/systemd-boot.efi $1/systemd-boot.efi >/dev/null 2>&1'
-	R="layout.sfdisk does not match" ctamper "a partition table with another root UUID" - 'sed -i "/name=\"root-containers\"/s/uuid=[0-9A-F-]*/uuid=11111111-2222-3333-4444-555555555555/" $1/layout.sfdisk'
+	R="layout.sfdisk does not match" ctamper "a partition table with another layer UUID" - 'sed -i "/name=\"root-docker\"/s/uuid=[0-9A-F-]*/uuid=11111111-2222-3333-4444-555555555555/" $1/layout.sfdisk'
 
 	# The initrd's choice of the root.
 	SEL=$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/select
 	SG=8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34 EV=$W/sel-efivars
 	H1=$(printf '1%.0s' {1..64}) H2=$(printf '2%.0s' {1..64})
-	CL="ro safespace.root.root=$H1 safespace.root.containers=$H2"
+	CL="ro safespace.layer.base=$H1 safespace.layer.docker=$H2 safespace.root.root=base safespace.root.containers=base,docker"
 	# The measuring program, replaced: it records its arguments (PCREXT_FAIL=1: fails).
 	PX=$W/pcrextend SR=$W/sel-run
 	printf '#!/bin/sh\necho "$*" >>"%s/pcrextend.log"\n[ -z "$PCREXT_FAIL" ]\n' "$W" >"$PX" && chmod +x "$PX"
-	t_select() { # CMDLINE ONCE PERSISTENT EXPECTED("name:hash")
+	t_select() { # CMDLINE ONCE PERSISTENT EXPECTED("name:layers")
 		rm -rf "$EV" "$SR" "$W/pcrextend.log" && mkdir -p "$EV"
 		[[ -z $2 ]] || printf '\x07\x00\x00\x00%s' "$2" >"$EV/SafespaceSelectOnce-$SG"
 		[[ -z $3 ]] || printf '\x07\x00\x00\x00%s' "$3" >"$EV/SafespaceSelect-$SG"
 		local got
-		got=$(cmdline=$1 SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$SR SAFESPACE_PCREXTEND=$PX sh -c 'msg() { :; }; . "$0"; select_root || exit 1; echo "$SELECT_NAME:$SELECT_HASH"' "$SEL") || return 1
+		got=$(cmdline=$1 SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$SR SAFESPACE_PCREXTEND=$PX sh -c 'msg() { :; }; . "$0"; select_root || exit 1; echo "$SELECT_NAME:$SELECT_LAYERS"' "$SEL") || return 1
 		[[ $got == "$4" ]] || { echo "got $got"; return 1; }
 	}
-	check "select: nothing set boots the first combination" t_select "$CL" "" "" "root:$H1"
-	check "select: the first is the default, whatever its name" t_select "ro safespace.root.containers=$H2 safespace.root.root=$H1" "" "" "containers:$H2"
-	check "select: SafespaceSelect=containers" t_select "$CL" "" containers "containers:$H2"
-	check "select: SafespaceSelectOnce wins over SafespaceSelect" t_select "$CL" root containers "root:$H1"
+	check "select: nothing set boots the first combination" t_select "$CL" "" "" "root:base"
+	check "select: the first is the default, whatever its name" t_select "ro safespace.layer.base=$H1 safespace.layer.docker=$H2 safespace.root.containers=base,docker safespace.root.root=base" "" "" "containers:base docker"
+	check "select: SafespaceSelect=containers: its layers, bottom first" t_select "$CL" "" containers "containers:base docker"
+	check "select: SafespaceSelectOnce wins over SafespaceSelect" t_select "$CL" root containers "root:base"
 	check "... and is deleted" test ! -e "$EV/SafespaceSelectOnce-$SG"
-	check "select: safespace.select= on the command line wins" t_select "$CL safespace.select=containers" root "" "containers:$H2"
+	check "select: safespace.select= on the command line wins" t_select "$CL safespace.select=containers" root "" "containers:base docker"
 	refuse "select: an unknown name stops the boot" t_select "$CL" "" nope ""
-	check "select: a variable that is no name is ignored" t_select "$CL" "" 'x;rm' "root:$H1"
+	check "select: a variable that is no name is ignored" t_select "$CL" "" 'x;rm' "root:base"
+	check "select: a variable cannot name layers (only a combination of the signed command line)" t_select "$CL" "" "base,docker" "root:base"
+	refuse "select: a combination naming a layer without a signed root hash stops the boot" t_select "$CL safespace.root.evil=base,xfce" "" evil ""
+	refuse "select: ... and one with an empty layer in its chain" t_select "$CL safespace.root.evil=base,,docker" "" evil ""
 	refuse "select: roothash= alone stops the boot (no fallback)" t_select "ro roothash=$H1" "" "" ""
 	refuse "select: a variable cannot add a root (no hash of its own)" t_select "$CL" "" "x$H1" ""
-	t_select "$CL" "" containers "containers:$H2" >/dev/null
+	t_select "$CL" "" containers "containers:base docker" >/dev/null
 	check "select: the choice is measured into PCR 15 before it is used" bash -c '[[ $(cat "$1") == "--graceful --pcr=15 safespace-combination:containers" ]]' _ "$W/pcrextend.log"
 	check "... and recorded in /run/safespace/combination" bash -c '[[ $(cat "$1/combination") == containers ]]' _ "$SR"
 	t_twice() { rm -rf "$SR" "$W/pcrextend.log"; cmdline=$CL SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$SR SAFESPACE_PCREXTEND=$PX sh -c 'msg() { :; }; . "$0"; select_root && select_root' "$SEL" && [[ $(wc -l <"$W/pcrextend.log") == 1 ]]; }
 	check "select: measured only once per boot" t_twice
-	t_failmeasure() { PCREXT_FAIL=1 t_select "$CL" "" "" "root:$H1"; }
+	t_failmeasure() { PCREXT_FAIL=1 t_select "$CL" "" "" "root:base"; }
 	check "select: a failing measurement does not stop the boot" t_failmeasure
 	t_unknown_measured() { t_select "$CL" "" nope ""; test -e "$W/pcrextend.log"; }
 	refuse "select: an unknown name is not measured" t_unknown_measured
+	t_unhashed_measured() { t_select "$CL safespace.root.evil=base,xfce" "" evil ""; test -e "$W/pcrextend.log"; }
+	refuse "select: ... nor a combination with a layer without hash" t_unhashed_measured
 	t_chosen() { # CMDLINE (after a choice of containers): what the boot paths take
-		t_select "$CL" "" containers "containers:$H2" >/dev/null || return 1
-		[[ $(cmdline=$1 SAFESPACE_RUN=$SR sh -c 'msg() { :; }; . "$0"; select_chosen || exit 1; echo "$SELECT_NAME:$SELECT_HASH"' "$SEL") == "containers:$H2" ]]
+		t_select "$CL" "" containers "containers:base docker" >/dev/null || return 1
+		[[ $(cmdline=$1 SAFESPACE_RUN=$SR sh -c 'msg() { :; }; . "$0"; select_chosen || exit 1; echo "$SELECT_NAME:$SELECT_LAYERS:$(select_layer_hash docker)"' "$SEL") == "containers:base docker:$H2" ]]
 	}
-	check "select: the boot paths take the combination chosen before, its hash from the command line" t_chosen "$CL"
-	refuse "select: ... not one the command line does not name" t_chosen "ro safespace.root.root=$H1"
+	check "select: the boot paths take the combination chosen before, its layers and their hashes from the command line" t_chosen "$CL"
+	refuse "select: ... not one the command line does not name" t_chosen "ro safespace.layer.base=$H1 safespace.root.root=base"
 	t_none_chosen() { rm -rf "$SR"; cmdline=$CL SAFESPACE_RUN=$SR sh -c 'msg() { :; }; . "$0"; select_chosen' "$SEL"; }
 	refuse "select: nothing chosen: the boot paths stop" t_none_chosen
 
@@ -953,6 +1066,8 @@ if wanted units && need systemd-analyze; then
 	check "initrd: both paths require the combination chosen before (safespace-select.service)" bash -c 'for f in usb-bootdev netroot; do grep -q "^Requires=.*safespace-select.service" "$1/$f.service" && grep -q "^After=.*safespace-select.service" "$1/$f.service" || exit 1; done' _ "$I"
 	check "initrd: the identity after the choice, before the network (network-pre.target), not after a boot path" bash -c 'f=$1/safespace-identity.service; grep -qx "Before=network-pre.target" "$f" && grep -qx "Wants=network-pre.target" "$f" && grep -q "^After=safespace-select.service" "$f" && ! grep -qE "^After=.*(netroot|usb-bootdev)" "$f"' _ "$I"
 	check "initrd: netroot after the identity (DHCP as the machine)" grep -q "^After=.*safespace-identity.service" "$I/netroot.service"
+	check "initrd: both paths mount the stack before the root counts as there (initrd-root-fs.target, systemd-volatile-root)" bash -c 'for f in usb-bootdev netroot; do grep -q "^Before=.*initrd-root-fs.target.*systemd-volatile-root.service" "$1/$f.service" || exit 1; done' _ "$I"
+	check "initrd: without the stack mounted, the boot stops (no switch into an empty /sysroot)" bash -c 'grep -qx "AssertPathIsMountPoint=/sysroot" "$1/initrd-root-fs.target.d/10-safespace.conf"' _ "$I"
 fi
 
 printf '\n\e[1m%d passed, %d failed, %d skipped\e[0m\n' "$PASS" "$FAIL" "$SKIP"

@@ -29,7 +29,7 @@
 # --tftp: hand the UKI over QEMU's built-in TFTP server instead of HTTP, for
 #   firmware without UEFI HTTP boot. The root image still comes over HTTP.
 # --tree DIR: the release to serve (a directory with boot.efi and the
-#   root-<name>.img/.verity files, e.g. a distribution server's share).
+#   root-<layer>.img/.verity files, e.g. a distribution server's share).
 # --no-server: the tree is served at the signed URL already (tests/vm.sh runs
 #   one server for VMs booting side by side: the port is in the signed URL).
 # --url BOOT_URL: no local server; UEFI HTTP boot of a published UKI from a
@@ -113,11 +113,11 @@ if ((NETBOOT)) && [[ -n $BOOT_URL ]]; then
 	cmdline=$(objcopy -O binary --only-section=.cmdline "$uki" /dev/stdout 2>/dev/null | tr -d '\0')
 	NETROOT_URL=$(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace.netroot=//p' | head -1)
 	[[ -n $NETROOT_URL ]] || die "$BOOT_URL has no safespace.netroot= on its command line (built without NETROOT_URL)"
-	# The largest root the VM might load: one per combination.
+	# What the VM might load at most: every layer (a combination loads its own).
 	root_bytes=0
-	for f in $(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace\.root\.\([a-z0-9-]*\)=.*/root-\1.img/p'); do
+	for f in $(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace\.layer\.\([a-z0-9-]*\)=.*/root-\1.img/p'); do
 		b=$(curl -fsSI "${NETROOT_URL%/}/$f" 2>/dev/null | tr -d '\r' | awk 'tolower($1) == "content-length:" { print $2 }')
-		[[ $b =~ ^[0-9]+$ ]] && ((b > root_bytes)) && root_bytes=$b
+		[[ $b =~ ^[0-9]+$ ]] && root_bytes=$((root_bytes + b))
 	done
 	((root_bytes > 0)) || die "the server serves no root image under ${NETROOT_URL%/}/"
 	MEM=${MEM:-$((root_bytes / 1048576 + 2048))}
@@ -142,7 +142,7 @@ elif ((NETBOOT)); then
 	ls "$BOOTDIR"/root*.img >/dev/null 2>&1 || die "no root image in $BOOTDIR"
 	# The root image is about as large as the system itself and is downloaded
 	# into a tmpfs, so the VM needs the RAM for it (override with MEM=).
-	root_mib=$(($(stat -c %s "$BOOTDIR"/root*.img | sort -n | tail -1) / 1048576))
+	root_mib=$((($(stat -c %s "$BOOTDIR"/root*.img | paste -sd+)) / 1048576))
 	MEM=${MEM:-$((root_mib + 2048))}
 
 	# Serve the published files under the exact path the signed URL names, so

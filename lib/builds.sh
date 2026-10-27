@@ -165,6 +165,7 @@ builds_release() { # DIR
 	echo "VERSION=$(builds_info "$d" version)"
 	echo "BUILD=$(builds_info "$d" build)"
 	echo "COMBINATIONS=$(builds_combo_names "$d")"
+	echo "LAYERS=$(verify_layers "$(uki_section "$d/boot.efi" .cmdline)" | paste -sd,)"
 	echo "BUILT=$(builds_info "$d" finished)"
 	echo "SNAPSHOT=$(builds_info "$d" snapshot)"
 	echo "COMMIT=$(builds_info "$d" commit)$([[ $(builds_info "$d" uncommitted_changes) == yes ]] && echo +uncommitted)"
@@ -194,7 +195,7 @@ builds_write_info() { # DIR, then KEY=VALUE pairs (VALUE with commas = a list fo
 		info = {}
 		for p in pairs:
 		    k, _, v = p.partition("=")
-		    info[k] = [x for x in v.split(",") if x] if k in ("netroot", "combinations") else v
+		    info[k] = [x for x in v.split(",") if x] if k in ("netroot", "combinations", "layers") else v
 		info["packages"] = sum(len(json.load(open(m))["packages"]) for m in sorted(glob.glob(d + "/manifest-*.json")))
 		info["uki_bytes"] = os.path.getsize(d + "/boot.efi") if os.path.exists(d + "/boot.efi") else 0
 		info["root_bytes"] = sum(os.path.getsize(f) for f in glob.glob(d + "/root*.img"))

@@ -107,7 +107,10 @@ DEST=$STAGE_DIR
 rm -rf "$DEST"
 mkdir -p "$DEST"
 PARTS=(boot.efi systemd-boot.efi layout.sfdisk)
-for n in ${COMBOS//,/ }; do PARTS+=("root-$n.img" "root-$n.verity" "roothash-$n" "manifest-$n.json"); done
+# Per layer its image, hash tree and root hash (the layers on the UKI's signed
+# command line), per combination its package list.
+for l in $(verify_layers "$(uki_section "$DIR/boot.efi" .cmdline)"); do PARTS+=("root-$l.img" "root-$l.verity" "roothash-$l"); done
+for n in ${COMBOS//,/ }; do PARTS+=("manifest-$n.json"); done
 for f in "${PARTS[@]}"; do
 	[[ -f $DIR/$f ]] || die "$DIR/$f missing"
 	ln "$DIR/$f" "$DEST/$f" 2>/dev/null || cp --reflink=auto "$DIR/$f" "$DEST/$f"

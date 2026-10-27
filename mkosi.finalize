@@ -5,18 +5,12 @@ set -euo pipefail
 # systemd-resolved's stub resolver (left to the end so nothing overwrites it).
 ln -sf ../run/systemd/resolve/stub-resolv.conf "$BUILDROOT/etc/resolv.conf"
 
-# /var is a tmpfs at runtime (systemd.volatile=state). Move everything built
-# into /var (homes, pacman database, package state) to the verified factory
-# copy in /usr; safespace-var-factory.service copies it into the tmpfs on
-# every boot. Caches and logs are dropped.
-factory=$BUILDROOT/usr/share/factory/var
-rm -rf "$factory"
-install -d "$factory"
-rm -rf "$BUILDROOT"/var/cache/* "$BUILDROOT"/var/log/* "$BUILDROOT"/var/tmp/* \
-	"$BUILDROOT"/var/lib/pacman/sync
-cp -a "$BUILDROOT/var/." "$factory/"
-find "$BUILDROOT/var" -mindepth 1 -delete
-echo "safespace: /var moved to /usr/share/factory/var ($(du -sh "$factory" | cut -f1))"
+# /var into the verified factory copy in /usr (lib/factory.sh) - not for a
+# layer's tree (SAFESPACE_KEEP_VAR=1, build.sh): the layers built on it need
+# pacman's database in /var; build.sh moves it after them.
+# shellcheck source=lib/factory.sh
+source "$SRCDIR/lib/factory.sh"
+[[ ${SAFESPACE_KEEP_VAR:-} == 1 ]] || factory_var "$BUILDROOT"
 
 # The systemd-stub the UKI is built from, next to the outputs: build.sh
 # composes the common UKI of all combinations with exactly this stub

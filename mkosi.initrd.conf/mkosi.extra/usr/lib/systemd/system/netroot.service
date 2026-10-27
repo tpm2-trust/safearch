@@ -16,7 +16,10 @@ ConditionPathExists=!/sys/firmware/efi/efivars/LoaderDevicePartUUID-4a67b082-0a4
 Requires=systemd-networkd.service safespace-select.service
 After=systemd-networkd.service safespace-select.service safespace-identity.service systemd-udevd.service systemd-udev-trigger.service
 Wants=systemd-udev-trigger.service
+# It mounts the chosen combination's layers at /sysroot itself (no root=):
+# before the root file system counts as there.
 Before=initrd-root-device.target cryptsetup-pre.target veritysetup-pre.target sysroot.mount
+Before=initrd-root-fs.target systemd-volatile-root.service initrd-parse-etc.service
 Conflicts=shutdown.target
 
 [Service]
