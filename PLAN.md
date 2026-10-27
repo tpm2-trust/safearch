@@ -17,6 +17,75 @@ T450s findings with usb/network aligned.
 
 ---
 
+# PLAN: the identity made once, automatically; updates unattended
+
+Status: **confirmed 2026-10-26** (the user's choices, in order: a signed PCR file and
+unattended updates; the build's PCR key as the signer, since a TPM cannot check the RSA-4096
+db key; two slots; trust anchor B, no PIN; one decision for everything, expandable; the
+creation in the initrd, aSSH in it; aSSH keeps its PIN functions, safearch no longer uses
+them; everything stays in EFI variables - a TPM's NV memory is small - with the CA's private
+key in the TPM as now: made there, signing there, only its TPM-wrapped blob in the variable). Replaces the identity's PIN path in safearch (`identity create|approve|move|pin`,
+`tpm unlock`, the move with `select`).
+
+## The states (what the login shows)
+
+| State | Colour |
+|---|---|
+| not sealed (Setup Mode, Secure Boot off) | red: `sudo safespace seal` |
+| sealed, no identity yet (the next boot creates it) | yellow |
+| identity, slot 0: firmware as at the creation, a build the build host signed | green |
+| identity, slot 1: Secure Boot and the combination right, firmware or option ROM changed, or the UKI carries no build signature | purple: check |
+| identity elsewhere (another combination, Secure Boot changed): aSSH's temporary key | red |
+| no TPM, aSSH failed: throwaway key | red |
+
+## Design
+
+- **One event, one place:** the initrd's identity step, at the first boot with Secure Boot
+  on (SecureBoot=1, SetupMode=0) and no identity, creates all of it, all or nothing: the
+  machine-id (a systemd-creds credential in `SAFEmachineID`, as now, renamed from `SafespaceIdMachine`) and, with
+  `assh identity create` (aSSH in the initrd, ~+3 MB in the UKI), the CA and its approvals
+  (`SAFEasshCA`). The only way to an identity; a new one after `safespace identity clear`.
+- **The CA's private key never leaves the TPM:** made there (fixedTPM, fixedParent), every
+  certificate signed there; `SAFEasshCA` holds its blob wrapped by this TPM's storage key
+  (useless in any other TPM) and public data (the CA's key, the slots, the approvals).
+- **The authority exists only for that moment:** a key in the TPM under the NULL hierarchy;
+  it signs the approvals and is flushed (and gone with the boot anyway). No PIN, no counter,
+  no lockout authorization: nobody can approve anything afterwards - not root of another
+  combination, not an attacker after a firmware change.
+- **The approvals, fixed at the creation:**
+  - slot 0 (agent): PCR 0, 2, 7 as now, PCR 15 = `safespace-combination:NAME`,
+    `safespace-identity:sealed` (calculated), and PCR 11 authorized by the build's PCR key
+    (PolicyPCR(11) -> PolicyAuthorize(PCR key), from systemd's
+    `/run/systemd/tpm2-pcr-signature.json`, phase `enter-initrd:leave-initrd`);
+  - slot 1 (agent): PCR 7, 15 (as above).
+- **The machine-id** stays systemd's: a systemd-creds credential (literal PCR 7 and 15 at the
+  creation, PCR 11 signed by the identity key for `enter-initrd`), released in the initrd as
+  now. More data later: further credentials of the same kind, each in its EFI variable.
+- **Updates:** a new build is certified through slot 0 at its first boot, unattended (its UKI
+  carries its signature). `safespace update` (network-booted machines): the server from the
+  signed command line, `release` fetched, a newer version required, a detached signature by
+  the db key over it checked against the image's `db.pem` (`build.sh` signs it), then reboot.
+- **The client's line:** `safespace` and the login show the `@cert-authority` line once the
+  CA exists (the first login after sealing).
+- **What goes:** `identity create|approve|move|pin`, `tpm unlock`, the move with `select`,
+  `SafespaceAssign*`. `select NAME` only selects; the identity stays
+  with its combination. After a firmware update: purple until `identity clear`.
+- **aSSH:** slots with build-signed PCRs (`ASSH_CA_SLOT_<N>_SIGNED=11`, `ASSH_PCR_KEY`,
+  `ASSH_PCR_SIGNATURE`), `identity create` (the one-time authority, approvals for given or
+  calculated values). Its PIN functions stay.
+- **Trade-off:** every UKI the build signed gets slot 0 - an old one too (it gets slot 1 even
+  today). A firmware update means a new identity and a new client line.
+
+## Tests
+
+aSSH with swtpm (signed PCR 11 with a test key in systemd's format; the one-time authority
+gone after creation); tests/run.sh; tests/vm.sh:
+the first sealed boot creates everything, the next boot green (slot 0), an update (a second
+build) green without a step, an option ROM purple, another combination red, `identity
+clear` + a boot = a new CA line, `safespace update` against the test server.
+
+---
+
 # PLAN: one command, `safespace`
 
 Status: **confirmed 2026-10-26** (the user's choices: the verb `select`, the old commands

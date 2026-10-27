@@ -173,6 +173,14 @@ fx_build() {
 		compose_check "$co/mkosi.output/combined_$v" "$kd/db/db.pem"
 	) || return 1
 	fx_info "$co" "$v" "${combos%,}"
+	fx_release "$co/mkosi.output/combined_$v" "$kd"
+}
+
+# fx_release DIR KEYDIR: the release file and its db signature, as build.sh writes them.
+fx_release() {
+	(HERE=${1%/mkosi.output/*}; source "$HERE/lib/builds.sh"; builds_release "$1") >"$1/release" &&
+		openssl cms -sign -binary -noattr -outform DER -in "$1/release" -out "$1/release.p7s" \
+			-signer "$2/db/db.pem" -inkey "$2/db/db.key" -md sha256
 }
 
 # fx_reuki DIR KEYDIR IDENTITY_PHASES [BANKS]: rebuild DIR/boot.efi from its own

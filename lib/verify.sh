@@ -54,15 +54,25 @@ verify_combinations() { # CMDLINE
 	tr ' ' '\n' <<<"$1" | sed -n 's/^safespace\.root\.\([a-z][a-z0-9-]*\)=[0-9a-f]\{64\}$/\1/p'
 }
 
+# The release file's signature (release.p7s, detached CMS) by the db key:
+# that certificate alone, given here (-nointern), whatever the signature
+# carries; the same check a machine makes before it updates (safespace update).
+verify_release_file() { # RELEASE P7S DB_CERT
+	openssl cms -verify -binary -inform DER -in "$2" -content "$1" -certfile "$3" -nointern -noverify -out /dev/null 2>/dev/null
+}
+
 verify_release() { # DIR DB_CERT
 	local dir=$1 cert=$2 f version cmdline url urls=0 n h names=() pairs=()
 	[[ -f $cert ]] || vfail "no db certificate $cert" || return
 	[[ -d $dir ]] || vfail "no release directory $dir" || return
-	for f in boot.efi systemd-boot.efi layout.sfdisk cmdline release SHA256SUMS; do
+	for f in boot.efi systemd-boot.efi layout.sfdisk cmdline release release.p7s SHA256SUMS; do
 		[[ -f $dir/$f && ! -L $dir/$f ]] || vfail "$f missing" || return
 	done
 	verify_sums "$dir" || return
 	vinfo "SHA256SUMS ok"
+	verify_release_file "$dir/release" "$dir/release.p7s" "$cert" ||
+		vfail "release is not signed by the db key (release.p7s)" || return
+	vinfo "release signed by the db key"
 	version=$(release_get "$dir/release" VERSION)
 	verify_name_version "$version" || vfail "release has an invalid VERSION='$version'" || return
 	vinfo "release $(release_get "$dir/release" BUILD)"

@@ -35,6 +35,8 @@ mkosi.profiles/docker/mkosi.extra/usr/share/safespace/docker-images/
 mkosi.extra/usr/share/safespace/secureboot/
 # Built by build.sh from the submodule assh/ (lib/assh.sh).
 mkosi.extra/usr/bin/assh
+mkosi.initrd.conf/mkosi.extra/usr/bin/assh
+mkosi.initrd.conf/mkosi.extra/etc/assh/
 
 # Test builds, VM disks, hwtest-image.sh output.
 mkosi.test/

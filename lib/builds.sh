@@ -155,6 +155,20 @@ builds_prune() { # KEEP YES
 }
 
 # build.json for a finished build (build.sh, as root, after mkosi succeeded).
+# The release file of a build, from its build.json: what a server publishes
+# and a machine reads before an update (safespace update). build.sh writes it
+# with release.p7s, its signature by the db key; release.sh copies both.
+builds_release() { # DIR
+	local d=$1
+	echo "VERSION=$(builds_info "$d" version)"
+	echo "BUILD=$(builds_info "$d" build)"
+	echo "COMBINATIONS=$(builds_info "$d" combinations | tr ',' '\n' | cut -d: -f1 | paste -sd,)"
+	echo "BUILT=$(builds_info "$d" finished)"
+	echo "SNAPSHOT=$(builds_info "$d" snapshot)"
+	echo "COMMIT=$(builds_info "$d" commit)$([[ $(builds_info "$d" uncommitted_changes) == yes ]] && echo +uncommitted)"
+	echo "PACKAGES=$(builds_info "$d" packages)"
+}
+
 builds_write_info() { # DIR, then KEY=VALUE pairs (VALUE with commas = a list for combinations/netroot)
 	local d=$1; shift
 	python3 -I - "$d" "$@" <<-'EOF'

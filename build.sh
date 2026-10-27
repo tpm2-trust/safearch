@@ -270,8 +270,13 @@ keys_export "$DB_EXPORT"
 # shellcheck source=lib/assh.sh
 source "$HERE/lib/assh.sh"
 assh_build "$HERE/mkosi.extra/usr/bin/assh"
+# The initrd makes the identity (mkosi.initrd.conf/.../identity): aSSH and its
+# settings there too, the same file as the root's.
+install -D -m 0755 "$HERE/mkosi.extra/usr/bin/assh" "$HERE/mkosi.initrd.conf/mkosi.extra/usr/bin/assh"
+install -D -m 0644 "$HERE/mkosi.extra/etc/assh/assh.conf" "$HERE/mkosi.initrd.conf/mkosi.extra/etc/assh/assh.conf"
 # Keep the project owned by its user, not by root.
-chown -R --reference="$HERE" "$HERE/mkosi.extra/usr/share/safespace" "$HERE/mkosi.extra/usr/bin/assh"
+chown -R --reference="$HERE" "$HERE/mkosi.extra/usr/share/safespace" "$HERE/mkosi.extra/usr/bin/assh" \
+	"$HERE/mkosi.initrd.conf/mkosi.extra/usr/bin" "$HERE/mkosi.initrd.conf/mkosi.extra/etc/assh"
 keys_ensure_pcr
 [[ $SNAPSHOT == latest ]] && log "note: SNAPSHOT=latest reuses the cached image as long as the configuration is unchanged; -f installs the current packages"
 
@@ -354,6 +359,12 @@ builds_write_info "$OUTDIR" build="$BUILD" version="$VERSION" combinations="${co
 	uncommitted_changes="$([[ -z $("${git[@]}" status --porcelain 2>/dev/null) ]] && echo no || echo yes)" \
 	signer="$(keys_fingerprint "$KEYS_SB_CERT")" netroot="$(IFS=,; echo "${NETROOT[*]-}")" \
 	builder="$(uname -n)" users="$USERS_FILE"
+# The release file, signed by the db key (detached CMS): a machine checks it
+# against the db.pem in its image before it updates (safespace update).
+builds_release "$OUTDIR" >"$OUTDIR/release"
+openssl cms -sign -binary -noattr -outform DER -in "$OUTDIR/release" -out "$OUTDIR/release.p7s" \
+	-signer "$KEYS_SB_DIR/db/db.pem" -inkey "$KEYS_SB_DIR/db/db.key" -md sha256 ||
+	die "signing the release file with the db key failed"
 rm -rf -- "${PARTS:?}"
 # The build belongs to whoever ran sudo, so list, release.sh and prune work
 # without root. (Changing a file there gains nothing: release.sh and the

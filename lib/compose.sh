@@ -87,16 +87,20 @@ compose_uki() { # OUT FIRST_UKI STUB CMDLINE
 	[[ $v =~ ^[0-9]{8}-[0-9]{4,6}$ ]] || { rm -rf "$t"; die "no IMAGE_VERSION in the .osrel of $uki"; }
 	printf 'PRETTY_NAME="safespace %s"\n' "$v" >>"$t/osrel.all"
 	mv "$t/osrel.all" "$t/osrel"
-	# The identity key's public part, for sealing the machine's secrets in the
-	# initrd (mkosi.initrd.conf/.../identity): appended as a cpio of its own,
-	# the kernel unpacks every archive of the initrd in turn.
+	# The public parts of the identity key (the machine-id's policy) and of the
+	# PCR key (the CA's slot 0: aSSH takes PCR 11 signed by it), for the
+	# identity's creation in the initrd (mkosi.initrd.conf/.../identity): appended
+	# as a cpio of its own, the kernel unpacks every archive of the initrd in turn.
+	# (ukify adds no .pcrpkey section, so systemd-stub hands over no key.)
 	install -d "$t/id/usr/local/lib/safespace"
 	openssl x509 -in "$KEYS_ID_CERT" -pubkey -noout >"$t/id/usr/local/lib/safespace/identity.pem" ||
 		{ rm -rf "$t"; die "cannot read the identity key's certificate $KEYS_ID_CERT"; }
+	openssl x509 -in "$KEYS_PCR_CERT" -pubkey -noout >"$t/id/usr/local/lib/safespace/pcr.pem" ||
+		{ rm -rf "$t"; die "cannot read the PCR key's certificate $KEYS_PCR_CERT"; }
 	(cd "$t/id" && find usr | sort | cpio -o -H newc --owner=0:0 --reproducible --quiet) >>"$t/initrd" ||
 		{ rm -rf "$t"; die "cannot append the identity key to the initrd"; }
-	# Two PCR signing keys: mkosi's for every phase (first: its public key is the
-	# .pcrpkey systemd uses), the identity key for enter-initrd only. Both banks:
+	# Two PCR signing keys: mkosi's for every phase, the identity key for
+	# enter-initrd only. Both banks:
 	# SHA-1 for a TPM whose firmware activates nothing else (T450s), used there
 	# only where safespace tpm sha1 allows it (initrd identity); a SHA-256 TPM
 	# seals to SHA-256, which no SHA-1 signature satisfies.

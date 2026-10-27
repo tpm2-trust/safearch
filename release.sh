@@ -25,7 +25,8 @@
 # hardlinks (nothing is copied or unpacked) plus the release files:
 #   boot.efi (signed UKI), systemd-boot.efi, layout.sfdisk; per combination
 #   root-<name>.img, root-<name>.verity, roothash-<name>, manifest-<name>.json;
-#   cmdline (the UKI's signed command line, readable), release (VERSION,
+#   cmdline (the UKI's signed command line, readable), release.p7s (the release
+#   file's signature by the db key, from the build), release (VERSION,
 #   BUILD, COMBINATIONS, BUILT, SNAPSHOT, COMMIT, PACKAGES), SHA256SUMS
 # It is checked here exactly as a server checks it (lib/verify.sh): Secure
 # Boot signatures against the exported db.pem, every root image against its
@@ -107,17 +108,13 @@ for f in "${PARTS[@]}"; do
 done
 uki_cmdline "$DEST/boot.efi" >"$DEST/cmdline"
 echo >>"$DEST/cmdline"
-{
-	echo "VERSION=$VERSION"
-	echo "BUILD=$BUILD"
-	echo "COMBINATIONS=$COMBOS"
-	echo "BUILT=$(builds_info "$DIR" finished)"
-	echo "SNAPSHOT=$(builds_info "$DIR" snapshot)"
-	echo "COMMIT=$(builds_info "$DIR" commit)$([[ $(builds_info "$DIR" uncommitted_changes) == yes ]] && echo +uncommitted)"
-	echo "PACKAGES=$(builds_info "$DIR" packages)"
-} >"$DEST/release"
+# The release file and its signature, as the build wrote them.
+for f in release release.p7s; do
+	[[ -f $DIR/$f ]] || die "$DIR/$f missing (a build from before the signed release file? rebuild)"
+	cp "$DIR/$f" "$DEST/$f"
+done
 (cd "$DEST" && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | sort | xargs sha256sum >SHA256SUMS)
-chmod 0644 "$DEST"/{cmdline,release,SHA256SUMS}
+chmod 0644 "$DEST"/{cmdline,release,release.p7s,SHA256SUMS}
 chmod 0755 "$DEST"
 
 # --- check it as a server will ---------------------------------------------------
