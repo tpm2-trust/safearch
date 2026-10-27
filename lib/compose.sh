@@ -43,28 +43,25 @@ combos_load() { # FILE
 	((${#COMBO_NAMES[@]})) || die "$1: no combination"
 }
 
-uki_section() { objcopy -O binary --only-section="$2" "$1" /dev/stdout 2>/dev/null | tr -d '\0'; }
-
 compose_layout() { # OUT FIRST_LAYOUT DIR
 	local out=$1 base=$2 dir=$3 h esp parts="" n part file start end size root half type name
 	h=$(sed -n '/^label:/p; /^label-id:/p; /^unit:/p; /^first-lba:/p' "$base")
-	esp=$(grep -i 'type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B' "$base") || die "$base: no ESP"
+	esp=$(grep -i "type=$GPT_ESP" "$base") || die "$base: no ESP"
 	# Partitions start on 1 MiB boundaries after the ESP.
 	end=$(awk -F'[=,]' '{ gsub(/ /, ""); print $2 + $4 }' <<<"$esp")
 	align() { echo $((($1 + 2047) / 2048 * 2048)); }
-	uuid() { sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12}).*/\1-\2-\3-\4-\5/' <<<"$1" | tr a-f A-F; }
 	for n in "${COMBO_NAMES[@]}"; do
 		root=$(tr -d "[:space:]" <"$dir/roothash-$n")
 		for part in root verity; do
 			if [[ $part == root ]]; then
-				file=root-$n.img type=4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709 name=root-$n half=${root:0:32}
+				file=root-$n.img type=$GPT_ROOT name=root-$n half=${root:0:32}
 			else
-				file=root-$n.verity type=2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5 name=root-$n-verity half=${root:32}
+				file=root-$n.verity type=$GPT_VERITY name=root-$n-verity half=${root:32}
 			fi
 			start=$(align "$end")
 			size=$((($(stat -c %s "$dir/$file") + 511) / 512))
 			parts+=$(printf 'start=%12d, size=%12d, type=%s, uuid=%s, name="%s", attrs="GUID:60"' \
-				"$start" "$size" "$type" "$(uuid "$half")" "$name")$'\n'
+				"$start" "$size" "$type" "$(layout_uuid "$half" | tr a-f A-F)" "$name")$'\n'
 			end=$((start + size))
 		done
 	done
@@ -162,7 +159,7 @@ compose_check() { # DEST DB_CERT
 	local dest=$1 cert=$2 cmdline names n h osrel ucode pairs=()
 	verify_signature "$dest/boot.efi" "$cert" || die "the composed UKI is not signed by $cert"
 	verify_signature "$dest/systemd-boot.efi" "$cert" || die "systemd-boot.efi is not signed by $cert"
-	cmdline=$(uki_cmdline "$dest/boot.efi")
+	cmdline=$(uki_section "$dest/boot.efi" .cmdline)
 	[[ " $cmdline " == *" lockdown=integrity "* ]] || die "the composed UKI's command line lacks lockdown=integrity"
 	[[ " $cmdline " != *" roothash="* ]] || die "the composed UKI's command line still carries roothash="
 	names=$(verify_combinations "$cmdline" | tr '\n' ' ')

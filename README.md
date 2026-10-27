@@ -281,8 +281,8 @@ clear` and a boot ([Machine identity](#machine-identity)).
 (`mkosi.postinst`), so the name is that of the verified root, not of the selection.
 `PRETTY_NAME` in `/usr/lib/os-release` is `safespace <version> <combination>`, e.g.
 `safespace 20261020-1250 containers` (`VARIANT_ID=<combination>`; `ID=arch` and `NAME` stay
-Arch's), shown by systemd's "Welcome to …", the console login banner (`/etc/issue`) and
-`hostnamectl`; `/usr/lib/safespace/combination` holds the name alone. The initrd is common to
+Arch's), shown by systemd's "Welcome to …", the console login banner (`/etc/issue`, with
+the whole `safespace` overview below it: `safespace-issue.service`) and `hostnamectl`; `/usr/lib/safespace/combination` holds the name alone. The initrd is common to
 all combinations and keeps Arch's name.
 
 So a machine is sealed once on the default (`safespace seal`), then preselected. The variable
@@ -913,12 +913,14 @@ CA, once (`safespace` shows the line):
   trust only the CA refuse it.
 - **Nothing approves another state**: the CA's authority existed for the creation alone. A
   new identity - for another combination, after a firmware update, after a cleared TPM - is
-  `sudo safespace identity clear` and a boot; the clients need the new line.
+  `sudo safespace identity clear` and a boot; the clients need the new line. `sudo safespace
+  select NAME` asks on a terminal whether to clear it too (default no).
 
 | Command (on the machine) | Does |
 |---|---|
-| `safespace` | the overview: the combinations, Secure Boot, the TPM's bank, the identity with its `@cert-authority` line, this boot's host key |
-| `safespace identity` | the machine-id, the CA with its slots and the `@cert-authority` line, this boot's host key: certified through which slot, or temporary |
+| `safespace` | the overview: the combinations, Secure Boot, the TPM's bank, the identity with its `@cert-authority` line, this boot's host key (also on the console before the login) |
+| `safespace identity` | the machine-id, the CA with its slots and the `@cert-authority` line, this boot's host key: certified through which slot, or temporary, and in full (`host key: ssh-rsa AAAA…`, what ssh shows whoever connects without the CA's line) |
+| `sudo safespace select NAME` | NAME from the next boot on; another combination than the booted one, with an identity, asks whether to clear it (`--clear-identity`, `--keep-identity` answer it; without a terminal it stays) |
 | `sudo safespace identity clear` | removes the identity (YES): the CA, the machine-id; the next boot with Secure Boot on makes a new one, with a new `@cert-authority` line. SHA-1 stays |
 | `sudo safespace tpm sha1 on\|off` | allows SHA-1 on a TPM whose firmware activates no SHA-256 PCR bank (T450s), or forbids it again: the identity uses it from the next boot, only while it is on. Elsewhere it changes nothing ([SECURITY.md](SECURITY.md#the-sha-1-bank)) |
 | `sudo safespace update` | a network-booted machine: the server's `release` checked against the image's `db.pem`, a newer version with the booted combination required, then reboot |
@@ -928,7 +930,12 @@ identity's colour, and the prompt `pix@safespace[containers]:~$` with the hostna
 green certified through slot 0, purple through slot 1 (the firmware or an option ROM
 changed, or the UKI is not the build's: check), yellow sealed but no identity yet (the next
 boot makes it), red not sealed, or a temporary or throwaway key
-(`/etc/profile.d/safespace-status.sh`, from aSSH's `/run/assh/status`). A client sees the
+(`/etc/profile.d/safespace-status.sh`, from aSSH's `/run/assh/status`; the state is decided
+in `/usr/local/lib/safespace/state.sh`, for `safespace` alike). The console shows the
+overview before the login, the host key in full with it. The overview is in the same
+colours, on a terminal and on the console: this boot and its host key in the identity's,
+each other line green where it holds, yellow where it waits or is weaker (no identity yet,
+SHA-1, a throwaway machine-id), red where it is missing (`NO_COLOR` switches them off). A client sees the
 slot in the certificate's key ID (`ssh -v`: `ID "safespace slot=0 pcrs=0,2,7,15
 signed=11"`). Whatever must rely on the state checks it itself (an unlock the TPM binds).
 
@@ -972,8 +979,8 @@ volumes, networks. RAM (`/var`) would fill up quickly. So:
   Docker 29's default containerd image store is switched off on purpose, so all images live
   in `data-root` and image IDs can be checked against the shipped archives.
 - `/etc/containerd/config.toml`: containerd's data goes to `/opt/docker/containerd`.
-Only in combinations with the **`docker` group** (`containers`, `remote-workstation`); its files are in
-`mkosi.profiles/docker/`.
+Only in combinations with the **`docker` group** (`containers`, `remote-workstation`), with
+Docker Compose (`docker compose`, `docker-compose`); its files are in `mkosi.profiles/docker/`.
 
 - **Docker is not started at boot** (not enabled in the preset). Start it by hand once the
   data disk is mounted: `sudo systemctl start docker`. As a second guard, `docker.service`,

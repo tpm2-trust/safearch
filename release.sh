@@ -83,8 +83,8 @@ else
 fi
 DIR=$(builds_dir "$BUILD")
 VERSION=$(builds_info "$DIR" version)
-COMBOS=$(builds_info "$DIR" combinations | tr ',' '\n' | cut -d: -f1 | paste -sd,)
-[[ -n $COMBOS ]] || die "$DIR/build.json names no combinations (a build from before the combinations? rebuild)"
+COMBOS=$(builds_combo_names "$DIR")
+[[ -n $COMBOS ]] || die "$DIR/build.json names no combinations"
 verify_name_version "$VERSION" || die "invalid version '$VERSION' in $DIR/build.json"
 log "Release $BUILD"
 log "  combinations $COMBOS, built $(builds_info "$DIR" finished), snapshot $(builds_info "$DIR" snapshot), commit $(builds_info "$DIR" commit)$([[ $(builds_info "$DIR" uncommitted_changes) == yes ]] && echo ' + uncommitted changes'), $(builds_info "$DIR" packages) packages"
@@ -103,14 +103,14 @@ mkdir -p "$DEST"
 PARTS=(boot.efi systemd-boot.efi layout.sfdisk)
 for n in ${COMBOS//,/ }; do PARTS+=("root-$n.img" "root-$n.verity" "roothash-$n" "manifest-$n.json"); done
 for f in "${PARTS[@]}"; do
-	[[ -f $DIR/$f ]] || die "$DIR/$f missing (a build from before the parts layout? rebuild)"
+	[[ -f $DIR/$f ]] || die "$DIR/$f missing"
 	ln "$DIR/$f" "$DEST/$f" 2>/dev/null || cp --reflink=auto "$DIR/$f" "$DEST/$f"
 done
-uki_cmdline "$DEST/boot.efi" >"$DEST/cmdline"
+uki_section "$DEST/boot.efi" .cmdline >"$DEST/cmdline"
 echo >>"$DEST/cmdline"
 # The release file and its signature, as the build wrote them.
 for f in release release.p7s; do
-	[[ -f $DIR/$f ]] || die "$DIR/$f missing (a build from before the signed release file? rebuild)"
+	[[ -f $DIR/$f ]] || die "$DIR/$f missing"
 	cp "$DIR/$f" "$DEST/$f"
 done
 (cd "$DEST" && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | sort | xargs sha256sum >SHA256SUMS)

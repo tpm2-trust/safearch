@@ -24,7 +24,8 @@ HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 usage() { sed -n '2,${/^#/!q;s/^# \?//;p}' "$0"; }
-release_get() { sed -n "s/^$2=//p" "$1" | head -1; }
+# shellcheck source=lib/verify.sh
+source "$HERE/lib/verify.sh"
 # shellcheck source=lib/stick.sh
 source "$HERE/lib/stick.sh"
 # shellcheck source=lib/builds.sh
@@ -85,7 +86,7 @@ if [[ -z $BASE_URL && -f $SRC/SHA256SUMS ]]; then
 	(cd "$SRC" && sha256sum --quiet --strict -c SHA256SUMS) || die "$SRC does not match its SHA256SUMS"
 fi
 if [[ -f $SRC/build.json ]]; then
-	what="build $(builds_info "$SRC" build), combinations $(builds_info "$SRC" combinations | tr ',' '\n' | cut -d: -f1 | paste -sd,), built $(builds_info "$SRC" finished)"
+	what="build $(builds_info "$SRC" build), combinations $(builds_combo_names "$SRC"), built $(builds_info "$SRC" finished)"
 elif [[ -f $SRC/release ]]; then
 	what="release $(release_get "$SRC/release" BUILD), combinations $(release_get "$SRC/release" COMBINATIONS), built $(release_get "$SRC/release" BUILT)"
 else

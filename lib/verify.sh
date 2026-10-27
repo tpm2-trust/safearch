@@ -9,6 +9,9 @@
 #   verify_combinations CMDLINE  the combination names on a signed command line
 #   release_get FILE KEY        value of KEY=... in a release file (not sourced)
 #   verify_name_version VALUE
+#   uki_section FILE SECTION    a section of a UKI (.cmdline, .uname, .osrel)
+#   GPT_ESP, GPT_ROOT, GPT_VERITY, layout_uuid HEX32, layout_part LAYOUT TYPE KEY [NAME]
+#                               a stick's partition table, as systemd-repart makes it
 #
 # What is trusted: only DB_CERT, the public Secure Boot db certificate. The
 # UKI and systemd-boot must carry a valid signature from it; the root hashes
@@ -30,8 +33,28 @@ release_get() { # FILE KEY
 	sed -n "s/^$2=//p" "$1" | head -1
 }
 
-uki_cmdline() { # FILE
-	objcopy -O binary --only-section=.cmdline "$1" /dev/stdout 2>/dev/null | tr -d '\0'
+uki_section() { # FILE SECTION
+	objcopy -O binary --only-section="$2" "$1" /dev/stdout 2>/dev/null | tr -d '\0'
+}
+
+# A stick's partition types (x86-64): the ESP, a root and its dm-verity tree.
+GPT_ESP=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+GPT_ROOT=4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709
+GPT_VERITY=2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5
+
+# A partition UUID from half a root hash (32 hex digits), as systemd-repart
+# derives it and the initrd looks for it: 8-4-4-4-12, lower case.
+layout_uuid() { # HEX32
+	sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12}).*/\1-\2-\3-\4-\5/' <<<"$1" | tr A-F a-f
+}
+
+# A value (start, size, uuid, ...) of the first partition of an sfdisk dump
+# with that type - and that name, if given; "" for none.
+layout_part() { # LAYOUT TYPE KEY [NAME]
+	awk -v t="$2" -v k="$3" -v pn="${4-}" 'toupper($0) ~ "TYPE=" t && (pn == "" || $0 ~ "name=\"" pn "\"") {
+		sub(/^[^=]* : /, ""); n = split($0, a, ",")
+		for (i = 1; i <= n; i++) { split(a[i], kv, "="); gsub(/ /, "", kv[1]); gsub(/[ "]/, "", kv[2]); if (kv[1] == k) print kv[2] }
+		exit }' "$1"
 }
 
 verify_signature() { # FILE DB_CERT
@@ -80,7 +103,7 @@ verify_release() { # DIR DB_CERT
 	verify_signature "$dir/boot.efi" "$cert" || return
 	verify_signature "$dir/systemd-boot.efi" "$cert" || return
 	vinfo "boot.efi and systemd-boot.efi signed by the db key"
-	cmdline=$(uki_cmdline "$dir/boot.efi")
+	cmdline=$(uki_section "$dir/boot.efi" .cmdline)
 	[[ " $cmdline " == *" lockdown=integrity "* ]] || vfail "the UKI's signed command line lacks lockdown=integrity" || return
 	for url in $(tr ' ' '\n' <<<"$cmdline" | sed -n 's/^safespace\.netroot=//p'); do
 		urls=$((urls + 1))
@@ -115,20 +138,16 @@ verify_release() { # DIR DB_CERT
 # large enough for the files.
 verify_layout() { # DIR "NAME HASH"...
 	local dir=$1 l=$1/layout.sfdisk p n h want size uuid type name half file; shift
-	uuid_of() { sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12}).*/\1-\2-\3-\4-\5/' <<<"$1"; }
-	part() { # TYPE PARTNAME KEY: a value of the partition with that type and name
-		awk -v t="$1" -v pn="$2" -v k="$3" 'toupper($0) ~ "TYPE=" t && $0 ~ "name=\"" pn "\"" {
-			n = split($0, a, ","); for (i = 1; i <= n; i++) { split(a[i], kv, "="); gsub(/ /, "", kv[1]); gsub(/[ "]/, "", kv[2]); if (kv[1] == k) print kv[2] } exit }' "$l"; }
 	[[ $(grep -c 'type=' "$l") == $((1 + 2 * $#)) ]] || vfail "layout.sfdisk: not 1 + 2 x $# partitions" || return
-	grep -qi 'type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B' "$l" || vfail "layout.sfdisk: no ESP" || return
+	[[ -n $(layout_part "$l" "$GPT_ESP" start) ]] || vfail "layout.sfdisk: no ESP" || return
 	for p in "$@"; do
 		read -r n h <<<"$p"
-		for x in "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709:root-$n:${h:0:32}:root-$n.img" "2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5:root-$n-verity:${h:32}:root-$n.verity"; do
+		for x in "$GPT_ROOT:root-$n:${h:0:32}:root-$n.img" "$GPT_VERITY:root-$n-verity:${h:32}:root-$n.verity"; do
 			IFS=: read -r type name half file <<<"$x"
-			want=$(uuid_of "$half")
-			uuid=$(part "$type" "$name" uuid | tr A-F a-f)
+			want=$(layout_uuid "$half")
+			uuid=$(layout_part "$l" "$type" uuid "$name" | tr A-F a-f)
 			[[ $uuid == "$want" ]] || vfail "layout.sfdisk: partition $name is not $want (from the root hash)" || return
-			size=$(part "$type" "$name" size)
+			size=$(layout_part "$l" "$type" size "$name")
 			[[ $size =~ ^[0-9]+$ ]] && (($(stat -c %s "$dir/$file") <= size * 512)) ||
 				vfail "layout.sfdisk: $file does not fit partition $name" || return
 		done

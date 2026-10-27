@@ -359,11 +359,8 @@ builds_write_info "$OUTDIR" build="$BUILD" version="$VERSION" combinations="${co
 	uncommitted_changes="$([[ -z $("${git[@]}" status --porcelain 2>/dev/null) ]] && echo no || echo yes)" \
 	signer="$(keys_fingerprint "$KEYS_SB_CERT")" netroot="$(IFS=,; echo "${NETROOT[*]-}")" \
 	builder="$(uname -n)" users="$USERS_FILE"
-# The release file, signed by the db key (detached CMS): a machine checks it
-# against the db.pem in its image before it updates (safespace update).
-builds_release "$OUTDIR" >"$OUTDIR/release"
-openssl cms -sign -binary -noattr -outform DER -in "$OUTDIR/release" -out "$OUTDIR/release.p7s" \
-	-signer "$KEYS_SB_DIR/db/db.pem" -inkey "$KEYS_SB_DIR/db/db.key" -md sha256 ||
+# The release file, signed by the db key (safespace update checks it).
+builds_sign_release "$OUTDIR" "$KEYS_SB_DIR/db/db.pem" "$KEYS_SB_DIR/db/db.key" ||
 	die "signing the release file with the db key failed"
 rm -rf -- "${PARTS:?}"
 # The build belongs to whoever ran sudo, so list, release.sh and prune work

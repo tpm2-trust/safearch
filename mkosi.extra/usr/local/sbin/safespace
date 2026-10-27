@@ -7,6 +7,9 @@
 #                                    preselection
 #   sudo safespace select NAME       NAME from the next boot on
 #   sudo safespace select NAME --once    NAME on the next boot only
+#                                    (another combination than the booted one, with an
+#                                    identity: asks whether to clear it too;
+#                                    --clear-identity, --keep-identity answer it)
 #   sudo safespace select --default  no preselection: the first combination
 #   sudo safespace seal [--replace]  enroll this stick's Secure Boot keys (Setup Mode)
 #   safespace identity               the machine-id, the CA, the known_hosts line, this
@@ -16,6 +19,8 @@
 #   sudo safespace tpm sha1 on|off
 #   sudo safespace update            a newer release on the server this machine booted
 #                                    from: checked, then reboot into it
+#   sudo safespace issue             the overview for the console before the login
+#                                    (/run/issue.d; safespace-issue.service at boot)
 #
 # Options where they apply: --yes (no YES asked).
 #
@@ -23,7 +28,8 @@
 #   SafespaceSelectOnce; vendor GUID 8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34); the root
 #   hash of every combination is on the UKI's signed command line, so only the names
 #   offered there can be selected. The identity stays with its combination: another
-#   one boots with aSSH's temporary host key (not the machine's).
+#   one boots with aSSH's temporary host key (not the machine's) - unless the identity
+#   is cleared with the selection, and the next boot makes a new one for it.
 #
 # seal: the machine must be in Setup Mode (firmware setup: "Reset to Setup Mode" /
 #   "Clear Secure Boot keys"). Adds this stick's KEK and db to what the firmware
@@ -57,32 +63,44 @@
 #   new UKI (checked by Secure Boot), the identity follows it unattended.
 set -Eeuo pipefail
 
+# The identity's state, the variables' names, what sshd serves: one place, the
+# login's too.
+. /usr/local/lib/safespace/state.sh
 KEYS=/usr/share/safespace/secureboot
-EFIVARS=/sys/firmware/efi/efivars
-GLOBAL=8be4df61-93ca-11d2-aa0d-00e098032b8c
 IMGSEC=d719b2cb-3d3a-4596-a3bc-dad00e67656f
-# The selection's variables (the initrd's select), and the machine-id's.
-SELECT_GUID=8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34
 # The machine's inventory ID: its machine-id, hashed for this application
 # (machine-id(5): the machine-id itself stays confidential).
 APP_ID=eda1fc8c35e94e2087addff88d0b4e91
 ASSH=/usr/bin/assh
 ASSH_CONF=/etc/assh/assh.conf
-# The CA's file: the EFI variable of assh.conf's ASSH_CA (aSSH's vendor GUID).
-CA_VAR=$EFIVARS/SAFEasshCA-24415b90-39be-45c0-a9a3-d547ebe28ea0
-MID_VAR=$EFIVARS/SAFEmachineID-$SELECT_GUID
-# The agent's files: what this boot's host key is (assh-agent.service).
-CERT=/run/assh/host-cert.pub HOSTPUB=/run/assh/host.pub STATUS=/run/assh/status
 
 die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 warn() { printf '\e[1;33m==> WARNING:\e[0m %s\n' "$*" >&2; }
+
+# The overview in colours where it reaches a terminal, and on the console
+# (issue_cmd); NO_COLOR switches them off.
+COLOUR=0
+[[ -t 1 && -z ${NO_COLOR:-} ]] && COLOUR=1
+# row LABEL STATE TEXT: one line of the overview, the label bold, the text in
+# the colour of state.sh's STATE (green, purple, noidentity: yellow, any other:
+# red; "": plain). Without a label it continues the line before.
+row() {
+	local l=${1:+$1:}
+	if ((COLOUR)); then
+		printf '\e[1m%-15s\e[0m%s%s\e[0m\n' "$l" "${2:+$(state_colour "$2")}" "$3"
+	else
+		printf '%-15s%s\n' "$l" "$3"
+	fi
+}
 usage() { sed -n '2,${/^#/!q;s/^# \?//;p}' "$0"; }
 
-ARGS=() CONFIRM=1 REPLACE=0 ONCE=0 DEFAULT_SEL=0
+ARGS=() CONFIRM=1 REPLACE=0 ONCE=0 DEFAULT_SEL=0 CLEAR_ID=ask
 while (($#)); do
 	case $1 in
 		--yes) CONFIRM=0; shift ;;
+		--clear-identity) CLEAR_ID=yes; shift ;;
+		--keep-identity) CLEAR_ID=no; shift ;;
 		--replace) REPLACE=1; shift ;;
 		--once) ONCE=1; shift ;;
 		--default) DEFAULT_SEL=1; shift ;;
@@ -120,8 +138,6 @@ efivars_rw() {
 sel_var() { [[ -r $EFIVARS/$1-$SELECT_GUID ]] && tail -c +5 "$EFIVARS/$1-$SELECT_GUID" | tr -d '\000\n' || true; }
 sel_var_rm() { local f=$EFIVARS/$1-$SELECT_GUID; [[ -e $f ]] || return 0; chattr -i "$f" 2>/dev/null || true; rm -f "$f"; }
 sel_var_write() { sel_var_rm "$1"; printf '\x07\x00\x00\x00%s' "$2" >"$EFIVARS/$1-$SELECT_GUID"; }
-# Value byte of a global UEFI variable (after the 4-byte attribute header).
-var_byte() { od -An -tu1 -j4 -N1 "$EFIVARS/$1-$GLOBAL" 2>/dev/null | tr -d ' '; }
 confirm() { # QUESTION
 	((CONFIRM)) || return 0
 	local answer
@@ -131,12 +147,12 @@ confirm() { # QUESTION
 
 # --- select ------------------------------------------------------------------------
 select_show() {
-	echo "combinations:  ${NAMES[*]}"
-	echo "booted:        $(booted)"
+	row combinations "" "${NAMES[*]}"
+	row booted "$(identity_state)" "$(booted)"
 	local p o
 	p=$(sel_var SafespaceSelect) o=$(sel_var SafespaceSelectOnce)
-	echo "preselected:   ${p:-$FIRST (none set)}"
-	[[ -z $o ]] || echo "next boot:     $o (once)"
+	row preselected "" "${p:-$FIRST (none set)}"
+	[[ -z $o ]] || row "next boot" noidentity "$o (once)"
 }
 
 select_cmd() {
@@ -164,8 +180,20 @@ select_cmd() {
 		fi
 		echo "from the next boot on: $to"
 	fi
-	if [[ -e $CA_VAR && $to != "$(booted)" ]]; then
-		echo "(the machine's identity stays with its combination: $to boots with aSSH's temporary host key)"
+	[[ -e $CA_VAR && $to != "$(booted)" ]] || return 0
+	# The identity stays with the combination it was made in, unless it goes now.
+	local answer=$CLEAR_ID
+	if [[ $answer == ask ]]; then
+		answer=no
+		if [[ -t 0 ]]; then
+			read -rp "This machine's identity stays with its combination: $to would boot with aSSH's temporary host key. Clear the identity, so the next boot makes a new one for $to (a new @cert-authority line for the clients)? [y/N] " answer
+			[[ $answer == [yY]* ]] && answer=yes || answer=no
+		fi
+	fi
+	if [[ $answer == yes ]]; then
+		identity_remove
+	else
+		echo "(the machine's identity stays with its combination: $to boots with aSSH's temporary host key; sudo safespace identity clear makes room for a new one)"
 	fi
 }
 
@@ -238,14 +266,14 @@ bank_line() {
 	b=$(banks) a=$(sha1_allowed)
 	if [[ -n $b && " $b" != *" sha256 "* ]]; then
 		case $a in
-			yes) echo "PCR bank:      sha1 (the TPM has no SHA-256 bank; allowed: safespace tpm sha1 on)" ;;
-			no) echo "PCR bank:      none: the TPM has the SHA-1 bank only, and SHA-1 is not allowed (sudo safespace tpm sha1 on)" ;;
-			*) echo "PCR bank:      sha1 only (run as root to see whether SHA-1 is allowed)" ;;
+			yes) row "PCR bank" noidentity "sha1 (the TPM has no SHA-256 bank; allowed: safespace tpm sha1 on)" ;;
+			no) row "PCR bank" none "none: the TPM has the SHA-1 bank only, and SHA-1 is not allowed (sudo safespace tpm sha1 on)" ;;
+			*) row "PCR bank" noidentity "sha1 only (run as root to see whether SHA-1 is allowed)" ;;
 		esac
 	elif [[ -n $b ]]; then
-		echo "PCR bank:      sha256"
+		row "PCR bank" green sha256
 	else
-		echo "PCR bank:      no TPM 2.0"
+		row "PCR bank" none "no TPM 2.0"
 	fi
 }
 
@@ -280,58 +308,56 @@ tpm_cmd() {
 }
 
 # --- the identity --------------------------------------------------------------------
-# The slot that certified this boot's host key ("" for none), from the agent's
-# status (readable without root).
-certified_slot() {
-	[[ -s $CERT ]] || return 0
-	sed -n 's/^slot=\([0-9]*\)$/\1/p' "$STATUS" 2>/dev/null
-}
-
 identity_show() {
 	if [[ -e $MID_VAR ]]; then
 		if grep -qx SAFEmachineID /run/safespace/identity/released 2>/dev/null; then
-			echo "machine-id:    the machine's (released in this combination); inventory ID $(systemd-id128 machine-id --app-specific=$APP_ID)"
+			row machine-id green "the machine's (released in this combination); inventory ID $(systemd-id128 machine-id --app-specific=$APP_ID)"
 		else
-			echo "machine-id:    throwaway (the machine's is sealed to another combination)"
+			row machine-id noidentity "throwaway (the machine's is sealed to another combination)"
 		fi
 	else
-		echo "machine-id:    throwaway (no identity)"
+		row machine-id noidentity "throwaway (no identity)"
 	fi
 	if [[ ! -e $CA_VAR ]]; then
-		if [[ $(var_byte SetupMode) == 0 && $(var_byte SecureBoot) == 1 ]]; then
-			echo "identity:      none yet: the next boot makes it"
+		if sealed; then
+			row identity noidentity "none yet: the next boot makes it"
 		else
-			echo "identity:      none: Secure Boot is not on (sudo safespace seal, then switch it on)"
+			row identity none "none: Secure Boot is not on (sudo safespace seal, then switch it on)"
 		fi
 	else
-		echo "identity:      the CA in this TPM (SAFEasshCA):"
-		"$ASSH" ca show --config "$ASSH_CONF" 2>&1 | sed 's/^/  /'
+		row identity green "the CA in this TPM (SAFEasshCA):"
+		# A CA that does not load is shown with aSSH's error, the overview goes on.
+		{ "$ASSH" ca show --config "$ASSH_CONF" 2>&1 || true; } | sed 's/^/  /'
 	fi
-	local slot fp
-	fp=$(ssh-keygen -lf "$HOSTPUB" 2>/dev/null | cut -d' ' -f2) || true
-	slot=$(certified_slot)
-	if [[ $slot == 0 ]]; then
-		echo "this boot:     host key ${fp:-?}, certified by the CA through slot 0 (firmware as at the creation, a build the build host signed)"
-	elif [[ -n $slot ]]; then
-		echo "this boot:     host key ${fp:-?}, certified by the CA through slot $slot: the firmware or an option ROM changed, or the UKI is not the build's - check"
-	elif [[ -s $HOSTPUB ]]; then
-		echo "this boot:     host key ${fp:-?} TEMPORARY (not certified: compare its fingerprint before trusting it)"
-		if [[ -e $CA_VAR ]]; then
-			echo "               (another combination, or Secure Boot changed: not this machine's identity)"
-		fi
-	else
-		echo "this boot:     no host key of aSSH (no TPM 2.0, or aSSH did not start: a throwaway key)"
-	fi
+	local key fp st
+	key=$(served_hostkey) st=$(identity_state)
+	fp=$(ssh-keygen -lf - <<<"$key" 2>/dev/null | cut -d' ' -f2) || true
+	case $st in
+		green) row "this boot" $st "host key ${fp:-?}, certified by the CA through slot 0 (firmware as at the creation, a build the build host signed)" ;;
+		purple) row "this boot" $st "host key ${fp:-?}, certified by the CA through slot $(certified_slot): the firmware or an option ROM changed, or the UKI is not the build's - check" ;;
+		throwaway) row "this boot" $st "host key ${fp:-?}, a throwaway one (no TPM 2.0, or aSSH did not start)" ;;
+		temporary) row "this boot" $st "host key ${fp:-?} TEMPORARY (not certified: compare its fingerprint before trusting it)"
+			row "" $st "(another combination, or Secure Boot changed: not this machine's identity)" ;;
+		*) row "this boot" $st "host key ${fp:-?} TEMPORARY (not certified: compare its fingerprint before trusting it)" ;;
+	esac
+	# In full: what ssh shows whoever connects without the CA's line.
+	row "host key" $st "${key:-none (sshd has none)}"
+}
+
+# identity_remove is identity clear without its question: the selection's too.
+identity_remove() {
+	need_root identity clear
+	need_assh
+	efivars_rw
+	"$ASSH" ca remove --config "$ASSH_CONF" || die "removing the CA failed"
+	sel_var_rm SAFEmachineID || die "could not remove SAFEmachineID"
+	log "the identity is removed. sshd serves the temporary key; the next boot with Secure Boot on makes a new one (a new @cert-authority line for the clients)"
 }
 
 identity_clear() {
 	need_root identity clear
-	need_assh
-	efivars_rw
 	confirm "Remove this machine's identity (the CA, the machine-id)? Clients that trust the CA will refuse it."
-	"$ASSH" ca remove --config "$ASSH_CONF" || die "removing the CA failed"
-	sel_var_rm SAFEmachineID || die "could not remove SAFEmachineID"
-	log "the identity is removed. sshd serves the temporary key; the next boot with Secure Boot on makes a new one (a new @cert-authority line for the clients)"
+	identity_remove
 }
 
 identity_cmd() {
@@ -372,17 +398,31 @@ update_cmd() {
 	systemctl reboot
 }
 
+# --- the console ---------------------------------------------------------------------
+# The overview where agetty shows it before the login, below /etc/issue's
+# "safespace <build> <combination> <kernel>": agetty reads /run/issue.d while
+# /etc/issue.d is not there, and takes a backslash as an escape. In colours
+# (the console is a terminal; NO_COLOR switches them off).
+issue_cmd() {
+	need_root issue
+	[[ -n ${NO_COLOR:-} ]] || COLOUR=1
+	install -d -m 0755 /run/issue.d
+	{ overview 2>&1; echo; } | sed 's/\\/\\\\/g' >/run/issue.d/.50-safespace.new
+	mv /run/issue.d/.50-safespace.new /run/issue.d/50-safespace.issue
+	agetty --reload 2>/dev/null || true
+}
+
 # --- the overview --------------------------------------------------------------------
 overview() {
 	select_show
 	local setup sb
 	setup=$(var_byte SetupMode) sb=$(var_byte SecureBoot)
 	if [[ $setup == 1 ]]; then
-		echo "Secure Boot:   Setup Mode: not sealed (sudo safespace seal)"
+		row "Secure Boot" none "Setup Mode: not sealed (sudo safespace seal)"
 	elif [[ $sb == 1 ]]; then
-		echo "Secure Boot:   on (sealed)"
+		row "Secure Boot" green "on (sealed)"
 	else
-		echo "Secure Boot:   off"
+		row "Secure Boot" none off
 	fi
 	bank_line
 	identity_show
@@ -395,5 +435,6 @@ case ${1:-} in
 	identity) shift; identity_cmd "$@" ;;
 	tpm) shift; tpm_cmd "$@" ;;
 	update) update_cmd ;;
+	issue) issue_cmd ;;
 	*) die "unknown command $1 (safespace --help)" ;;
 esac

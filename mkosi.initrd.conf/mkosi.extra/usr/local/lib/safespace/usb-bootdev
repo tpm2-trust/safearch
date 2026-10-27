@@ -33,7 +33,6 @@ TIMEOUT=30
 msg() { echo "usb-bootdev: $*" >/dev/kmsg; }
 
 cmdline=$(cat /proc/cmdline)
-arg() { printf '%s\n' "$cmdline" | tr ' ' '\n' | sed -n "s/^$1=//p" | tail -n 1; }
 
 # Which root: the selected combination's (select, next to this script).
 . "${0%/*}/select"

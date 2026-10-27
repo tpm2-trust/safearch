@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Boot a usb build in QEMU as a USB stick (xHCI + usb-storage, like real
+# Boot a build in QEMU as a USB stick (xHCI + usb-storage, like real
 # hardware), with OVMF. The stick image is assembled from the build's parts
 # (lib/stick.sh, as burn.sh writes a stick) and opened with snapshot=on.
 #
@@ -64,6 +64,9 @@
 set -Eeuo pipefail
 
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# The partition table's helpers (layout_part, GPT_ESP).
+# shellcheck source=lib/verify.sh
+source "$HERE/lib/verify.sh"
 die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 
@@ -134,7 +137,7 @@ elif ((NETBOOT)); then
 	host=${hostport%%:*}; port=${hostport##*:}
 	[[ $port == "$host" ]] && port=80
 	[[ $host == 10.0.2.2 ]] ||
-		die "this UKI loads its root from $host, which the VM cannot reach: QEMU's user network is the host at 10.0.2.2. Rebuild with: sudo ./build.sh network --url http://10.0.2.2:8000/"
+		die "this UKI loads its root from $host, which the VM cannot reach: QEMU's user network is the host at 10.0.2.2. Rebuild with: sudo ./build.sh --url http://10.0.2.2:8000/"
 	((port >= 1024)) || die "port $port would need root for the test server; rebuild with e.g. --url http://10.0.2.2:8000/"
 	ls "$BOOTDIR"/root*.img >/dev/null 2>&1 || die "no root image in $BOOTDIR"
 	# The root image is about as large as the system itself and is downloaded
@@ -198,7 +201,7 @@ if ((SB)); then
 	command -v virt-fw-vars >/dev/null || die "virt-fw-vars missing (pacman -S virt-firmware)"
 	if ((!NETBOOT)); then
 		uki=$WORK/uki.efi
-		mcopy -n -i "$RAW@@$(($(sfdisk -d "$RAW" | awk -F'[=,]' '/type=C12A7328/ { print $2 }') * 512))" \
+		mcopy -n -i "$RAW@@$(($(layout_part <(sfdisk -d "$RAW") "$GPT_ESP" start) * 512))" \
 			::/EFI/BOOT/BOOTX64.EFI "$uki" 2>/dev/null || die "cannot read the UKI from the ESP (mtools installed?)"
 	fi
 	# Certificate table (PE data directory 4) -> PKCS#7 -> signer certificate.

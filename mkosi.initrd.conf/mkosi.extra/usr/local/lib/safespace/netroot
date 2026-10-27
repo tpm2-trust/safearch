@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runs in mkosi's default initrd of the network variant (bash as sh, coreutils,
+# Runs in the initrd of a network boot (bash as sh, coreutils,
 # sed, kmod, curl, veritysetup), started by netroot.service. It downloads the
 # root image and its dm-verity hash tree into a tmpfs and opens them as
 # /dev/mapper/root, which the signed kernel command line names as root=.

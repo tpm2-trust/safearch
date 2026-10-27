@@ -1,0 +1,17 @@
+# The console before the login: below /etc/issue's "safespace <build>
+# <combination> <kernel>" the whole safespace overview - the combinations,
+# Secure Boot, the TPM, the identity and the host key sshd serves in full (what
+# ssh shows whoever connects without the CA's line). Written once the host key
+# is decided (assh-agent, else sshd-hostkeys' throwaway key); agetty shows it
+# again (--reload).
+[Unit]
+Description=safespace: the overview on the console before the login
+After=sshd-hostkeys.service assh-agent.service sys-firmware-efi-efivars.mount
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/safespace issue
+
+[Install]
+WantedBy=multi-user.target

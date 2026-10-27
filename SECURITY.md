@@ -144,7 +144,7 @@ sequenceDiagram
 | **The TPM is closed** after unsealing: PCR 15 is extended with `safespace-identity:sealed`, always (also on errors, `trap`) | a second unseal in the same boot, even in the initrd | `identity` |
 | **The released machine-id lives in RAM only**: `/run/safespace/identity/` (0700 root) and `/run/machine-id` (PID 1 takes it over) | the secret on any medium | `identity` |
 | **Updates are checked before the reboot**: `safespace update` (network-booted machines) fetches `release` and `release.p7s` from the server on the signed command line and checks the signature against the image's `db.pem` (the db key signs it at the build: `build.sh`), wants a newer version that has the booted combination, then reboots; the firmware checks the new UKI anyway, the agent the build's signature of PCR 11 | rebooting into whatever a server offers | `safespace`, `build.sh`, `lib/verify.sh` |
-| **SHA-1 only where the owner allows it**: on a TPM whose firmware activates no SHA-256 PCR bank (ThinkPad T450s) the machine-id and the host key are bound to SHA-1 values only while `safespace tpm sha1 on` has set aSSH's NV index `0x01802914` - read at every boot by the initrd (`tpm2 nvreadpublic`, its exact attributes) and the agent (`ASSH_CA_BANK=auto`); off, neither is released or certified. Where SHA-256 is active it changes nothing (see [The SHA-1 bank](#the-sha-1-bank)) | binding the identity to the weaker hash without the owner's decision | `identity`, `assh.conf`, `safespace` |
+| **SHA-1 only where the owner allows it**: on a TPM whose firmware activates no SHA-256 PCR bank (ThinkPad T450s) the machine-id and the host key are bound to SHA-1 values only while `safespace tpm sha1 on` has set aSSH's NV index `0x01802914` - read at every boot by aSSH, for the initrd (`assh tpm sha1`: "bank auto") and the agent (`ASSH_CA_BANK=auto`) alike, its exact shape checked; off, neither is released or certified. Where SHA-256 is active it changes nothing (see [The SHA-1 bank](#the-sha-1-bank)) | binding the identity to the weaker hash without the owner's decision | `identity`, `assh.conf`, `safespace` |
 | **The boot never depends on the TPM**: no TPM, no identity, no signature, any error → no identity (temporary or throwaway key, throwaway machine-id), the boot goes on | a TPM fault making the machine unusable | `identity`, `assh-agent.service`, `sshd-hostkeys.service` |
 
 **What root of the identity's combination can do** (the same in every design): use the host
@@ -153,7 +153,7 @@ key until the next reboot, on this machine only (the agent answers root); delete
 is another CA. Never move it, never approve another state: there is no authority left.
 
 **The trade-offs:** every UKI the build host's PCR key signed meets slot 0, an old one too
-(with a PIN-approved slot it met slot 1 anyway). A firmware update leaves slot 0 for good:
+(it meets slot 1 anyway). A firmware update leaves slot 0 for good:
 purple until the identity is made again, with a new client line.
 
 ### The SHA-1 bank
@@ -236,9 +236,7 @@ measure it (`.linux\0`, the section's content, `enter-initrd`; checked equal to
 | Late extend: initrd measured nothing, after `leave-initrd` the root extends `containers` — with an **all-phase** signature | **unsealed** (why the identity key exists) |
 | … with an **enter-initrd-only** signature (also after `sysinit`, `ready`) | refused |
 
-**QEMU (2026-10-27, `tests/vm.sh` run-20261027-003838: 44 of 45 checks passed, the one
-failure in the test itself - a login checked before the CA line was fetched - fixed;
-`tests/vm.sh identity` run-20261027-005633 then: all 37 passed).** Test
+**QEMU (2026-10-27, `tests/vm.sh` run-20261027-143631: all 46 checks passed).** Test
 builds A and B (combinations `root`, `containers`; B the same configuration a few minutes
 later, so another UKI and PCR 11), booted with `test-vm.sh --tpm` (swtpm as a TPM 2.0 with CRB
 interface, like Intel PTT; its state and the firmware variables kept across boots), from the
@@ -257,7 +255,9 @@ yes`) logs in or is refused in every boot.
 | An option ROM more (an e1000e NIC: PCR 2) | slot 1 (`safespace slot=1 pcrs=7,15`), the login purple |
 | Another certificate added to db (`virt-fw-vars --add-db`: PCR 7) | temporary key, machine-id not released, nothing made |
 | **The stick of build B** (an update) | **slot 0 with no step**, the same CA (the client logs in) and machine-id |
-| `safespace identity clear`, then a boot | the next boot makes a new identity: a new CA (the old line refused), a new machine-id, slot 0 |
+| `safespace select containers` without a terminal | the identity stays (`select` asks only on a terminal) |
+| `safespace select containers --clear-identity`, back to `root`, then a boot | the identity removed; the next boot makes a new one: a new CA (the old line refused), a new machine-id, slot 0 |
+| The console before the login (`agetty --show-issue`), certified and temporary | the `safespace` overview with the host key sshd serves in full |
 | `SAFEasshCA` damaged (the agent fails) | sshd up with a throwaway key; the console says why |
 | A new TPM with the SHA-1 bank only | nothing made, the temporary key; `safespace tpm sha1 on`, a boot: the identity made on SHA-1, slot 0; `tpm sha1 off`: neither released nor certified |
 | **`safespace update`** on a network-booted machine (the identity made in that boot path) | "up to date" while the server has A; with B in the share: B's `release` checked against `db.pem`, reboot; B's boot slot 0, the same CA and machine-id |
@@ -273,7 +273,10 @@ first sealed boot makes both at once (the root's PCR 15 ahead) and releases the 
 the CA failing takes the machine-id with it; one variable without the other: nothing made;
 nothing with Secure Boot off, in Setup Mode or without a measured combination (PCR 15 closed
 all the same); another combination: not released, nothing made; a credential with the plain
-type, or one that unseals without a signature: nothing made; SHA-1 only with the flag.
+type, or one that unseals without a signature: nothing made; SHA-1 only where aSSH says
+bank sha1 (none: nothing made, PCR 15 closed); no `pcr.pem` in the initrd: nothing made.
+The login's and `safespace`'s state (`state.sh`) for all six cases, the host key sshd
+serves (aSSH's or the throwaway one), the variables named as the initrd names them.
 `compose_check`: the identity signature for `enter-initrd` alone, per bank; both keys in the
 initrd. A release file changed after the build is refused (its db signature).
 

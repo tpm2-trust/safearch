@@ -23,13 +23,9 @@
 #   3. the dm-verity hash trees and the root partitions, byte for byte
 # No root needed for an image file; a device needs root, like any write to it.
 
-# start and size (512-byte sectors) of a partition of layout.sfdisk by type
-stick_part() { # LAYOUT TYPE-GUID
-	awk -F'[=,]' -v t="$2" 'toupper($0) ~ "TYPE=" t { gsub(/ /, ""); print $2, $4; exit }' "$1"
-}
-STICK_ESP=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
-STICK_ROOT=4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709
-STICK_VERITY=2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5
+# The partition table's helpers (layout_part, GPT_ESP).
+# shellcheck source=lib/verify.sh
+source "${BASH_SOURCE[0]%/*}/verify.sh"
 
 stick_bytes() { # SRC
 	local last
@@ -58,8 +54,8 @@ stick_write() { # TARGET SRC [FETCH]
 	for f in layout.sfdisk systemd-boot.efi boot.efi; do
 		[[ -f $src/$f ]] || die "$src/$f missing (not a build or release)"
 	done
-	esp=$(stick_part "$layout" "$STICK_ESP")
-	[[ -n $esp ]] || die "$layout: no ESP"
+	esp="$(layout_part "$layout" "$GPT_ESP" start) $(layout_part "$layout" "$GPT_ESP" size)"
+	[[ $esp != " " ]] || die "$layout: no ESP"
 	files=$(stick_files "$src")
 	[[ -n $files ]] || die "$layout: no root partitions"
 	while read -r f start size; do

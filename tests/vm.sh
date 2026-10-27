@@ -253,6 +253,14 @@ fi
 SSH=(ssh -i "$REPO/$VM/id_ed25519" -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=no
 	-o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=error -o ConnectTimeout=5)
 SELECT_GUID=8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34
+# A firmware variable (attributes NV, BS, RT) written into a copy of the
+# firmware's variable store (virt-fw-vars), as select or a damaged identity
+# leaves it.
+fw_var_set() { # IN OUT NAME GUID VALUE LOG
+	printf '{"version":2,"variables":[{"name":"%s","guid":"%s","attr":7,"data":"%s"}]}\n' \
+		"$3" "$4" "$(printf %s "$5" | od -An -tx1 | tr -d ' \n')" >"$2.json"
+	virt-fw-vars -i "$1" -o "$2" --set-json "$2.json" >"$6" 2>&1
+}
 VM_PID="" PORT="" WORK=""
 free_port() { python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
 vm_ssh() { "${SSH[@]}" -p "$PORT" tester@127.0.0.1 "$@"; }
@@ -319,6 +327,7 @@ echo state=$(systemctl is-system-running)
 echo failed=$(systemctl --failed --no-legend --plain | wc -l)
 echo combination=$(sudo dmesg | sed -n "s/.*\(usb-bootdev\|netroot\): combination \([a-z0-9-]*\) .*/\2/p" | tail -1)
 command -v docker >/dev/null && echo docker=yes || echo docker=no
+docker compose version >/dev/null 2>&1 && echo compose=yes || echo compose=no
 echo groups=$(cat /usr/lib/safespace/groups)
 # The name the system shows (spaces as _): os-release, the console login banner.
 echo named=$(cat /usr/lib/safespace/combination)
@@ -345,13 +354,13 @@ echo lockdown=$(sudo cat /sys/kernel/security/lockdown | sed -n "s/.*\[\(.*\)\].
 echo secure_boot=$(bootctl status 2>/dev/null | sed -n "s/^ *Secure Boot: *//p" | head -1 | tr " " _)
 # The machine identity (step identity): the host key sshd serves (aSSH'"'"'s, or a
 # throwaway one without a TPM), whether the CA certified it and through which slot,
-# the machine-id, the slots the initrd released ("released" list), whether it
+# the machine-id, what the initrd released ("released" list), whether it
 # created one this boot.
 hk=$(sed -n "s/^HostKey //p" /run/safespace/sshd-hostkey.conf 2>/dev/null | head -1)
 echo hostkey=$(sudo ssh-keygen -lf "$hk" 2>/dev/null | cut -d" " -f2)
 case $hk in /run/assh/*) echo hostkey_src=assh ;; /var/lib/sshd/*) echo hostkey_src=throwaway ;; *) echo hostkey_src=none ;; esac
 [ -s /run/assh/host-cert.pub ] && echo hostcert=yes || echo hostcert=no
-echo assh_slot=$(sudo journalctl -b -u assh-agent -o cat | sed -n "s/.* through slot \([0-9]*\)\$/\1/p" | tail -1)
+echo assh_slot=$(sed -n "s/^slot=//p" /run/assh/status 2>/dev/null)
 echo machine_id=$(cat /etc/machine-id)
 # The PCR values the agent recorded at its start (which slot 0 PCR differs between boots).
 echo pcrs=$(sudo cat /run/assh/agent.pcrs.json 2>/dev/null | tr -d " \n")
@@ -361,6 +370,12 @@ echo identity_created=$(sudo dmesg | grep -c "safespace-identity: the identity i
 # certificate served (the slot it was certified through).
 echo login=$(script -qc "bash -lic true" /dev/null 2>/dev/null | head -1 | sed "s/\x1b\[[0-9;]*m//g" | tr -d "\r" | tr " " _)
 echo cert_id=$(ssh-keygen -Lf /run/assh/host-cert.pub 2>/dev/null | sed -n "s/.*Key ID: \"\(.*\)\"/\1/p" | tr " " _)
+# The console before the login (safespace-issue.service, as agetty shows it):
+# the overview, and the host key sshd serves in full.
+case $hk in *.pub) pub=$hk ;; *) pub=$hk.pub ;; esac
+iss=$(script -qc "agetty --show-issue" /dev/null | tr -d "\r" | sed "s/\x1b\[[0-9;]*m//g")
+echo issue_overview=$(printf "%s\n" "$iss" | grep -c "^combinations:")
+printf "%s\n" "$iss" | grep -qxF "host key:      $(sudo cut -d" " -f1,2 "$pub" 2>/dev/null)" && echo issue_hostkey=yes || echo issue_hostkey=no
 # The TPM'"'"'s active PCR banks (sysfs).
 echo tpm_banks=$(cd /sys/class/tpm/tpm0 2>/dev/null && ls -d pcr-* 2>/dev/null | sed "s/^pcr-//" | tr "\n" , | sed "s/,\$//")
 '
@@ -445,11 +460,11 @@ step_seal() {
 
 # What a combination must look like from inside: its name (the initrd's and
 # the root's own, os-release, the login banner), its groups, the docker command
-# exactly with the docker group.
+# and Docker Compose exactly with the docker group.
 looks() { # "name:group+group"
 	local n=${1%%:*} g=${1#*:} d=no
 	[[ +$g+ == *+docker+* ]] && d=yes
-	echo "combination=$n" "named=$n" "pretty=safespace_${VERSION}_$n" "issue=safespace_${VERSION}_${n}_*" "groups=${g//+/,}" "docker=$d"
+	echo "combination=$n" "named=$n" "pretty=safespace_${VERSION}_$n" "issue=safespace_${VERSION}_${n}_*" "groups=${g//+/,}" "docker=$d" "compose=$d"
 }
 # sel_boot NAME COMBO COMMAND-AFTER: boot the stick on the step's sealed
 # variables, check, run a command, power off
@@ -490,9 +505,7 @@ step_select() {
 # variable.
 step_select_once() { # INDEX
 	local combo=${COMBOS[$1]} n=${COMBOS[$1]%%:*}
-	printf '{"version":2,"variables":[{"name":"SafespaceSelectOnce","guid":"%s","attr":7,"data":"%s"}]}\n' \
-		"$SELECT_GUID" "$(printf %s "$n" | od -An -tx1 | tr -d ' \n')" >"$WORK/select-once.json"
-	if ! virt-fw-vars -i "$RUN/sealed-vars.fd" -o "$WORK/sealed-vars.fd" --set-json "$WORK/select-once.json" >"$LOGS/select-$n.vars.log" 2>&1; then
+	if ! fw_var_set "$RUN/sealed-vars.fd" "$WORK/sealed-vars.fd" SafespaceSelectOnce "$SELECT_GUID" "$n" "$LOGS/select-$n.vars.log"; then
 		result FAIL "select-$n" "could not write SafespaceSelectOnce (see ${LOGS#"$REPO"/}/select-$n.vars.log)"
 		return
 	fi
@@ -503,11 +516,10 @@ step_select_once() { # INDEX
 # test-vm.sh --tpm: its state stays in the step's work directory, like a real TPM)
 # and a copy of the sealed firmware of seal. The initrd makes it at the first sealed
 # boot, all at once; nothing approves anything after.
-ID_GUID=8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34
 # From the running root: unseal the machine-id with the UKI's signatures, then again
 # after extending PCR 15 with NAME (what an attacker in another combination does).
 id_attack() { # NAME
-	vm_ssh 'sudo sh -c "tail -c +5 /sys/firmware/efi/efivars/SAFEmachineID-'"$ID_GUID"'" >/tmp/id.cred
+	vm_ssh 'sudo sh -c "tail -c +5 /sys/firmware/efi/efivars/SAFEmachineID-'"$SELECT_GUID"'" >/tmp/id.cred
 		try() { sudo systemd-creds decrypt --tpm2-signature=/run/systemd/tpm2-pcr-signature.json --name=safespace-machine-id /tmp/id.cred - >/dev/null 2>&1 && echo yes || echo no; }
 		echo unsealed=$(try)
 		sudo /usr/lib/systemd/systemd-pcrextend --pcr=15 "safespace-combination:'"$1"'" >/dev/null 2>&1
@@ -573,7 +585,7 @@ step_identity() {
 	{ vm_ssh 'echo ssh_after_restart=yes' 2>/dev/null || echo ssh_after_restart=no; ca_login | sed 's/^/restart_/'; } >"$LOGS/identity-restart.probe"
 	vm_stop identity-certified
 	cat "$LOGS/identity-certified.attack" >>"$LOGS/identity-certified.probe"
-	expect identity-certified combination="$first" identity=SAFEmachineID identity_created=0 hostkey_src=assh hostcert=yes assh_slot=0 cert_id=$ID_SLOT0 ca_login=yes unsealed=no unsealed_extended=no "${SEALED[@]}"
+	expect identity-certified combination="$first" identity=SAFEmachineID identity_created=0 hostkey_src=assh hostcert=yes assh_slot=0 cert_id=$ID_SLOT0 ca_login=yes unsealed=no unsealed_extended=no issue_overview=1 issue_hostkey=yes "${SEALED[@]}"
 	id_check identity-certified "the same machine-id" "[[ '$(val identity-certified machine_id)' == '$mid' ]]"
 	id_check identity-restart "an agent restart in the same boot: temporary (window closed), sshd with it, the first start's state kept" "grep -q 'TEMPORARY' '$LOGS/identity-restart.log' && grep -q 'PCR 15 not as approved' '$LOGS/identity-restart.log' && grep -q 'stays in /run/assh/agent.pcrs.json' '$LOGS/identity-restart.log' && [[ \$(grep -E '^[0-9a-f]{64}' '$LOGS/identity-restart.log' | wc -l) == 2 && \$(grep -E '^[0-9a-f]{64}' '$LOGS/identity-restart.log' | sort -u | wc -l) == 1 ]] && grep -qx ssh_after_restart=yes '$LOGS/identity-restart.probe' && grep -qx restart_ca_login=no '$LOGS/identity-restart.probe'"
 	echo "$mid" >"$WORK/mid"
@@ -595,7 +607,7 @@ step_identity_other() {
 	id_attack "$first" >"$LOGS/identity-$other.attack" 2>&1
 	vm_stop "identity-$other"
 	cat "$LOGS/identity-$other.attack" >>"$LOGS/identity-$other.probe"
-	expect "identity-$other" combination="$other" identity= identity_created=0 hostkey_src=assh hostcert=no assh_slot= ca_login=no unsealed=no unsealed_extended=no "${SEALED[@]}"
+	expect "identity-$other" combination="$other" identity= identity_created=0 hostkey_src=assh hostcert=no assh_slot= ca_login=no unsealed=no unsealed_extended=no issue_overview=1 issue_hostkey=yes "${SEALED[@]}"
 	id_check "identity-$other" "another machine-id" "[[ '$(val "identity-$other" machine_id)' != '$mid' ]]"
 	id_check "identity-$other" "the login says TEMPORARY host key" "grep -q '^login=$other:_TEMPORARY_host_key' '$LOGS/identity-$other.probe'"
 }
@@ -653,12 +665,17 @@ step_identity_clear() {
 	local first other mid old
 	id_names
 	id_branch || return
-	# 8. Cleared in the certified default: safespace identity says the next boot
-	# makes it; the next boot makes a new one - a new CA (the old line refused) and a
-	# new machine-id - certified at once.
+	# 8. Cleared in the certified default, with the selection of another combination:
+	# without a terminal select keeps the identity (it asks only there), with
+	# --clear-identity it removes it; back to the default, safespace identity says
+	# the next boot makes it; the next boot makes a new one - a new CA (the old line
+	# refused) and a new machine-id - certified at once.
 	old=$(cat "$WORK/ca_known_hosts")
 	id_boot identity-clear "$STICK" || return
-	id_run identity-clear-run "identity clear" "the identity is removed" vm_ssh "sudo safespace identity clear --yes"
+	id_run identity-select-keep "select $other without a terminal: the identity stays" "the machine's identity stays with its combination" \
+		vm_ssh "sudo safespace select $other </dev/null && test -e /sys/firmware/efi/efivars/SAFEasshCA-24415b90-39be-45c0-a9a3-d547ebe28ea0 && echo CA kept"
+	id_run identity-clear-run "select $other --clear-identity: the identity goes" "the identity is removed" \
+		vm_ssh "sudo safespace select $other --clear-identity && sudo safespace select $first"
 	vm_ssh 'sudo safespace identity; ls /sys/firmware/efi/efivars | grep -c -E "^(SAFEasshCA|SAFEmachineID)-" || true' >"$LOGS/identity-clear.out" 2>&1
 	vm_stop identity-clear
 	id_check identity-clear "nothing left of the identity: the next boot makes it" "grep -q 'identity:      none yet: the next boot makes it' '$LOGS/identity-clear.out' && tail -1 '$LOGS/identity-clear.out' | grep -qx 0"
@@ -677,10 +694,8 @@ step_identity_fails() {
 	id_branch || return
 	# 9. The agent fails (SAFEasshCA damaged, written into the firmware variables):
 	# sshd still comes up, with the throwaway key, and says why.
-	printf '{"version":2,"variables":[{"name":"SAFEasshCA","guid":"24415b90-39be-45c0-a9a3-d547ebe28ea0","attr":7,"data":"%s"}]}\n' \
-		"$(printf %s '{broken' | od -An -tx1 | tr -d ' \n')" >"$WORK/broken.json"
 	cp "$WORK/sealed-vars.fd" "$WORK/sealed-vars.ok"
-	virt-fw-vars -i "$WORK/sealed-vars.ok" -o "$WORK/sealed-vars.fd" --set-json "$WORK/broken.json" >"$LOGS/identity-broken.vars.log" 2>&1 ||
+	fw_var_set "$WORK/sealed-vars.ok" "$WORK/sealed-vars.fd" SAFEasshCA 24415b90-39be-45c0-a9a3-d547ebe28ea0 '{broken' "$LOGS/identity-broken.vars.log" ||
 		{ result FAIL identity-agent-fails "could not damage SAFEasshCA (see ${LOGS#"$REPO"/}/identity-broken.vars.log)"; return; }
 	id_boot identity-agent-fails "$STICK" || return
 	vm_ssh 'sudo journalctl -b -u sshd-hostkeys -u assh-agent -o cat' >"$LOGS/identity-agent-fails.journal" 2>&1
@@ -756,9 +771,7 @@ step_update() {
 id_boot_once() { # NAME COMBINATION
 	local n=$1
 	cp "$WORK/sealed-vars.fd" "$WORK/sealed-vars.once"
-	printf '{"version":2,"variables":[{"name":"SafespaceSelectOnce","guid":"%s","attr":7,"data":"%s"}]}\n' \
-		"$SELECT_GUID" "$(printf %s "$2" | od -An -tx1 | tr -d ' \n')" >"$WORK/once.json"
-	virt-fw-vars -i "$WORK/sealed-vars.once" -o "$WORK/sealed-vars.fd" --set-json "$WORK/once.json" >"$LOGS/$n.vars.log" 2>&1 ||
+	fw_var_set "$WORK/sealed-vars.once" "$WORK/sealed-vars.fd" SafespaceSelectOnce "$SELECT_GUID" "$2" "$LOGS/$n.vars.log" ||
 		{ result FAIL "$n" "could not write SafespaceSelectOnce (see ${LOGS#"$REPO"/}/$n.vars.log)"; return 1; }
 	id_boot "$n" "$STICK"
 }

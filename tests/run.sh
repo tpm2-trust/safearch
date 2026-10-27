@@ -160,7 +160,7 @@ if wanted groups; then
 			python3 -I -c 'import json, sys; print(" ".join(json.load(sys.stdin)["Images"][-1]["Packages"]))'; }
 		base=$(pk) all=$(pk --profile=xfce4-headless-vnc --profile=docker) dbg=$(pk --profile=debug)
 		check "base: no desktop, no docker, no debug tools; btrfs-progs" bash -c '[[ " $1 " != *" xfce4 "* && " $1 " != *" docker "* && " $1 " != *" tcpdump "* && " $1 " == *" openssh "* && " $1 " == *" btrfs-progs "* ]]' _ "$base"
-		check "xfce4-headless-vnc + docker add theirs" bash -c '[[ " $1 " == *" xfce4 "* && " $1 " == *" docker "* && " $1 " == *" tigervnc "* ]]' _ "$all"
+		check "xfce4-headless-vnc + docker add theirs (docker with docker-compose)" bash -c '[[ " $1 " == *" xfce4 "* && " $1 " == *" docker "* && " $1 " == *" docker-compose "* && " $1 " == *" tigervnc "* ]]' _ "$all"
 		check "debug adds its tools" bash -c '[[ " $1 " == *" tcpdump "* && " $1 " == *" kexec-tools "* && " $1 " != *" docker "* ]]' _ "$dbg"
 		check "firmware by package: Intel, AMD GPU, Realtek, both microcodes; no meta package, nothing else" bash -c '
 			for p in linux-firmware-intel linux-firmware-amdgpu linux-firmware-realtek intel-ucode amd-ucode; do [[ " $1 " == *" $p "* ]] || exit 1; done
@@ -291,8 +291,8 @@ if wanted server && shared; then
 	h=$(cat "$SHARE/roothash-root")
 	tamper "a single-root UKI (roothash=, no safespace.root.*), signed by the db key" "set -- \$1 'roothash=$h systemd.volatile=state lockdown=integrity'; $resign"
 	tamper "a UKI without lockdown=integrity, signed by the db key" "set -- \$1 'systemd.volatile=state $(grep -o 'safespace\.root\.[^ ]*' "$SHARE/cmdline" | tr '\n' ' ')'; $resign"
-	tamper "a partition table with another root partition UUID" 'sed -i "/4F68BCE3/s/uuid=[0-9A-F-]*/uuid=11111111-2222-3333-4444-555555555555/" $1/layout.sfdisk; '"$resum"
-	tamper "a partition too small for the root image" 'sed -i "/4F68BCE3/s/size= *[0-9]*/size=8/" $1/layout.sfdisk; '"$resum"
+	tamper "a partition table with another root partition UUID" 'sed -i "/'"$GPT_ROOT"'/s/uuid=[0-9A-F-]*/uuid=11111111-2222-3333-4444-555555555555/" $1/layout.sfdisk; '"$resum"
+	tamper "a partition too small for the root image" 'sed -i "/'"$GPT_ROOT"'/s/size= *[0-9]*/size=8/" $1/layout.sfdisk; '"$resum"
 	tamper "a file not in SHA256SUMS" 'echo x >$1/extra'
 	tamper "a broken transfer" 'truncate -s 1M $1/root-root.img'
 	check "status says BROKEN" bash -c '"$1" status | grep -q BROKEN' _ "$NB"
@@ -578,20 +578,12 @@ if wanted compose && fixtures; then
 	STUB
 	chmod +x "$CS"
 	echo good >"$W/sig-good.json"; echo bad >"$W/sig-bad.json"
-	# The TPM's active banks (sysfs), and tpm2 nvreadpublic of aSSH's SHA-1 flag:
-	# printed as tpm2-tools does while $W/sha1-flag holds its attributes value.
-	mkdir -p "$W/tpm-sha256/pcr-sha256" "$W/tpm-sha256/pcr-sha1" "$W/tpm-sha1/pcr-sha1"
-	cat >"$W/tpm2-stub" <<-STUB
-		#!/bin/bash
-		[[ \$1 == nvreadpublic && \$2 == 0x01802914 && -s $W/sha1-flag ]] || exit 1
-		printf '0x1802914:\\n  name: 000b0c8a\\n  hash algorithm:\\n    friendly: sha256\\n    value: 0xB\\n  attributes:\\n    friendly: ownerwrite|ownerread|no_da|written\\n    value: %s\\n  size: 1\\n\\n' "\$(cat $W/sha1-flag)"
-	STUB
-	chmod +x "$W/tpm2-stub"
-	rm -f "$W/sha1-flag"
-	# aSSH: ca create writes SAFEasshCA (STUB_ASSH_FAIL=1: fails), ca remove deletes
-	# it; the arguments go to $W/assh.log.
+	# aSSH: tpm sha1 says the bank auto resolves to (STUB_BANK, default sha256); ca
+	# create writes SAFEasshCA (STUB_ASSH_FAIL=1: fails), ca remove deletes it; the
+	# arguments of ca commands go to $W/assh.log.
 	cat >"$W/assh-stub" <<-STUB
 		#!/bin/bash
+		[[ "\$1 \$2" == "tpm sha1" ]] && { echo "bank auto: \${STUB_BANK:-sha256}"; exit 0; }
 		echo "\$*" >>"$W/assh.log"
 		v=$EV/SAFEasshCA-24415b90-39be-45c0-a9a3-d547ebe28ea0
 		case "\$1 \$2" in
@@ -606,18 +598,20 @@ if wanted compose && fixtures; then
 		printf '\x06\x00\x00\x00\x0'"$2" >"$EV/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
 		printf '\x06\x00\x00\x00\x0'"$3" >"$EV/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c"
 		[[ -z $1 ]] || echo "$1" >"$IR/run/combination"
-		env SAFESPACE_TPM_SYSFS="$W/tpm-sha256" SAFESPACE_TPM2="$W/tpm2-stub" "${@:5}" \
+		env "${@:5}" \
 			SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$IR/run SAFESPACE_PCREXTEND=$PX SAFESPACE_CREDS=$CS \
-			SAFESPACE_ASSH="$W/assh-stub" SAFESPACE_PCRKEY="$W/pcr-key.pem" \
+			SAFESPACE_ASSH="$W/assh-stub" \
 			SAFESPACE_IDENTITY_KEY=/dev/null SAFESPACE_PCRSIG=$4 SAFESPACE_MACHINE_ID=$IR/machine-id \
-			sh "$ID" 2>"$IR/log"
+			sh "$IDB/identity" 2>"$IR/log"
 	}
-	echo key >"$W/pcr-key.pem"
-	slot() { tail -c +5 "$EV/$1-$SG" 2>/dev/null | sha256sum | cut -c1-16; }
+	# The initrd's directory: identity, select, and pcr.pem as compose appends it.
+	IDB=$W/id-bin
+	mkdir -p "$IDB" && cp "$ID" "${ID%/*}/select" "$IDB/" && echo key >"$IDB/pcr.pem"
+	var_hash() { tail -c +5 "$EV/$1-$SG" 2>/dev/null | sha256sum | cut -c1-16; }
 	t_id_first() {
 		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" &&
 			[[ -e $EV/SAFEmachineID-$SG && -e $EV/$CAV ]] &&
-			[[ $(cat "$W/assh.log") == "ca create --config /etc/assh/assh.conf --pcr-key $W/pcr-key.pem --events 15:safespace-combination:containers --events 15:safespace-identity:sealed" ]] &&
+			[[ $(cat "$W/assh.log") == "ca create --config /etc/assh/assh.conf --events 15:safespace-combination:containers --events 15:safespace-identity:sealed" ]] &&
 			[[ -s $IR/machine-id ]] && cmp -s "$IR/machine-id" "$IR/run/identity/machine-id" &&
 			[[ $(cat "$IR/run/identity/released") == SAFEmachineID ]] &&
 			[[ $(tail -1 "$W/pcrextend.log") == "--graceful --pcr=15 safespace-identity:sealed" ]]
@@ -629,9 +623,9 @@ if wanted compose && fixtures; then
 	check "identity: Setup Mode: nothing made" t_id_setup
 	t_id_other() {
 		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" || return 1
-		local h=$(slot SAFEmachineID)
+		local h=$(var_hash SAFEmachineID)
 		t_id root 1 0 "$W/sig-bad.json"
-		[[ ! -e $IR/machine-id && $(slot SAFEmachineID) == "$h" && ! -e $W/assh.log ]] && grep -q 'identity:sealed' "$W/pcrextend.log"
+		[[ ! -e $IR/machine-id && $(var_hash SAFEmachineID) == "$h" && ! -e $W/assh.log ]] && grep -q 'identity:sealed' "$W/pcrextend.log"
 	}
 	check "identity: another combination: not released, nothing made, PCR 15 closed" t_id_other
 	t_id_update() { rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" && cp "$IR/machine-id" "$W/mid1" && t_id containers 1 0 "$W/sig-good.json" && cmp -s "$IR/machine-id" "$W/mid1" && [[ ! -e $W/assh.log ]]; }
@@ -660,40 +654,80 @@ if wanted compose && fixtures; then
 	t_id_swap() {
 		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" || return 1
 		echo 0123456789abcdef0123456789abcdef >"$W/other"
-		"$CS" encrypt --with-key=tpm2-with-public-key --name=safespace-ssh-host-key "$W/other" "$W/other.cred" &&
+		"$CS" encrypt --with-key=tpm2-with-public-key --name=safespace-other "$W/other" "$W/other.cred" &&
 			{ printf '\x07\x00\x00\x00'; cat "$W/other.cred"; } >"$EV/SAFEmachineID-$SG"
 		t_id containers 1 0 "$W/sig-good.json"
 		[[ ! -e $IR/machine-id ]]
 	}
 	check "identity: a credential of another name in SAFEmachineID is not released" t_id_swap
 	t_id_sha1_off() {
-		rm -rf "$EV" "$W/sha1-flag"
-		t_id containers 1 0 "$W/sig-good.json" SAFESPACE_TPM_SYSFS="$W/tpm-sha1"
+		rm -rf "$EV"
+		t_id containers 1 0 "$W/sig-good.json" STUB_BANK="none (the TPM's only active PCR bank is sha1, and sha1 is not allowed on it)"
 		[[ ! -e $EV/SAFEmachineID-$SG && ! -e $EV/$CAV && ! -e $IR/machine-id ]] &&
-			grep -q "SHA-1 is not allowed: no identity this boot (sudo safespace tpm sha1 on)" "$IR/log" && grep -q 'identity:sealed' "$W/pcrextend.log"
+			grep -q "SHA-1 is not allowed: no identity this boot (the TPM has the SHA-1 bank only: sudo safespace tpm sha1 on)" "$IR/log" && grep -q 'identity:sealed' "$W/pcrextend.log"
 	}
-	check "identity: a TPM with SHA-1 only, not allowed: nothing made, PCR 15 closed" t_id_sha1_off
+	check "identity: a TPM with SHA-1 only, not allowed (aSSH: bank none): nothing made, PCR 15 closed" t_id_sha1_off
 	t_id_sha1_on() {
-		rm -rf "$EV"; echo 0x22020002 >"$W/sha1-flag"
-		t_id containers 1 0 "$W/sig-good.json" SAFESPACE_TPM_SYSFS="$W/tpm-sha1" && [[ -e $EV/$CAV ]] && cp "$IR/machine-id" "$W/mid-sha1" &&
-			t_id containers 1 0 "$W/sig-good.json" SAFESPACE_TPM_SYSFS="$W/tpm-sha1" && cmp -s "$IR/machine-id" "$W/mid-sha1" &&
+		rm -rf "$EV"
+		t_id containers 1 0 "$W/sig-good.json" STUB_BANK=sha1 && [[ -e $EV/$CAV ]] && cp "$IR/machine-id" "$W/mid-sha1" &&
+			t_id containers 1 0 "$W/sig-good.json" STUB_BANK=sha1 && cmp -s "$IR/machine-id" "$W/mid-sha1" &&
 			grep -q "SHA-1 is allowed" "$IR/log" || return 1
 		# forbidden again: the identity stays, nothing is released
-		rm -f "$W/sha1-flag"; t_id containers 1 0 "$W/sig-good.json" SAFESPACE_TPM_SYSFS="$W/tpm-sha1"
+		t_id containers 1 0 "$W/sig-good.json" STUB_BANK=none
 		[[ -e $EV/SAFEmachineID-$SG && ! -e $IR/machine-id ]]
 	}
 	check "identity: SHA-1 only, allowed (safespace tpm sha1 on): made, the same machine-id at the next boot; off again: not released" t_id_sha1_on
-	t_id_sha1_other() {
-		rm -rf "$EV"; echo 0x22020006 >"$W/sha1-flag"
-		t_id containers 1 0 "$W/sig-good.json" SAFESPACE_TPM_SYSFS="$W/tpm-sha1"; rm -f "$W/sha1-flag"
-		[[ ! -e $EV/SAFEmachineID-$SG ]] && grep -q "SHA-1 is not allowed" "$IR/log"
+	t_id_sha1_both() { rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" && [[ -e $EV/SAFEmachineID-$SG ]] && ! grep -q "SHA-1" "$IR/log"; }
+	check "identity: SHA-256 active: nothing said of SHA-1" t_id_sha1_both
+	t_id_nokey() {
+		rm -rf "$EV"; mv "$IDB/pcr.pem" "$IDB/pcr.away"
+		t_id containers 1 0 "$W/sig-good.json"; mv "$IDB/pcr.away" "$IDB/pcr.pem"
+		[[ ! -e $EV/SAFEmachineID-$SG && ! -e $EV/$CAV ]] && grep -q "no PCR signing key in the initrd" "$IR/log"
 	}
-	check "identity: SHA-1 only, an index of other attributes at the flag's handle: not allowed" t_id_sha1_other
-	t_id_sha1_both() { rm -rf "$EV" "$W/sha1-flag"; t_id containers 1 0 "$W/sig-good.json" && [[ -e $EV/SAFEmachineID-$SG ]] && ! grep -q "SHA-1" "$IR/log"; }
-	check "identity: SHA-256 active: the flag is not asked" t_id_sha1_both
+	check "identity: no pcr.pem in the initrd: nothing made" t_id_nokey
 	# The initrd has no grep (mkosi's Arch initrd): its scripts use sed.
 	check "identity, select: no grep (the initrd has none)" bash -c '! grep -nE "(^|[|;&(]|then|do)[[:space:]]*grep[[:space:]]" "$@"' _ "$ID" "$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/select"
-	check "identity: every sealing uses tpm2-with-public-key" bash -c '! grep -nE "(creds|CREDS\"?) encrypt" "$@" | grep -v "with-key=tpm2-with-public-key"' _ "$ID" "$REPO/mkosi.extra/usr/local/sbin/safespace"
+	check "identity: every sealing uses tpm2-with-public-key" bash -c '! grep -nE "(creds|CREDS\"?) encrypt" "$1" | grep -v "with-key=tpm2-with-public-key"' _ "$ID"
+
+	# The state the login and safespace show (state.sh): one place for both.
+	ST=$REPO/mkosi.extra/usr/local/lib/safespace/state.sh SE=$W/st-ev SR2=$W/st-run
+	t_state() { # SECUREBOOT SETUPMODE CA(0/1) STATUS(- for none) EXPECTED
+		rm -rf "$SE" "$SR2"; mkdir -p "$SE" "$SR2/assh"
+		printf '\x06\x00\x00\x00\x0'"$1" >"$SE/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+		printf '\x06\x00\x00\x00\x0'"$2" >"$SE/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+		[[ $3 == 0 ]] || : >"$SE/$CAV"
+		[[ $4 == - ]] || printf '%b' "$4" >"$SR2/assh/status"
+		[[ $(SAFESPACE_EFIVARS=$SE SAFESPACE_RUNDIR=$SR2 bash -c '. "$1"; identity_state' _ "$ST") == "$5" ]]
+	}
+	check "state: certified through slot 0: green" t_state 1 0 1 'key=x\ncertified=yes\nslot=0\n' green
+	check "state: certified through slot 1: purple" t_state 1 0 1 'key=x\ncertified=yes\nslot=1\n' purple
+	check "state: the CA there, not certified: temporary" t_state 1 0 1 'key=x\ncertified=no\nwhy=slot 0: x\n' temporary
+	check "state: sealed, no CA: no identity yet" t_state 1 0 0 'key=x\ncertified=no\n' noidentity
+	check "state: Secure Boot off: unsealed" t_state 0 0 0 'key=x\ncertified=no\n' unsealed
+	check "state: Setup Mode: unsealed" t_state 1 1 0 'key=x\ncertified=no\n' unsealed
+	check "state: no status of aSSH: throwaway" t_state 1 0 1 - throwaway
+	t_novars() { # firmware without Secure Boot: no variables, and safespace runs under pipefail
+		rm -rf "$SE" "$SR2"; mkdir -p "$SE" "$SR2/assh"; echo certified=no >"$SR2/assh/status"
+		[[ $(SAFESPACE_EFIVARS=$SE SAFESPACE_RUNDIR=$SR2 bash -c 'set -Eeuo pipefail; . "$1"; sb=$(var_byte SecureBoot); identity_state' _ "$ST") == unsealed ]]
+	}
+	check "state: firmware without Secure Boot's variables: unsealed, no error under pipefail" t_novars
+	t_served() { # HOSTKEY-LINE PUBFILE
+		rm -rf "$SR2"; mkdir -p "$SR2/safespace" "$SR2/k"
+		echo "ssh-ed25519 AAAAC3Nz test-comment" >"$SR2/k/$2"
+		printf 'HostKey %s\nHostKeyAgent /x\n' "$SR2/k/$1" >"$SR2/safespace/sshd-hostkey.conf"
+		[[ $(SAFESPACE_RUNDIR=$SR2 bash -c '. "$1"; served_hostkey' _ "$ST") == "ssh-ed25519 AAAAC3Nz" ]]
+	}
+	check "state: the host key sshd serves, in full: aSSH's (HostKey names the .pub)" t_served host.pub host.pub
+	check "state: ... the throwaway one (HostKey names the private key)" t_served ssh_host_ed25519_key ssh_host_ed25519_key.pub
+	t_names() {
+		local id; id=$(cat "$ID")
+		bash -c '. "$1"; echo "${CA_VAR##*/} SAFEmachineID-$SELECT_GUID"' _ "$ST" | {
+			read -r ca mid
+			[[ $id == *"CA_VAR=$ca"* && $id == *"MID_VAR=SAFEmachineID"* && $mid == SAFEmachineID-$(sed -n 's/^SELECT_GUID=//p' "$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/select") ]]
+		}
+	}
+	check "state: the identity's variables named as the initrd names them" t_names
+	check "state: the login and safespace decide by it, with no copy of their own" bash -c 'grep -q "state.sh" "$1" && grep -q "state.sh" "$2" && ! grep -q "od -An" "$1" "$2"' _ "$REPO/mkosi.extra/etc/profile.d/safespace-status.sh" "$REPO/mkosi.extra/usr/local/sbin/safespace"
 fi
 
 # --- dnsmasq ----------------------------------------------------------------------------------
@@ -750,7 +784,6 @@ if wanted nginx && shared && need nginx curl; then
 	rm -f "$SHARE/.hidden"
 fi
 
-# --- units ------------------------------------------------------------------------------------
 # --- aSSH: the machine's host key (lib/assh.sh, the image's assh.conf) ----------------------
 if wanted assh && need go; then
 	section assh

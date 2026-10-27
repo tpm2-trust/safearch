@@ -9,6 +9,10 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# The checks the build host and the servers make: the combinations, the UKI's
+# sections, the partition table's types and UUIDs.
+# shellcheck source=lib/verify.sh
+source "$HERE/lib/verify.sh"
 DB_CERT=""
 [[ ${1:-} == --db-cert ]] && { DB_CERT=${2:?--db-cert needs a file}; shift 2; }
 DISK=${1:?usage: sudo $0 [--db-cert db.pem] /dev/sdX}
@@ -40,11 +44,11 @@ part_by_type() {
 hdr "Partition table"
 sfdisk -d "$DISK"
 lsblk -o NAME,SIZE,FSTYPE,PARTTYPENAME,PARTUUID "$DISK"
-ESP=$(part_by_type c12a7328-f81f-11d2-ba4b-00a0c93ec93b)
+ESP=$(part_by_type "${GPT_ESP,,}")
 [[ -n $ESP ]] && ok "ESP partition: $ESP" || { bad "no ESP partition"; exit 1; }
 NPARTS=$(lsblk -lnpo TYPE "$DISK" | grep -c part)
 if [[ $(dd if="$DISK" bs=1 skip=32769 count=5 status=none) == CD001 ]]; then
-	bad "ISO9660/El Torito header at 32 KiB (CD boot path; image built before ElTorito=no)"
+	bad "ISO9660/El Torito header at 32 KiB (a CD boot path: not a stick burn.sh wrote)"
 else
 	ok "no ISO9660/El Torito header"
 fi
@@ -85,7 +89,7 @@ if command -v sbverify >/dev/null; then
 else
 	echo "  NOTE sbverify missing (pacman -S sbsigntools): signatures not checked"
 fi
-CMDLINE=$(objcopy -O binary --only-section=.cmdline "$UKI" /dev/stdout 2>/dev/null | tr -d '\0')
+CMDLINE=$(uki_section "$UKI" .cmdline)
 [[ -n $CMDLINE ]] && ok "cmdline: $CMDLINE" || bad "UKI has no .cmdline section"
 [[ $CMDLINE == *usbcore.authorized_default=0* ]] && ok "USB lockdown on the kernel command line"
 [[ $CMDLINE == *systemd.volatile=state* ]] && ok "/var is a tmpfs (systemd.volatile=state)" ||
@@ -105,7 +109,7 @@ extra=$(cd "$TMP/esp" && find . -type f ! -ipath './efi/boot/bootx64.efi' ! -ipa
 
 [[ " $CMDLINE " == *" lockdown=integrity "* ]] && ok "lockdown=integrity" || bad "lockdown=integrity missing from the kernel command line"
 [[ " $CMDLINE " != *" roothash="* ]] && ok "no roothash= (the roots are named per combination)" || bad "roothash= on the command line"
-mapfile -t COMBOS < <(tr ' ' '\n' <<<"$CMDLINE" | sed -n 's/^safespace\.root\.\([a-z][a-z0-9-]*\)=[0-9a-f]\{64\}$/\1/p')
+mapfile -t COMBOS < <(verify_combinations "$CMDLINE")
 ((${#COMBOS[@]})) && ok "combinations: ${COMBOS[*]} (default ${COMBOS[0]})" || { bad "no safespace.root.<name>= on the kernel command line"; exit 1; }
 ((NPARTS == 1 + 2 * ${#COMBOS[@]})) && ok "exactly $NPARTS partitions (ESP + a root/verity pair per combination), nothing writable on the stick" ||
 	bad "$NPARTS partitions, expected $((1 + 2 * ${#COMBOS[@]})) (ESP, root-<name> and root-<name>-verity per combination)"
@@ -154,7 +158,6 @@ check_root() { # NAME PARTITION: what is inside a root (read-only)
 	umount -q "$TMP/root" 2>/dev/null
 }
 
-uuid() { sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12}).*/\1-\2-\3-\4-\5/' <<<"$1"; }
 part_by_uuid() { lsblk -lnpo NAME,PARTUUID "$DISK" | awk -v u="$1" 'tolower($2) == u { print $1; exit }'; }
 # The roots, each checked as the initrd opens it: partitions by the UUIDs
 # derived from its signed hash, every block against that hash.
@@ -169,10 +172,10 @@ for C in "${COMBOS[@]}"; do
 	else
 		echo "  NOTE build: no build with this root hash on this host"
 	fi
-	ROOT=$(part_by_uuid "$(uuid "${ROOTHASH:0:32}")")
-	VERITY=$(part_by_uuid "$(uuid "${ROOTHASH: -32}")")
-	[[ -n $ROOT ]] && ok "root partition $ROOT: UUID from the root hash" || { bad "no partition with the root UUID $(uuid "${ROOTHASH:0:32}")"; continue; }
-	[[ -n $VERITY ]] && ok "verity partition $VERITY: UUID from the root hash" || { bad "no partition with the verity UUID $(uuid "${ROOTHASH: -32}")"; continue; }
+	ROOT=$(part_by_uuid "$(layout_uuid "${ROOTHASH:0:32}")")
+	VERITY=$(part_by_uuid "$(layout_uuid "${ROOTHASH: -32}")")
+	[[ -n $ROOT ]] && ok "root partition $ROOT: UUID from the root hash" || { bad "no partition with the root UUID $(layout_uuid "${ROOTHASH:0:32}")"; continue; }
+	[[ -n $VERITY ]] && ok "verity partition $VERITY: UUID from the root hash" || { bad "no partition with the verity UUID $(layout_uuid "${ROOTHASH: -32}")"; continue; }
 	echo "  verifying every block of root against the root hash (takes a while)..."
 	if veritysetup verify "$ROOT" "$VERITY" "$ROOTHASH"; then
 		ok "root of $C is exactly what was signed"

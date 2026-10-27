@@ -3,6 +3,10 @@
 # turned into parts by the real builds_finalize and into a build by the real
 # lib/compose.sh. Sourced by tests/run.sh. No root needed.
 
+# The partition table as the build makes it (layout_uuid, GPT_*).
+# shellcheck source=lib/verify.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../lib/verify.sh"
+
 # fx_keys DIR: a dedicated sbctl key set (PK, KEK, db, GUID) and its config.
 fx_keys() {
 	local dir=$1
@@ -92,8 +96,6 @@ fx_finish() {
 	fx_info "$1" "$2" root:base
 }
 
-# uuid HEX32: 8-4-4-4-12, as systemd-repart derives partition UUIDs from the root hash.
-fx_uuid() { sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12}).*/\1-\2-\3-\4-\5/' <<<"$1"; }
 
 # fx_part DIR VERSION KEYDIR URL PACKAGES...: what one combination's mkosi run
 # leaves in its directory (the split parts and the whole disk image, partition
@@ -125,8 +127,8 @@ fx_part() {
 		total=$((2048 + 16384 + rs + vs + 2048))
 		truncate -s $((total * 512)) "$b.raw"
 		printf 'label: gpt\nstart=2048, size=16384, type=%s, name="esp"\nsize=%d, type=%s, uuid=%s, name="root-x86-64"\nsize=%d, type=%s, uuid=%s, name="root-x86-64-verity"\n' \
-			C12A7328-F81F-11D2-BA4B-00A0C93EC93B "$rs" 4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709 "$(fx_uuid "${hash:0:32}")" \
-			"$vs" 2C7357ED-EBD2-46D9-AEC1-23D437EC2BF5 "$(fx_uuid "${hash:32}")" | sfdisk -q "$b.raw"
+			"$GPT_ESP" "$rs" "$GPT_ROOT" "$(layout_uuid "${hash:0:32}")" \
+			"$vs" "$GPT_VERITY" "$(layout_uuid "${hash:32}")" | sfdisk -q "$b.raw"
 		dd if="$tmp/esp.img" of="$b.raw" bs=1M seek=$((2048 * 512)) oflag=seek_bytes conv=notrunc status=none
 		dd if="$tmp/root.img" of="$b.raw" bs=1M seek=$((18432 * 512)) oflag=seek_bytes conv=notrunc status=none
 		dd if="$tmp/root.verity" of="$b.raw" bs=1M seek=$(((18432 + rs) * 512)) oflag=seek_bytes conv=notrunc status=none
@@ -176,11 +178,9 @@ fx_build() {
 	fx_release "$co/mkosi.output/combined_$v" "$kd"
 }
 
-# fx_release DIR KEYDIR: the release file and its db signature, as build.sh writes them.
+# fx_release DIR KEYDIR: the release file and its db signature, by build.sh's code.
 fx_release() {
-	(HERE=${1%/mkosi.output/*}; source "$HERE/lib/builds.sh"; builds_release "$1") >"$1/release" &&
-		openssl cms -sign -binary -noattr -outform DER -in "$1/release" -out "$1/release.p7s" \
-			-signer "$2/db/db.pem" -inkey "$2/db/db.key" -md sha256
+	(HERE=${1%/mkosi.output/*}; source "$HERE/lib/builds.sh"; builds_sign_release "$1" "$2/db/db.pem" "$2/db/db.key")
 }
 
 # fx_reuki DIR KEYDIR IDENTITY_PHASES [BANKS]: rebuild DIR/boot.efi from its own

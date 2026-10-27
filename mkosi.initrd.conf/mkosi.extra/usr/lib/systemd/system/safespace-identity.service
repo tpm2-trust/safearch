@@ -1,10 +1,10 @@
-# The machine's identity, released only in its assigned combination
-# (/usr/local/lib/safespace/identity). After the boot path measured the
+# The machine's identity: made at the first sealed boot, released in its
+# combination (/usr/local/lib/safespace/identity). After the boot path measured the
 # combination, while PCR 11 still holds enter-initrd (systemd-pcrphase-initrd
 # measures leave-initrd when it stops, after this), before the switch to the root.
-# Never blocks the boot: without TPM, slots or assignment it only logs.
+# Never blocks the boot: without a TPM or an identity it only logs.
 [Unit]
-Description=Release the machine's identity (assigned combination only)
+Description=Make or release the machine's identity (its combination only)
 DefaultDependencies=no
 After=usb-bootdev.service netroot.service tpm2.target systemd-pcrphase-initrd.service systemd-tpm2-setup-early.service
 Before=initrd.target initrd-switch-root.target

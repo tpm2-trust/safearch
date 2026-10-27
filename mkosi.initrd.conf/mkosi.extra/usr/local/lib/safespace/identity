@@ -35,15 +35,15 @@
 #    throwaway machine-id.
 # On a TPM without an active SHA-256 bank (its firmware activates SHA-1 only:
 # ThinkPad T450s) 1 and 2 happen only while safespace tpm sha1 on allows SHA-1:
-# aSSH's NV index 0x01802914, the host key's alike.
+# aSSH decides it (assh tpm sha1, "bank auto"), for the host key alike.
 # 3. Always, also on errors: extend PCR 15 with "safespace-identity:sealed", so
 #    nothing unseals again in this boot. aSSH's agent finds PCR 15 so (the
 #    combination, then this) at every boot of the combination.
 # The boot never depends on this: every failure only means no identity.
 #
 # SAFESPACE_EFIVARS, SAFESPACE_RUN, SAFESPACE_PCREXTEND, SAFESPACE_CREDS,
-# SAFESPACE_IDENTITY_KEY, SAFESPACE_PCRSIG, SAFESPACE_PCRKEY, SAFESPACE_MACHINE_ID,
-# SAFESPACE_TPM_SYSFS, SAFESPACE_TPM2, SAFESPACE_ASSH: only for tests/run.sh.
+# SAFESPACE_IDENTITY_KEY, SAFESPACE_PCRSIG, SAFESPACE_MACHINE_ID, SAFESPACE_ASSH:
+# only for tests/run.sh.
 
 msg() { echo "safespace-identity: $*" >/dev/kmsg 2>/dev/null || echo "safespace-identity: $*" >&2; }
 
@@ -55,11 +55,11 @@ ASSH=${SAFESPACE_ASSH:-assh}
 KEY=${SAFESPACE_IDENTITY_KEY:-${0%/*}/identity.pem}
 OUT=$SELECT_RUN/identity
 MACHINE_ID=${SAFESPACE_MACHINE_ID:-/run/machine-id}
-TPM_SYSFS=${SAFESPACE_TPM_SYSFS:-/sys/class/tpm/tpm0}
-TPM2=${SAFESPACE_TPM2:-tpm2}
-# aSSH's SHA-1 flag (hostkey.SHA1Handle) as aSSH makes it: owner write and read,
-# noDA, written; one byte.
-SHA1_INDEX=0x01802914 SHA1_ATTRS=0x22020002
+ASSH_CONF=/etc/assh/assh.conf
+# The build's PCR key, whose signatures of PCR 11 the CA's slot 0 takes
+# (assh.conf's ASSH_PCR_KEY: appended to this initrd by lib/compose.sh, beside
+# identity.pem).
+PCR_KEY=${0%/*}/pcr.pem
 # The credential header's type for "sealed with a signed PCR policy"
 # (--with-key=tpm2-with-public-key). With plain tpm2, systemd-creds drops the
 # --tpm2-public-key* options without a word and PCR 11 is not bound at all.
@@ -95,19 +95,16 @@ esac
 umask 077
 mkdir -p "$OUT/.new" || exit 0
 
-# The kernel lists the TPM's active banks in sysfs (pcr-<alg>/).
-if [ ! -d "$TPM_SYSFS/pcr-sha256" ] && [ -d "$TPM_SYSFS/pcr-sha1" ]; then
-	# (No grep in the initrd: sed.)
-	pub=$(TPM2TOOLS_TCTI=device:/dev/tpmrm0 "$TPM2" nvreadpublic $SHA1_INDEX 2>/dev/null)
-	attrs=$(echo "$pub" | sed -n '/^ *attributes:/,/^ *size:/s/^ *value: *//p')
-	size=$(echo "$pub" | sed -n 's/^ *size: *//p')
-	if [ "$attrs" = "$SHA1_ATTRS" ] && [ "$size" = 1 ]; then
-		msg "the TPM has the SHA-1 bank only, and SHA-1 is allowed (safespace tpm sha1 on): the identity uses it"
-	else
-		msg "the TPM has the SHA-1 bank only, and SHA-1 is not allowed: no identity this boot (sudo safespace tpm sha1 on)"
-		exit 0
-	fi
-fi
+# The PCR bank, as aSSH's agent will read it: SHA-256, else SHA-1 where the TPM
+# has no SHA-256 bank and allows it (safespace tpm sha1 on). (No grep in the
+# initrd: sed.)
+bank=$("$ASSH" tpm sha1 --config $ASSH_CONF 2>&1 | sed -n 's/^bank auto: //p')
+case $bank in
+	sha256) ;;
+	sha1) msg "the TPM has the SHA-1 bank only, and SHA-1 is allowed (safespace tpm sha1 on): the identity uses it" ;;
+	*sha1*not\ allowed*) msg "SHA-1 is not allowed: no identity this boot (the TPM has the SHA-1 bank only: sudo safespace tpm sha1 on)"; exit 0 ;;
+	*) msg "no PCR bank to bind to (${bank:-aSSH could not tell}): no identity this boot"; exit 0 ;;
+esac
 
 # The signed expected PCR values and their key, as systemd-stub hands them to
 # the initrd.
@@ -115,10 +112,6 @@ sig=${SAFESPACE_PCRSIG:-}
 for f in /run/systemd/tpm2-pcr-signature.json /.extra/tpm2-pcr-signature.json; do
 	[ -n "$sig" ] || { [ -s "$f" ] && sig=$f; }
 done
-# The build's PCR key, whose signatures of PCR 11 the CA's slot 0 takes
-# (appended to this initrd by lib/compose.sh, beside identity.pem).
-pcrkey=${SAFESPACE_PCRKEY:-${0%/*}/pcr.pem}
-[ -s "$pcrkey" ] || pcrkey=""
 [ -n "$sig" ] || { msg "no signed PCR values from the UKI: no identity this boot"; exit 0; }
 
 # A sealed credential is accepted only if it is bound to the signed policy:
@@ -139,7 +132,7 @@ have_mid=0 have_ca=0
 if [ $have_mid = 0 ] && [ $have_ca = 0 ]; then
 	if [ "$(global_byte SecureBoot)" != 1 ] || [ "$(global_byte SetupMode)" != 0 ]; then
 		msg "no identity: Secure Boot is off (seal the machine first)"
-	elif [ -z "$pcrkey" ]; then
+	elif [ ! -s "$PCR_KEY" ]; then
 		msg "ERROR: no PCR signing key in the initrd (pcr.pem): no identity made"
 	else
 		msg "no identity yet, Secure Boot on: making it - this machine belongs to $name from now on"
@@ -157,7 +150,7 @@ if [ $have_mid = 0 ] && [ $have_ca = 0 ]; then
 			var_write $MID_VAR "$OUT/.new/mid.cred" || { ok=0; msg "ERROR: cannot write $MID_VAR"; }
 		fi
 		if [ $ok = 1 ]; then
-			"$ASSH" ca create --config /etc/assh/assh.conf --pcr-key "$pcrkey" \
+			"$ASSH" ca create --config $ASSH_CONF \
 				--events "15:safespace-combination:$name" --events "15:safespace-identity:sealed" >"$OUT/.new/ca.log" 2>&1 ||
 				{ ok=0; msg "ERROR: creating the CA failed: $(tail -1 "$OUT/.new/ca.log")"; }
 		fi
@@ -167,7 +160,7 @@ if [ $have_mid = 0 ] && [ $have_ca = 0 ]; then
 			# All or nothing: what was made goes.
 			var_rm $MID_VAR
 			if [ -e "$SELECT_VARS/$CA_VAR" ]; then
-				"$ASSH" ca remove --config /etc/assh/assh.conf >/dev/null 2>&1
+				"$ASSH" ca remove --config $ASSH_CONF >/dev/null 2>&1
 			fi
 			msg "ERROR: no identity made"
 		fi

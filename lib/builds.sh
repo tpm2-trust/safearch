@@ -34,6 +34,9 @@
 #                                 lib/compose.sh turns into the build
 # A build is complete once build.json exists (written after a successful build).
 
+# The partition table's helpers (layout_part, GPT_ESP).
+# shellcheck source=lib/verify.sh
+source "${BASH_SOURCE[0]%/*}/verify.sh"
 BUILDS_ROOT=${BUILDS_ROOT:-$HERE/mkosi.output}
 BUILDS_IMAGE_ID=safespace-arch
 
@@ -154,7 +157,6 @@ builds_prune() { # KEEP YES
 	log "deleted ${#del[@]} build(s)"
 }
 
-# build.json for a finished build (build.sh, as root, after mkosi succeeded).
 # The release file of a build, from its build.json: what a server publishes
 # and a machine reads before an update (safespace update). build.sh writes it
 # with release.p7s, its signature by the db key; release.sh copies both.
@@ -162,13 +164,28 @@ builds_release() { # DIR
 	local d=$1
 	echo "VERSION=$(builds_info "$d" version)"
 	echo "BUILD=$(builds_info "$d" build)"
-	echo "COMBINATIONS=$(builds_info "$d" combinations | tr ',' '\n' | cut -d: -f1 | paste -sd,)"
+	echo "COMBINATIONS=$(builds_combo_names "$d")"
 	echo "BUILT=$(builds_info "$d" finished)"
 	echo "SNAPSHOT=$(builds_info "$d" snapshot)"
 	echo "COMMIT=$(builds_info "$d" commit)$([[ $(builds_info "$d" uncommitted_changes) == yes ]] && echo +uncommitted)"
 	echo "PACKAGES=$(builds_info "$d" packages)"
 }
 
+# The release file and release.p7s, its signature by the db key (detached CMS):
+# a machine checks it against the db.pem in its image before it updates.
+builds_sign_release() { # DIR DB_CERT DB_KEY
+	builds_release "$1" >"$1/release" &&
+		openssl cms -sign -binary -noattr -outform DER -in "$1/release" -out "$1/release.p7s" \
+			-signer "$2" -inkey "$3" -md sha256
+}
+
+# The combinations of a build by name: "root,containers" (build.json holds
+# name:groups).
+builds_combo_names() { # DIR
+	builds_info "$1" combinations | tr ',' '\n' | cut -d: -f1 | paste -sd,
+}
+
+# build.json for a finished build (build.sh, as root, after mkosi succeeded).
 builds_write_info() { # DIR, then KEY=VALUE pairs (VALUE with commas = a list for combinations/netroot)
 	local d=$1; shift
 	python3 -I - "$d" "$@" <<-'EOF'
@@ -223,7 +240,7 @@ builds_finalize() { # DIR VERSION
 	# The table as systemd-repart wrote it (types, UUIDs derived from the root
 	# hash, sizes, attributes), without the image's file name.
 	sfdisk -d "$b.raw" | sed -e '/^device:/d' -e 's|^[^ ]* : ||' >"$d/layout.sfdisk"
-	off=$(($(awk -F'[=,]' 'toupper($0) ~ /TYPE=C12A7328-F81F-11D2-BA4B-00A0C93EC93B/ { gsub(/ /, ""); print $2; exit }' "$d/layout.sfdisk") * 512))
+	off=$(($(layout_part "$d/layout.sfdisk" "$GPT_ESP" start) * 512))
 	mcopy -n -i "$b.raw@@$off" ::/EFI/BOOT/BOOTX64.EFI "$d/systemd-boot.efi" ||
 		die "builds_finalize: no \\EFI\\BOOT\\BOOTX64.EFI in the ESP"
 	rm -f -- "$b.raw" "$b" "$b".*.raw "$d/initrd" "$d/initrd.cpio.zst"
