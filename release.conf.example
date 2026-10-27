@@ -1,4 +1,0 @@
-# Copy to release.conf (gitignored): the distribution servers release.sh
-# pushes to when no --push is given. Space-separated; each one is the upload
-# account set up by server/setup.sh, or a local share directory.
-RELEASE_TARGETS="safespace@dist1.example.org safespace@dist2.example.org"

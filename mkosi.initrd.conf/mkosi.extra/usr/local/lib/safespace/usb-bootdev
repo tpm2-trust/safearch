@@ -34,9 +34,10 @@ msg() { echo "usb-bootdev: $*" >/dev/kmsg; }
 
 cmdline=$(cat /proc/cmdline)
 
-# Which root: the selected combination's (select, next to this script).
+# Which root: the chosen combination's (safespace-select.service; select, next
+# to this script).
 . "${0%/*}/select"
-select_root || exit 1
+select_chosen || exit 1
 roothash=$SELECT_HASH
 # (No grep in the initrd: a shell pattern instead.)
 case $roothash in

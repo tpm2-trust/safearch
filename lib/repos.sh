@@ -1,9 +1,6 @@
 # Package source for the image: which Arch Linux snapshot, from which mirror.
-# Sourced by build.sh and update-snapshot.sh; expects die() and log().
-#
-# Read from repos.conf (tracked, the project default) and then
-# repos.local.conf (gitignored, per host), later keys win. The files are
-# parsed, not sourced: only SNAPSHOT= and MIRROR= are accepted.
+# Sourced by build.sh and update-snapshot.sh; expects die() and log(), and
+# SNAPSHOT and MIRROR from safespace.conf (lib/conf.sh).
 #
 #   SNAPSHOT=YYYY/MM/DD  pinned Arch Linux Archive day
 #   SNAPSHOT=latest      the current repositories, nothing pinned
@@ -21,38 +18,11 @@ REPOS_DEFAULT_ARCHIVE=https://archive.archlinux.org
 REPOS_DEFAULT_MIRROR=https://fastly.mirror.pkgbuild.com
 REPOS_ARCH=x86_64
 
-SNAPSHOT=""
-MIRROR=""
-
-# repos_parse FILE: set SNAPSHOT/MIRROR from FILE (KEY=VALUE, # comments).
-repos_parse() {
-	local file=$1 line key value n=0
-	while IFS= read -r line || [[ -n $line ]]; do
-		n=$((n + 1))
-		line=${line%$'\r'}
-		[[ $line =~ ^[[:space:]]*(#|$) ]] && continue
-		[[ $line =~ ^[[:space:]]*([A-Z_]+)=(.*)$ ]] || die "$file:$n: expected KEY=VALUE: $line"
-		key=${BASH_REMATCH[1]}
-		value=${BASH_REMATCH[2]}
-		value=${value%"${value##*[![:space:]]}"}
-		[[ $value =~ ^\"(.*)\"$ || $value =~ ^\'(.*)\'$ ]] && value=${BASH_REMATCH[1]}
-		case $key in
-			SNAPSHOT) SNAPSHOT=$value ;;
-			MIRROR) MIRROR=$value ;;
-			*) die "$file:$n: unknown key $key (expected SNAPSHOT or MIRROR)" ;;
-		esac
-	done <"$file"
-}
-
-# repos_load DIR: read DIR/repos.conf and DIR/repos.local.conf, validate.
-repos_load() {
-	local dir=$1
-	[[ -f $dir/repos.conf ]] || die "repos.conf missing in $dir"
-	repos_parse "$dir/repos.conf"
-	[[ -f $dir/repos.local.conf ]] && repos_parse "$dir/repos.local.conf"
-
+# repos_validate: SNAPSHOT and MIRROR as mkosi takes them (MIRROR without a
+# trailing slash).
+repos_validate() {
 	[[ $SNAPSHOT == latest || $SNAPSHOT =~ ^[0-9]{4}/[0-9]{2}/[0-9]{2}$ ]] ||
-		die "SNAPSHOT must be YYYY/MM/DD or latest, got '$SNAPSHOT' (repos.conf / repos.local.conf)"
+		die "SNAPSHOT must be YYYY/MM/DD or latest, got '$SNAPSHOT' (safespace.conf)"
 	if [[ -n $MIRROR ]]; then
 		[[ $MIRROR != *'$'* ]] ||
 			die "MIRROR must not contain \$repo/\$arch, mkosi appends the repository path itself: $MIRROR"

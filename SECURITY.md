@@ -1,7 +1,7 @@
 # Security of the standard installation
 
 What a standard safespace-arch build (`sudo ./build.sh`, every combination of
-`combinations.conf`) does to be trustworthy, and where each measure lives. Usage is in [README.md](README.md), network
+`safespace.conf`, its defaults) does to be trustworthy, and where each measure lives. Usage is in [README.md](README.md), network
 boot in [NETBOOT.md](NETBOOT.md). What is still open is listed at the end.
 
 ## Chain of trust
@@ -131,7 +131,8 @@ sequenceDiagram
 | **One event makes the identity, all or nothing**: the initrd, at the first boot with Secure Boot on (SecureBoot=1, SetupMode=0) and neither `SAFEmachineID` nor `SAFEasshCA`: the machine-id, then the CA (`assh ca create --authority-once`); if the CA fails, the machine-id goes too. One without the other: nothing is made (`safespace identity clear`) | two decision paths; half an identity | `identity` |
 | **The CA is a key in the TPM** (RSA-2048, else ECDSA P-256; `fixedTPM`), never exported: its file - the TPM's wrapped copy, the public parts, the approvals - is the EFI variable `SAFEasshCA`: nothing in it is secret, the TPM checks every approval in it each time the CA signs | the CA's key on any medium; a forged approval | `assh`, `/etc/assh/assh.conf` |
 | **Its authority exists for the creation alone**: a key made in the TPM under the NULL hierarchy approves the slots and is flushed (the NULL seed is new at the next boot anyway). No PIN, no counter, no lockout authorization: **nothing can approve another state after** - not root of any combination, not after a firmware change | another combination or firmware approved later; a PIN guessed or phished | `assh` |
-| **The approvals are made ahead, for the root's state**: PCR 15 calculated as the root sees it (`safespace-combination:<name>`, `safespace-identity:sealed`, from zero), PCR 0, 2, 7 as the TPM holds them at the creation. **Slot 0 = PCR 0, 2, 7, 15 + PCR 11 signed by the build's PCR key** (the UKI's own `.pcrsig`, phase `enter-initrd:leave-initrd`: `PolicyAuthorize` by that key inside the approved policy) - an update certifies with no step; **slot 1 = PCR 7, 15** - a firmware update or an option ROM (purple at the login). PCR 15 is in both: **another combination never certifies** | another combination, another firmware or Secure Boot state using the identity | `assh.conf` |
+| **The approvals are made ahead, for the root's state**: PCR 15 calculated as the root sees it (`safespace-combination:<name>`, `safespace-identity:sealed`, from zero), PCR 0, 2, 7 as the TPM holds them at the creation. **Slot 0 = PCR 0, 2, 7, 15 + PCR 11 signed by the build's PCR key** (the UKI's own `.pcrsig`, phase `enter-initrd:leave-initrd`: `PolicyAuthorize` by that key inside the approved policy) - an update certifies with no step; **slot 1 = PCR 7, 15** - a firmware update or an option ROM (purple at the login). PCR 15 is in both: **another combination never certifies** (the default policy of `safespace.conf`) | another combination, another firmware or Secure Boot state using the identity | `safespace.conf` (`IDENTITY_SLOTS`), the generated `assh.conf` |
+| **The policy is decided on the build host and checked before a build**: `IDENTITY_SLOTS`, `MACHINE_ID_PCRS`, `KEY_TYPES`, `PCR_BANK` of `safespace.conf`, written into the signed image (`/etc/assh/assh.conf`, `/usr/local/lib/safespace/settings`), never configured on a machine. Refused: a slot or the machine-id's seal without PCR 7 (it would hold with Secure Boot off) or PCR 15 (not per combination; a slot without aSSH's window would sign after it closed); a signed PCR other than 11; a machine-id seal without PCR 11 signed (it would unseal in a root, not only in the build's initrd); PCR 16 or 23 (any process resets them); what aSSH refuses in the generated file | a weakened identity by a slip in the configuration | `lib/settings.sh`, `lib/assh.sh` (`assh_check_conf`) |
 | **The window**: the agent runs before `sysinit.target` and before systemd's PCR 15 units (`systemd-pcrmachine`, `systemd-pcrfs-root`): PCR 11 and 15 hold what the initrd left, the same at every boot of the combination. Right after the host key is made it extends PCR 15 (`assh: closed`), also when the key is temporary: **the CA certifies nothing more until the next reboot** - a process started later, an agent restart | a root process getting a certificate for a key of its own | `assh-agent.service` |
 | **The host key is new at every boot, in the TPM** (NULL hierarchy, gone at the reboot); its authorization value is in the agent's memory alone (not dumpable); sshd gets signatures through `HostKeyAgent`, never the key | the host key on any medium, or used after the boot | `assh-agent.service`, `sshd_config.d/10-safespace.conf` |
 | **The machine-id: a systemd credential** (systemd-creds, name `safespace-machine-id`, checked) in the EFI variable `SAFEmachineID` | renewing it with another secret's credential | `mkosi.initrd.conf/.../identity` |
@@ -290,9 +291,10 @@ boot share PCR 0.
 |---|---|
 | No private key in an image, a release or the repository; only certificates, signed `.auth` updates and the GUID are shipped; the build refuses anything else in the shipped key directory | `lib/keys.sh`, `mkosi.postoutput` |
 | The `.auth` updates are signed with efitools with the right attributes (replace 0x27, append 0x67; sbctl's own append export is wrong and not used) | `lib/keys.sh`, `tests/lib/authcheck.py` |
-| A dedicated Secure Boot key set is possible (`SAFESPACE_SBCTL_CONFIG`); YubiKey-held keys are refused until supported | `lib/keys.sh` |
+| A dedicated Secure Boot key set is possible (`SBCTL_CONFIG`); YubiKey-held keys are refused until supported | `lib/keys.sh` |
 | The PCR signing keys (mkosi's, all phases; the identity key, `enter-initrd` only) are separate from the db key, root-only, never in the image | `mkosi.conf`, `build.sh`, `lib/keys.sh` |
-| Per-host and private settings live in gitignored files with `*.example` templates | `.gitignore` |
+| The build host's configuration is one file, parsed, never sourced: only known keys, nothing in it runs; this host's choices in `safespace.local.conf` (gitignored); a file it replaced still on the host stops the build instead of being dropped (a URL lost without a word) | `safespace.conf`, `lib/conf.sh` |
+| Private settings live in gitignored files (`users.conf`, `safespace.local.conf`, `mkosi.local.conf`) | `.gitignore` |
 | Test builds carry a throwaway test key and user and are kept apart (`mkosi.test/vm/`), invisible to `build.sh list` and `release.sh` | `tests/vm.sh` |
 
 ## Distribution server
@@ -304,6 +306,7 @@ boot share PCR 0.
 | The check runs sandboxed: own user, no network, read-only share, no capabilities, `ProtectSystem=strict`, system call filter, … | `server/systemd/safespace-netboot-verify.service` |
 | nginx serves the share read-only: GET/HEAD only, no directory listing, no hidden files (rsync's temporary files), no version banner | `server/nginx/safespace.conf` |
 | The build host checks a release exactly as a server will before pushing it | `release.sh` |
+| A test build never reaches a real server: a build from another directory than `mkosi.output` (`--builds`, the integration test's, with the test key) goes only where `--push` says, never to `RELEASE_TARGETS` | `release.sh` |
 
 ## Checked by the tests
 

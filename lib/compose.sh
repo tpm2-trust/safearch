@@ -1,8 +1,9 @@
-# Combinations: the group sets of combinations.conf, one root each, one signed
+# Combinations: the group sets of safespace.conf's COMBINATIONS, one root each, one signed
 # UKI for all. Sourced by build.sh; expects die(), log(), lib/groups.sh and
 # lib/verify.sh.
 #
-#   combos_load FILE            read combinations.conf into COMBO_NAMES/COMBO_GROUPS
+#   combos_load LIST            COMBINATIONS of safespace.conf ("name=groups ...")
+#                               into COMBO_NAMES/COMBO_GROUPS
 #                               (COMBO_NAMES[0]: the default, booted without a selection)
 #   compose_build DEST DIR...   one finalized mkosi build per combination (same
 #                               order as COMBO_NAMES) -> the build in DEST
@@ -27,20 +28,19 @@
 
 COMBO_NAMES=() COMBO_GROUPS=()
 
-combos_load() { # FILE
-	local line name groups
+combos_load() { # LIST
+	local c name groups list
 	COMBO_NAMES=() COMBO_GROUPS=()
-	[[ -f $1 ]] || die "no $1"
-	while IFS= read -r line; do
-		[[ $line =~ ^[[:space:]]*(#|$) ]] && continue
-		[[ $line =~ ^([a-z][a-z0-9-]{0,23})=([A-Za-z0-9,[:space:]-]+)$ ]] || die "$1: bad line: $line"
+	read -ra list <<<"$1"
+	for c in ${list[@]+"${list[@]}"}; do
+		[[ $c =~ ^([a-z][a-z0-9-]{0,23})=([A-Za-z0-9,-]+)$ ]] || die "COMBINATIONS: bad combination '$c' (name=group,group)"
 		name=${BASH_REMATCH[1]} groups=${BASH_REMATCH[2]}
-		[[ " ${COMBO_NAMES[*]} " != *" $name "* ]] || die "$1: $name twice"
+		[[ " ${COMBO_NAMES[*]} " != *" $name "* ]] || die "COMBINATIONS: $name twice"
 		groups_parse "$groups"
 		COMBO_NAMES+=("$name")
 		COMBO_GROUPS+=("$(IFS=,; echo "${SAFESPACE_GROUPS[*]}")")
-	done <"$1"
-	((${#COMBO_NAMES[@]})) || die "$1: no combination"
+	done
+	((${#COMBO_NAMES[@]})) || die "COMBINATIONS: no combination (safespace.conf)"
 }
 
 compose_layout() { # OUT FIRST_LAYOUT DIR

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Build safespace-arch with mkosi, and keep track of the builds on this host.
-# A build is the whole stack: every combination of combinations.conf as a
+# A build is the whole stack: every combination of safespace.conf as a
 # complete, dm-verity protected root of its own (one mkosi run each), and one
 # signed UKI that names them all (lib/compose.sh). The same build boots from a
 # USB stick / SD card (./burn.sh) and over the network (./release.sh to the
 # distribution servers, NETBOOT.md); a machine boots the first combination
 # unless safespace select preselects another (an EFI variable).
 #
-#   sudo ./build.sh [--url BASE_URL]... [--workers N] [--users FILE]
-#                   [--combinations FILE] [--output-root DIR] [MKOSI OPTIONS...]
+#   sudo ./build.sh [--config FILE] [--url BASE_URL]... [--workers N]
+#                   [--output-root DIR] [MKOSI OPTIONS...]
 #
 #   ./build.sh list                 the builds: built at, snapshot, packages,
 #                                   size, last release
@@ -37,29 +37,25 @@
 # printed when it ends; a combination with no cached image yet (or -f) runs on
 # its own, as it installs packages into the shared package cache.
 #
-# --url BASE_URL  where a network-booted machine loads its root from: the
-#              distribution servers' share, e.g. http://10.0.0.1/safespace/
-#              (a server only holds the newest release). More than once for
-#              failover (tried in order), or NETROOT_URL= in netboot.conf
-#              (netboot.conf.example). Without any, the build boots from
-#              sticks only.
+# What is built, from what, for whom: safespace.conf (every key, its default),
+# safespace.local.conf (this host's choices, gitignored), lib/conf.sh. The
+# combinations, the users file, the package source (build.sh checks that the
+# mirror serves core.db before the build starts), the netroot URLs, the Secure
+# Boot keys, and the machine identity's policy - checked (lib/settings.sh) and
+# written into the image as assh.conf and the scripts' settings.
 #
-# --users FILE    the users and ssh keys to build in (default: users.conf);
-# --combinations FILE  the combinations to build (default: combinations.conf);
-# --output-root DIR  where the build's directory goes (default: mkosi.output).
-#              All inside this checkout. For test builds (tests/vm.sh: a
-#              throwaway user, its own combinations, kept apart from the real
-#              builds, so list and release.sh never offer them).
-#
-# Package source: SNAPSHOT= and MIRROR= in repos.conf, overridden per host by
-# repos.local.conf (see repos.local.conf.example). A pinned date, or latest,
-# each with mkosi's default mirror or your own. Not settable on the command
-# line, so every build of a checkout uses the same source; build.sh checks
-# that the mirror serves core.db before the build starts.
-#
+# --config FILE   one more layer of safespace.conf keys on top of both (tests/vm.sh:
+#              its throwaway user, its combinations).
+# --url BASE_URL  where a network-booted machine loads its root from, instead of
+#              NETROOT_URL: the distribution servers' share, e.g.
+#              http://10.0.0.1/safespace/ (a server only holds the newest
+#              release). More than once for failover (tried in order).
+# --output-root DIR  where the build's directory goes (default: mkosi.output),
+#              inside this checkout. For test builds (tests/vm.sh: kept apart
+#              from the real builds, so list and release.sh never offer them).
 # --workers N  threads for the erofs compression of the roots (mkfs.erofs;
-#              0 would mean single-threaded, so N >= 1). Without it: the
-#              setting in mkosi.local.conf, else all available CPUs (nproc,
+#              0 would mean single-threaded, so N >= 1), instead of
+#              EROFS_WORKERS; without either, all available CPUs (nproc,
 #              which respects CPU affinity and limits).
 #
 # Before a build, the free disk space where the build lands and where mkosi
@@ -83,7 +79,7 @@
 # (mkosi.extra/usr/share/safespace/secureboot/), so safespace seal works, and
 # creates the expected-PCR signing key on the first build (lib/keys.sh). The
 # keys: the host's sbctl (/var/lib/sbctl), or a dedicated sbctl key set,
-# SAFESPACE_SBCTL_CONFIG= in mkosi.local.conf (README.md, "Secure Boot keys").
+# SBCTL_CONFIG= in safespace.local.conf (README.md, "Secure Boot keys").
 set -Eeuo pipefail
 
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
@@ -134,8 +130,7 @@ esac
 
 URLS=()
 NETROOT=()
-USERS_FILE=users.conf
-COMBOS_FILE=combinations.conf
+CONFIG=""
 OUTPUT_ROOT=mkosi.output
 WORKERS=""
 MKOSI_ARGS=()
@@ -143,15 +138,15 @@ while (($#)); do
 	case $1 in
 		--url) URLS+=("${2:?--url needs a base URL}"); shift 2 ;;
 		--url=*) URLS+=("${1#--url=}"); shift ;;
-		--users) USERS_FILE=${2:?--users needs a file}; shift 2 ;;
-		--combinations) COMBOS_FILE=${2:?--combinations needs a file}; shift 2 ;;
+		--config) CONFIG=$(readlink -f "${2:?--config needs a file}"); shift 2 ;;
+		--users | --combinations) die "$1: USERS= / COMBINATIONS= in safespace.conf (--config FILE for one more layer)" ;;
 		--output-root) OUTPUT_ROOT=${2:?--output-root needs a directory}; shift 2 ;;
 		--workers) WORKERS=${2:?--workers needs a thread count}; shift 2 ;;
 		--workers=*) WORKERS=${1#--workers=}; shift ;;
 		--groups | --groups=* | --debug | --combined | --version)
-			die "$1: there is none; combinations.conf decides what is built (a debug combination is one of them)" ;;
+			die "$1: there is none; COMBINATIONS in safespace.conf decides what is built (a debug combination is one of them)" ;;
 		-m* | --mirror | --mirror=* | --snapshot | --snapshot=*)
-			die "$1: the package source is set in repos.conf / repos.local.conf (SNAPSHOT=, MIRROR=)" ;;
+			die "$1: the package source is set in safespace.conf (SNAPSHOT=, MIRROR=)" ;;
 		build) shift ;;
 		summary | cat-config | shell | boot | vm | qemu | ssh | journalctl | clean | sysupdate | sandbox | burn | documentation | dependencies | genkey | serve | bump | init | completion)
 			die "'$1': build.sh only builds (a combination's configuration: mkosi --profile=GROUP $1)" ;;
@@ -159,29 +154,28 @@ while (($#)); do
 		*) MKOSI_ARGS+=("$1"); shift ;;
 	esac
 done
-[[ -z $WORKERS || $WORKERS =~ ^[1-9][0-9]*$ ]] || die "--workers needs a thread count >= 1, got '$WORKERS'"
-# No --workers and nothing in mkosi.local.conf: all available CPUs.
+# shellcheck source=lib/conf.sh
+source "$HERE/lib/conf.sh"
+conf_load "$HERE" "$CONFIG"
+# --workers, else EROFS_WORKERS, else all available CPUs.
 WORKERS_FROM="--workers"
-if [[ -z $WORKERS ]]; then
-	if grep -qs '^[^#]*SYSTEMD_REPART_MKFS_OPTIONS_EROFS=' "$HERE/mkosi.local.conf"; then
-		WORKERS_FROM=mkosi.local.conf
-	else
-		WORKERS=$(nproc 2>/dev/null || echo 1)
-		WORKERS_FROM="all available CPUs"
-	fi
+if [[ -z $WORKERS && -n $EROFS_WORKERS ]]; then
+	WORKERS=$EROFS_WORKERS WORKERS_FROM=EROFS_WORKERS
+elif [[ -z $WORKERS ]]; then
+	WORKERS=$(nproc 2>/dev/null || echo 1) WORKERS_FROM="all available CPUs"
 fi
+[[ $WORKERS =~ ^[1-9][0-9]*$ ]] || die "$WORKERS_FROM needs a thread count >= 1, got '$WORKERS'"
 
 command -v mkosi >/dev/null || die "mkosi not found (pacman -S mkosi)"
 [[ $EUID -eq 0 ]] || die "building must run as root (the sbctl db key is root-only): sudo $0"
 
-# --users / --output-root: relative paths inside the checkout (mkosi sees the
+# USERS / --output-root: relative paths inside the checkout (mkosi sees the
 # checkout as $SRCDIR in its scripts).
 inside() { # PATH: a plain relative path below the checkout
 	[[ $1 =~ ^[A-Za-z0-9._/-]+$ && $1 != /* && /$1/ != */../* ]]
 }
-USERS_FILE=${USERS_FILE#./} OUTPUT_ROOT=${OUTPUT_ROOT#./} COMBOS_FILE=${COMBOS_FILE#./}
-inside "$USERS_FILE" || die "--users: a relative path inside the checkout, got '$USERS_FILE'"
-inside "$COMBOS_FILE" || die "--combinations: a relative path inside the checkout, got '$COMBOS_FILE'"
+USERS_FILE=${USERS#./} OUTPUT_ROOT=${OUTPUT_ROOT#./}
+inside "$USERS_FILE" || die "USERS: a relative path inside the checkout, got '$USERS_FILE'"
 inside "$OUTPUT_ROOT" || die "--output-root: a relative path inside the checkout, got '$OUTPUT_ROOT'"
 [[ -f $HERE/$USERS_FILE ]] || die "$USERS_FILE missing: cp users.conf.example users.conf and add your ssh keys"
 BUILDS_ROOT=$HERE/${OUTPUT_ROOT%/}
@@ -192,10 +186,13 @@ source "$HERE/lib/groups.sh"
 source "$HERE/lib/verify.sh"
 # shellcheck source=lib/compose.sh
 source "$HERE/lib/compose.sh"
-combos_load "$HERE/$COMBOS_FILE"
+combos_load "$COMBINATIONS"
 # shellcheck source=lib/repos.sh
 source "$HERE/lib/repos.sh"
-repos_load "$HERE"
+repos_validate
+# shellcheck source=lib/settings.sh
+source "$HERE/lib/settings.sh"
+settings_check
 mapfile -t REPO_ARGS < <(repos_mkosi_args)
 
 # Host tools that mkosi (without a tools tree) runs from the host, and what
@@ -234,14 +231,10 @@ BUILD=combined_$VERSION
 OUTDIR=$(builds_dir "$BUILD")
 PARTS=$BUILDS_ROOT/.parts-$VERSION
 # What every combination's mkosi run gets.
-EXTRA=(--image-version="$VERSION" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --environment="SAFESPACE_USERS_CONF=$USERS_FILE")
-[[ -z $WORKERS ]] || EXTRA+=(--environment="SYSTEMD_REPART_MKFS_OPTIONS_EROFS=--workers=$WORKERS")
+EXTRA=(--image-version="$VERSION" ${REPO_ARGS[@]+"${REPO_ARGS[@]}"} --environment="SAFESPACE_USERS_CONF=$USERS_FILE"
+	--environment="SYSTEMD_REPART_MKFS_OPTIONS_EROFS=--workers=$WORKERS")
 
-if ((${#URLS[@]} == 0)); then
-	# shellcheck source=/dev/null
-	[[ -f $HERE/netboot.conf ]] && source "$HERE/netboot.conf"
-	read -ra URLS <<<"${NETROOT_URL:-}"
-fi
+((${#URLS[@]})) || read -ra URLS <<<"$NETROOT_URL"
 for url in ${URLS[@]+"${URLS[@]}"}; do
 	[[ $url == http://* || $url == https://* ]] || die "netboot URL must start with http:// or https://: $url"
 	host=${url#*//}; host=${host%%/*}; host=${host%%:*}
@@ -253,14 +246,21 @@ done
 
 log "build $BUILD: ${COMBO_NAMES[*]} (default ${COMBO_NAMES[0]})"
 log "packages: $(repos_describe)"
-if ((${#NETROOT[@]})); then log "netroot: ${NETROOT[*]}"; else log "no NETROOT_URL (netboot.conf / --url): this build boots from sticks only"; fi
-if [[ -n $WORKERS ]]; then log "erofs compression: $WORKERS threads ($WORKERS_FROM)"; else log "erofs compression: threads from mkosi.local.conf"; fi
+if ((${#NETROOT[@]})); then log "netroot: ${NETROOT[*]}"; else log "no NETROOT_URL (safespace.conf / --url): this build boots from sticks only"; fi
+log "erofs compression: $WORKERS threads ($WORKERS_FROM)"
+log "identity: $(settings_policy)"
+last=$(builds_newest)
+if [[ -n $last ]]; then
+	last_policy=$(builds_info "$(builds_dir "$last")" policy 2>/dev/null || true)
+	[[ -z $last_policy || $last_policy == "$(settings_policy)" ]] ||
+		log "note: another identity policy than $last's ($last_policy): it applies to identities made after it; a machine's existing identity keeps its own (a new one: safespace identity clear, reboot)"
+fi
 repos_check
 # shellcheck source=lib/keys.sh
 source "$HERE/lib/keys.sh"
 summary=$(mktemp)
 mkosi "${EXTRA[@]}" --json summary >"$summary" || { rm -f "$summary"; die "mkosi summary failed"; }
-keys_load "$summary"
+keys_load "$summary" "$SBCTL_CONFIG"
 rm -f "$summary"
 mapfile -t key_args < <(keys_mkosi_args)
 EXTRA+=(${key_args[@]+"${key_args[@]}"})
@@ -270,13 +270,17 @@ keys_export "$DB_EXPORT"
 # shellcheck source=lib/assh.sh
 source "$HERE/lib/assh.sh"
 assh_build "$HERE/mkosi.extra/usr/bin/assh"
-# The initrd makes the identity (mkosi.initrd.conf/.../identity): aSSH and its
-# settings there too, the same file as the root's.
+# The identity's policy and the scripts' constants (lib/settings.sh): into the
+# root and the initrd (which makes the identity: mkosi.initrd.conf/.../identity),
+# aSSH there too, the same files as the root's. aSSH checks its settings.
+for t in "$HERE/mkosi.extra" "$HERE/mkosi.initrd.conf/mkosi.extra"; do settings_write "$t"; done
+assh_check_conf "$HERE/mkosi.extra/usr/bin/assh" "$HERE/mkosi.extra/etc/assh/assh.conf"
 install -D -m 0755 "$HERE/mkosi.extra/usr/bin/assh" "$HERE/mkosi.initrd.conf/mkosi.extra/usr/bin/assh"
-install -D -m 0644 "$HERE/mkosi.extra/etc/assh/assh.conf" "$HERE/mkosi.initrd.conf/mkosi.extra/etc/assh/assh.conf"
 # Keep the project owned by its user, not by root.
 chown -R --reference="$HERE" "$HERE/mkosi.extra/usr/share/safespace" "$HERE/mkosi.extra/usr/bin/assh" \
-	"$HERE/mkosi.initrd.conf/mkosi.extra/usr/bin" "$HERE/mkosi.initrd.conf/mkosi.extra/etc/assh"
+	"$HERE/mkosi.extra/etc/assh" "$HERE/mkosi.extra/usr/local/lib/safespace/settings" \
+	"$HERE/mkosi.initrd.conf/mkosi.extra/usr/bin" "$HERE/mkosi.initrd.conf/mkosi.extra/etc/assh" \
+	"$HERE/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/settings"
 keys_ensure_pcr
 [[ $SNAPSHOT == latest ]] && log "note: SNAPSHOT=latest reuses the cached image as long as the configuration is unchanged; -f installs the current packages"
 
@@ -358,7 +362,7 @@ builds_write_info "$OUTDIR" build="$BUILD" version="$VERSION" combinations="${co
 	commit="$("${git[@]}" rev-parse --short HEAD 2>/dev/null || echo none)" \
 	uncommitted_changes="$([[ -z $("${git[@]}" status --porcelain 2>/dev/null) ]] && echo no || echo yes)" \
 	signer="$(keys_fingerprint "$KEYS_SB_CERT")" netroot="$(IFS=,; echo "${NETROOT[*]-}")" \
-	builder="$(uname -n)" users="$USERS_FILE"
+	builder="$(uname -n)" users="$USERS_FILE" policy="$(settings_policy)"
 # The release file, signed by the db key (safespace update checks it).
 builds_sign_release "$OUTDIR" "$KEYS_SB_DIR/db/db.pem" "$KEYS_SB_DIR/db/db.key" ||
 	die "signing the release file with the db key failed"

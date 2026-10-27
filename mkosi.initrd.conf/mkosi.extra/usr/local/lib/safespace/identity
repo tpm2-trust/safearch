@@ -1,10 +1,10 @@
 #!/bin/sh
 # The machine's identity (SECURITY.md, "Machine identity"): made here once, all
 # of it at once, and its machine-id released here at every boot of its
-# combination. Runs in the initrd after the boot path (usb-bootdev or netroot)
-# chose and measured the combination (select: PCR 15 "safespace-combination:<name>",
-# the name in /run/safespace/combination), before the switch to the root;
-# started by safespace-identity.service.
+# combination. Runs in the initrd after safespace-select.service chose and
+# measured the combination (select: PCR 15 "safespace-combination:<name>", the
+# name in /run/safespace/combination), before the network and the boot path
+# (usb-bootdev or netroot); started by safespace-identity.service.
 #
 # The identity, both in EFI variables:
 #   SAFEmachineID  the machine-id, a systemd-creds credential (vendor GUID as
@@ -30,8 +30,10 @@
 #    combination booted. Only 'safespace identity clear' makes room for another.
 #    One variable without the other: nothing is made (identity clear).
 # 2. Unseal SAFEmachineID into /run/safespace/identity/ (RAM; /run stays across
-#    the switch to the root; "released" lists it) and to /run/machine-id, which
-#    PID 1 takes over. One that does not unseal is left alone: the root has a
+#    the switch to the root; "released" lists it) and into /run/machine-id, which
+#    PID 1 takes over, and the initrd's /etc/machine-id: written in place (PID 1
+#    bind-mounts the one over the other), so systemd-networkd, started after
+#    this, asks DHCP with it. One that does not unseal is left alone: the root has a
 #    throwaway machine-id.
 # On a TPM without an active SHA-256 bank (its firmware activates SHA-1 only:
 # ThinkPad T450s) 1 and 2 happen only while safespace tpm sha1 on allows SHA-1:
@@ -42,7 +44,8 @@
 # The boot never depends on this: every failure only means no identity.
 #
 # SAFESPACE_EFIVARS, SAFESPACE_RUN, SAFESPACE_PCREXTEND, SAFESPACE_CREDS,
-# SAFESPACE_IDENTITY_KEY, SAFESPACE_PCRSIG, SAFESPACE_MACHINE_ID, SAFESPACE_ASSH:
+# SAFESPACE_IDENTITY_KEY, SAFESPACE_PCRSIG, SAFESPACE_MACHINE_ID,
+# SAFESPACE_ETC_MACHINE_ID, SAFESPACE_ASSH (and select's):
 # only for tests/run.sh.
 
 msg() { echo "safespace-identity: $*" >/dev/kmsg 2>/dev/null || echo "safespace-identity: $*" >&2; }
@@ -55,6 +58,7 @@ ASSH=${SAFESPACE_ASSH:-assh}
 KEY=${SAFESPACE_IDENTITY_KEY:-${0%/*}/identity.pem}
 OUT=$SELECT_RUN/identity
 MACHINE_ID=${SAFESPACE_MACHINE_ID:-/run/machine-id}
+ETC_MACHINE_ID=${SAFESPACE_ETC_MACHINE_ID:-/etc/machine-id}
 ASSH_CONF=/etc/assh/assh.conf
 # The build's PCR key, whose signatures of PCR 11 the CA's slot 0 takes
 # (assh.conf's ASSH_PCR_KEY: appended to this initrd by lib/compose.sh, beside
@@ -64,18 +68,17 @@ PCR_KEY=${0%/*}/pcr.pem
 # (--with-key=tpm2-with-public-key). With plain tpm2, systemd-creds drops the
 # --tpm2-public-key* options without a word and PCR 11 is not bound at all.
 SIGNED_TYPE=5e2d5c7603724eaf843c6fb5f64098f5
-MID_VAR=SAFEmachineID MID_CRED=safespace-machine-id
-# aSSH's CA (assh.conf's ASSH_CA, aSSH's vendor GUID).
-CA_VAR=SAFEasshCA-24415b90-39be-45c0-a9a3-d547ebe28ea0
+# The variables' names, the PCRs of the seal, the CA's variable: select sourced
+# settings (lib/settings.sh, from safespace.conf).
 
 close() {
-	"$SELECT_PCREXTEND" --graceful --pcr=15 "safespace-identity:sealed" >/dev/null 2>&1 ||
+	"$SELECT_PCREXTEND" --graceful --pcr=$SAFESPACE_PCR "$SAFESPACE_SEALED_EVENT" >/dev/null 2>&1 ||
 		msg "WARNING: could not close PCR 15"
 	rm -rf "$OUT/.new"
 }
 trap close EXIT
 
-var_path() { echo "$SELECT_VARS/$1-$SELECT_GUID"; }
+var_path() { echo "$SELECT_VARS/$1-$SAFESPACE_GUID"; }
 var_rm() {
 	[ -e "$(var_path "$1")" ] || return 0
 	chattr -i "$(var_path "$1")" 2>/dev/null
@@ -123,12 +126,12 @@ signed() { # CREDENTIAL_FILE NAME
 }
 
 # Value byte of a global UEFI variable (SecureBoot, SetupMode).
-global_byte() { od -An -tu1 -j4 -N1 "$SELECT_VARS/$1-8be4df61-93ca-11d2-aa0d-00e098032b8c" 2>/dev/null | tr -d ' '; }
+global_byte() { od -An -tu1 -j4 -N1 "$SELECT_VARS/$1-$SAFESPACE_EFI_GLOBAL" 2>/dev/null | tr -d ' '; }
 
 # 1. The creation, all or nothing.
 have_mid=0 have_ca=0
-[ -e "$(var_path $MID_VAR)" ] && have_mid=1
-[ -e "$SELECT_VARS/$CA_VAR" ] && have_ca=1
+[ -e "$(var_path $SAFESPACE_MID_VAR)" ] && have_mid=1
+[ -e "$SELECT_VARS/$SAFESPACE_CA_VAR" ] && have_ca=1
 if [ $have_mid = 0 ] && [ $have_ca = 0 ]; then
 	if [ "$(global_byte SecureBoot)" != 1 ] || [ "$(global_byte SetupMode)" != 0 ]; then
 		msg "no identity: Secure Boot is off (seal the machine first)"
@@ -139,48 +142,52 @@ if [ $have_mid = 0 ] && [ $have_ca = 0 ]; then
 		ok=1
 		systemd-id128 new >"$OUT/.new/machine-id" 2>/dev/null || ok=0
 		if [ $ok = 1 ]; then
-			"$CREDS" encrypt --with-key=tpm2-with-public-key --tpm2-pcrs=7+15 \
-				--tpm2-public-key="$KEY" --tpm2-public-key-pcrs=11 \
-				--name=$MID_CRED "$OUT/.new/machine-id" "$OUT/.new/mid.cred" >/dev/null 2>&1 || { ok=0; msg "ERROR: sealing the machine-id failed"; }
+			"$CREDS" encrypt --with-key=tpm2-with-public-key --tpm2-pcrs=$SAFESPACE_MID_PCRS \
+				--tpm2-public-key="$KEY" --tpm2-public-key-pcrs=$SAFESPACE_MID_SIGNED_PCRS \
+				--name=$SAFESPACE_MID_CRED "$OUT/.new/machine-id" "$OUT/.new/mid.cred" >/dev/null 2>&1 || { ok=0; msg "ERROR: sealing the machine-id failed"; }
 		fi
 		if [ $ok = 1 ]; then
-			signed "$OUT/.new/mid.cred" $MID_CRED || { ok=0; msg "ERROR: the machine-id is not bound to the signed policy"; }
+			signed "$OUT/.new/mid.cred" $SAFESPACE_MID_CRED || { ok=0; msg "ERROR: the machine-id is not bound to the signed policy"; }
 		fi
 		if [ $ok = 1 ]; then
-			var_write $MID_VAR "$OUT/.new/mid.cred" || { ok=0; msg "ERROR: cannot write $MID_VAR"; }
+			var_write $SAFESPACE_MID_VAR "$OUT/.new/mid.cred" || { ok=0; msg "ERROR: cannot write $SAFESPACE_MID_VAR"; }
 		fi
 		if [ $ok = 1 ]; then
 			"$ASSH" ca create --config $ASSH_CONF \
-				--events "15:safespace-combination:$name" --events "15:safespace-identity:sealed" >"$OUT/.new/ca.log" 2>&1 ||
+				--events "$SAFESPACE_PCR:$SAFESPACE_COMBINATION_EVENT$name" --events "$SAFESPACE_PCR:$SAFESPACE_SEALED_EVENT" >"$OUT/.new/ca.log" 2>&1 ||
 				{ ok=0; msg "ERROR: creating the CA failed: $(tail -1 "$OUT/.new/ca.log")"; }
 		fi
 		if [ $ok = 1 ]; then
 			msg "the identity is made, for $name: the machine-id and the CA"
 		else
 			# All or nothing: what was made goes.
-			var_rm $MID_VAR
-			if [ -e "$SELECT_VARS/$CA_VAR" ]; then
+			var_rm $SAFESPACE_MID_VAR
+			if [ -e "$SELECT_VARS/$SAFESPACE_CA_VAR" ]; then
 				"$ASSH" ca remove --config $ASSH_CONF >/dev/null 2>&1
 			fi
 			msg "ERROR: no identity made"
 		fi
 	fi
 elif [ $have_mid != $have_ca ]; then
-	msg "the identity is incomplete ($MID_VAR $([ $have_mid = 1 ] && echo there || echo missing), SAFEasshCA $([ $have_ca = 1 ] && echo there || echo missing)): nothing made; sudo safespace identity clear"
+	msg "the identity is incomplete ($SAFESPACE_MID_VAR $([ $have_mid = 1 ] && echo there || echo missing), ${SAFESPACE_CA_VAR%%-*} $([ $have_ca = 1 ] && echo there || echo missing)): nothing made; sudo safespace identity clear"
 fi
 
 # 2. The machine-id, where this is its combination.
-if [ -r "$(var_path $MID_VAR)" ]; then
-	tail -c +5 "$(var_path $MID_VAR)" >"$OUT/.new/in.cred"
-	if "$CREDS" decrypt --tpm2-signature="$sig" --name=$MID_CRED "$OUT/.new/in.cred" "$OUT/machine-id" >/dev/null 2>&1; then
-		msg "$MID_VAR released"
-		echo $MID_VAR >>"$OUT/released"
+if [ -r "$(var_path $SAFESPACE_MID_VAR)" ]; then
+	tail -c +5 "$(var_path $SAFESPACE_MID_VAR)" >"$OUT/.new/in.cred"
+	if "$CREDS" decrypt --tpm2-signature="$sig" --name=$SAFESPACE_MID_CRED "$OUT/.new/in.cred" "$OUT/machine-id" >/dev/null 2>&1; then
+		msg "$SAFESPACE_MID_VAR released"
+		echo $SAFESPACE_MID_VAR >>"$OUT/released"
 	else
 		rm -f "$OUT/machine-id"
-		msg "$MID_VAR not released (combination $name is not this machine's, or the firmware changed)"
+		msg "$SAFESPACE_MID_VAR not released (combination $name is not this machine's, or the firmware changed)"
 	fi
 fi
+# In place, not replaced: PID 1 bind-mounts /run/machine-id over /etc/machine-id
+# (read-only); where it does not, /etc/machine-id is written itself.
 if [ -s "$OUT/machine-id" ]; then
-	install -m 0444 "$OUT/machine-id" "$MACHINE_ID" || msg "WARNING: cannot hand the machine-id to PID 1"
+	{ cat "$OUT/machine-id" >"$MACHINE_ID" && chmod 0444 "$MACHINE_ID"; } || msg "WARNING: cannot hand the machine-id to PID 1"
+	[ "$(cat "$ETC_MACHINE_ID" 2>/dev/null)" = "$(cat "$OUT/machine-id")" ] || cat "$OUT/machine-id" >"$ETC_MACHINE_ID" ||
+		msg "WARNING: cannot hand the machine-id to the initrd's network"
 fi
 exit 0

@@ -7,7 +7,9 @@
 Description=Find and open the root partition on the boot stick
 DefaultDependencies=no
 ConditionPathExists=/sys/firmware/efi/efivars/LoaderDevicePartUUID-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
-After=systemd-udev-trigger.service systemd-udevd.service
+# The combination, chosen and measured before (safespace-select.service).
+Requires=safespace-select.service
+After=safespace-select.service systemd-udev-trigger.service systemd-udevd.service
 Wants=systemd-udev-trigger.service
 Before=initrd-root-device.target cryptsetup-pre.target veritysetup-pre.target sysroot.mount
 

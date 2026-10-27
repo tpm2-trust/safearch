@@ -25,7 +25,7 @@
 # Options where they apply: --yes (no YES asked).
 #
 # select: the initrd reads the choice from an EFI variable (SafespaceSelect, once:
-#   SafespaceSelectOnce; vendor GUID 8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34); the root
+#   SafespaceSelectOnce; the names and the GUID: settings, as the initrd's); the root
 #   hash of every combination is on the UKI's signed command line, so only the names
 #   offered there can be selected. The identity stays with its combination: another
 #   one boots with aSSH's temporary host key (not the machine's) - unless the identity
@@ -43,7 +43,8 @@
 # identity (SECURITY.md, "Machine identity"): made by the initrd at the first boot
 #   with Secure Boot on, all at once and without a step: the machine-id
 #   (SAFEmachineID) and aSSH's CA (SAFEasshCA; its private key never leaves the
-#   TPM), bound to the combination booted. The CA certifies the host key while the
+#   TPM), bound to the combination booted, under the policy the image was built
+#   with (safespace.conf). By default the CA certifies the host key while the
 #   firmware, Secure Boot and the combination are as at the creation and the UKI is
 #   one the build host signed (slot 0): updates need nothing. Firmware or an option
 #   ROM changed: slot 1 (Secure Boot and the combination). Nothing can approve
@@ -63,14 +64,11 @@
 #   new UKI (checked by Secure Boot), the identity follows it unattended.
 set -Eeuo pipefail
 
-# The identity's state, the variables' names, what sshd serves: one place, the
-# login's too.
+# The identity's state, the variables' names (settings), what sshd serves: one
+# place, the login's too.
 . /usr/local/lib/safespace/state.sh
 KEYS=/usr/share/safespace/secureboot
 IMGSEC=d719b2cb-3d3a-4596-a3bc-dad00e67656f
-# The machine's inventory ID: its machine-id, hashed for this application
-# (machine-id(5): the machine-id itself stays confidential).
-APP_ID=eda1fc8c35e94e2087addff88d0b4e91
 ASSH=/usr/bin/assh
 ASSH_CONF=/etc/assh/assh.conf
 
@@ -135,9 +133,9 @@ efivars_rw() {
 # A variable of the selection's vendor GUID: read, removed (efivarfs makes them
 # immutable: chattr -i first), written (the attributes NV, BS, RT, then the value,
 # in one write).
-sel_var() { [[ -r $EFIVARS/$1-$SELECT_GUID ]] && tail -c +5 "$EFIVARS/$1-$SELECT_GUID" | tr -d '\000\n' || true; }
-sel_var_rm() { local f=$EFIVARS/$1-$SELECT_GUID; [[ -e $f ]] || return 0; chattr -i "$f" 2>/dev/null || true; rm -f "$f"; }
-sel_var_write() { sel_var_rm "$1"; printf '\x07\x00\x00\x00%s' "$2" >"$EFIVARS/$1-$SELECT_GUID"; }
+sel_var() { [[ -r $EFIVARS/$1-$SAFESPACE_GUID ]] && tail -c +5 "$EFIVARS/$1-$SAFESPACE_GUID" | tr -d '\000\n' || true; }
+sel_var_rm() { local f=$EFIVARS/$1-$SAFESPACE_GUID; [[ -e $f ]] || return 0; chattr -i "$f" 2>/dev/null || true; rm -f "$f"; }
+sel_var_write() { sel_var_rm "$1"; printf '\x07\x00\x00\x00%s' "$2" >"$EFIVARS/$1-$SAFESPACE_GUID"; }
 confirm() { # QUESTION
 	((CONFIRM)) || return 0
 	local answer
@@ -150,7 +148,7 @@ select_show() {
 	row combinations "" "${NAMES[*]}"
 	row booted "$(identity_state)" "$(booted)"
 	local p o
-	p=$(sel_var SafespaceSelect) o=$(sel_var SafespaceSelectOnce)
+	p=$(sel_var $SAFESPACE_SELECT_VAR) o=$(sel_var $SAFESPACE_SELECT_ONCE_VAR)
 	row preselected "" "${p:-$FIRST (none set)}"
 	[[ -z $o ]] || row "next boot" noidentity "$o (once)"
 }
@@ -167,16 +165,16 @@ select_cmd() {
 	need_root select
 	efivars_rw
 	if ((ONCE)); then
-		sel_var_write SafespaceSelectOnce "$to" || die "could not write SafespaceSelectOnce"
+		sel_var_write $SAFESPACE_SELECT_ONCE_VAR "$to" || die "could not write $SAFESPACE_SELECT_ONCE_VAR"
 		echo "next boot only: $to"
 	else
 		if [[ $to == "$FIRST" ]]; then
-			sel_var_rm SafespaceSelect || die "could not remove SafespaceSelect"
+			sel_var_rm $SAFESPACE_SELECT_VAR || die "could not remove $SAFESPACE_SELECT_VAR"
 			if ((DEFAULT_SEL)); then
-				sel_var_rm SafespaceSelectOnce || die "could not remove SafespaceSelectOnce"
+				sel_var_rm $SAFESPACE_SELECT_ONCE_VAR || die "could not remove $SAFESPACE_SELECT_ONCE_VAR"
 			fi
 		else
-			sel_var_write SafespaceSelect "$to" || die "could not write the selection (efivarfs read-only?)"
+			sel_var_write $SAFESPACE_SELECT_VAR "$to" || die "could not write the selection (efivarfs read-only?)"
 		fi
 		echo "from the next boot on: $to"
 	fi
@@ -224,7 +222,7 @@ seal_cmd() {
 	log "SetupMode=${setup:-?} SecureBoot=$(var_byte SecureBoot)"
 	[[ $setup == 1 ]] || die "the machine is not in Setup Mode. In the firmware setup choose \"Reset to Setup Mode\" or \"Clear Secure Boot keys\", then boot this stick again."
 	echo "Currently enrolled:"
-	for v in PK KEK; do echo "  $v:"; list_var $v $GLOBAL; done
+	for v in PK KEK; do echo "  $v:"; list_var $v $SAFESPACE_EFI_GLOBAL; done
 	for v in db dbx; do echo "  $v:"; list_var $v $IMGSEC; done
 	echo "Will enroll (signed by the keys of this stick):"
 	for k in PK KEK db; do
@@ -238,7 +236,7 @@ seal_cmd() {
 	fi
 	confirm "Enroll these keys?"
 	# Existing variables are immutable in efivarfs.
-	for v in KEK-$GLOBAL db-$IMGSEC PK-$GLOBAL; do
+	for v in KEK-$SAFESPACE_EFI_GLOBAL db-$IMGSEC PK-$SAFESPACE_EFI_GLOBAL; do
 		[[ -e $EFIVARS/$v ]] && chattr -i "$EFIVARS/$v"
 	done
 	# db and KEK first: writing PK ends Setup Mode, after which only signed
@@ -310,8 +308,10 @@ tpm_cmd() {
 # --- the identity --------------------------------------------------------------------
 identity_show() {
 	if [[ -e $MID_VAR ]]; then
-		if grep -qx SAFEmachineID /run/safespace/identity/released 2>/dev/null; then
-			row machine-id green "the machine's (released in this combination); inventory ID $(systemd-id128 machine-id --app-specific=$APP_ID)"
+		if grep -qx "$SAFESPACE_MID_VAR" /run/safespace/identity/released 2>/dev/null; then
+			# The inventory ID: the machine-id hashed for this application
+			# (machine-id(5): the machine-id itself stays confidential).
+			row machine-id green "the machine's (released in this combination); inventory ID $(systemd-id128 machine-id --app-specific=$SAFESPACE_APP_ID)"
 		else
 			row machine-id noidentity "throwaway (the machine's is sealed to another combination)"
 		fi
@@ -325,10 +325,12 @@ identity_show() {
 			row identity none "none: Secure Boot is not on (sudo safespace seal, then switch it on)"
 		fi
 	else
-		row identity green "the CA in this TPM (SAFEasshCA):"
+		row identity green "the CA in this TPM (${SAFESPACE_CA_VAR%%-*}):"
 		# A CA that does not load is shown with aSSH's error, the overview goes on.
 		{ "$ASSH" ca show --config "$ASSH_CONF" 2>&1 || true; } | sed 's/^/  /'
 	fi
+	# What this image binds an identity to (the build's safespace.conf).
+	row policy "" "$SAFESPACE_POLICY"
 	local key fp st
 	key=$(served_hostkey) st=$(identity_state)
 	fp=$(ssh-keygen -lf - <<<"$key" 2>/dev/null | cut -d' ' -f2) || true
@@ -350,7 +352,7 @@ identity_remove() {
 	need_assh
 	efivars_rw
 	"$ASSH" ca remove --config "$ASSH_CONF" || die "removing the CA failed"
-	sel_var_rm SAFEmachineID || die "could not remove SAFEmachineID"
+	sel_var_rm $SAFESPACE_MID_VAR || die "could not remove $SAFESPACE_MID_VAR"
 	log "the identity is removed. sshd serves the temporary key; the next boot with Secure Boot on makes a new one (a new @cert-authority line for the clients)"
 }
 

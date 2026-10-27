@@ -12,14 +12,16 @@
 #                   build again is how a release is rolled back.
 #   (without)       the newest build
 #   --builds DIR    where the builds are (default: mkosi.output; tests/vm.sh
-#                   keeps its test builds apart)
+#                   keeps its test builds apart). A build from elsewhere goes
+#                   only where --push says, never to RELEASE_TARGETS: a test
+#                   build carries the test key and must never reach a real server.
 #   --stage DIR     where the release is staged (default: mkosi.release)
 #   --push TARGET   distribution server to push to, repeatable. TARGET is the
 #                   upload account, e.g. safespace@dist1.example.org (its ssh
 #                   key only reaches the share, see server/setup.sh), or a
 #                   local share directory, e.g. /srv/safespace/share. Without
-#                   --push: RELEASE_TARGETS= from release.conf (gitignored,
-#                   see release.conf.example); none at all = stage only.
+#                   --push: RELEASE_TARGETS= of safespace.conf (this host's
+#                   in safespace.local.conf); none at all = stage only.
 #
 # The bundle, mkosi.release/ (the newest release only): the build's parts as
 # hardlinks (nothing is copied or unpacked) plus the release files:
@@ -61,9 +63,13 @@ while (($#)); do
 		*) usage >&2; die "unknown option $1" ;;
 	esac
 done
-if ((${#TARGETS[@]} == 0)) && [[ -f $HERE/release.conf ]]; then
-	targets=$(sed -n 's/^RELEASE_TARGETS=//p' "$HERE/release.conf" | tail -1 | tr -d '"'"'")
-	read -ra TARGETS <<<"$targets"
+# shellcheck source=lib/conf.sh
+source "$HERE/lib/conf.sh"
+conf_load "$HERE"
+if [[ $BUILDS_ROOT == "$HERE/mkosi.output" ]]; then
+	((${#TARGETS[@]})) || read -ra TARGETS <<<"$RELEASE_TARGETS"
+elif ((${#TARGETS[@]} == 0)) && [[ -n $RELEASE_TARGETS ]]; then
+	log "builds from ${BUILDS_ROOT#"$HERE"/}, not mkosi.output: not to RELEASE_TARGETS (only --push)"
 fi
 for cmd in sbverify objcopy veritysetup sha256sum openssl; do
 	command -v "$cmd" >/dev/null || die "missing '$cmd' (pacman -S sbsigntools binutils cryptsetup openssl)"
@@ -144,4 +150,4 @@ for target in "${TARGETS[@]}"; do
 	echo "$(date -Is) $target" >>"$DIR/released.log"
 	log "  $target now serves $BUILD and checks it (there: safespace-netboot status)"
 done
-((${#TARGETS[@]})) || log "No --push target: staged only (RELEASE_TARGETS= in release.conf, or --push)"
+((${#TARGETS[@]})) || log "No --push target: staged only (RELEASE_TARGETS= in safespace.local.conf, or --push)"

@@ -69,7 +69,7 @@ When the user requests a programming task, **do not start coding immediately.**
 
 safespace-arch: a read-only, Secure-Boot-signed Arch Linux image built with
 mkosi 27: one build boots from a USB stick / SD card and over the network; it holds every
-combination of package groups (`combinations.conf`) as a root of its own. README.md is
+combination of package groups (`COMBINATIONS` in `safespace.conf`) as a root of its own. README.md is
 the user manual (read "Two roles" and "Deploy from scratch" first), NETBOOT.md
 the network-boot reference, SECURITY.md the applied hardening. Arch Linux only, everywhere.
 
@@ -79,13 +79,14 @@ the network-boot reference, SECURITY.md the applied hardening. Arch Linux only, 
 |---|---|
 | build host (has the keys) | `build.sh` (entry point), `release.sh`, `fetch-images.sh`, `update-snapshot.sh`, `burn.sh`, `diagnose.sh`, `test-vm.sh`, `hwtest-image.sh` |
 | image configuration | `mkosi.conf` (the image, both boot paths), `mkosi.profiles/{docker,xfce4-headless-vnc,debug}/` (groups), `mkosi.repart/`, `mkosi.extra/`, `mkosi.postinst`, `mkosi.finalize`, `mkosi.postoutput` |
-| initrd | `mkosi.initrd.conf/`: `usb-bootdev` (root from the stick) and `netroot` (root over HTTP), chosen at boot by `LoaderDevicePartUUID`; `select` (sourced by both: which root of a combined build) |
-| combinations | `combinations.conf` (the first is the default), `lib/compose.sh` (one mkosi run per combination → one UKI for all roots; `compose_check`), `mkosi.extra/usr/local/sbin/safespace select` |
+| initrd | `mkosi.initrd.conf/`: `usb-bootdev` (root from the stick) and `netroot` (root over HTTP), chosen at boot by `LoaderDevicePartUUID`; `choose` (safespace-select.service, before both and the identity) decides the combination with `select` (sourced by all: which root of a combined build); `identity` before the network |
+| configuration | `safespace.conf` (every key, its default; this host's: `safespace.local.conf`), `lib/conf.sh` (parsed, not sourced), `lib/settings.sh` (the identity's policy checked, `assh.conf` from `lib/assh.conf.in` and the scripts' `settings` written into root and initrd: no constant twice in the image) |
+| combinations | `COMBINATIONS` (the first is the default), `lib/compose.sh` (one mkosi run per combination → one UKI for all roots; `compose_check`), `mkosi.extra/usr/local/sbin/safespace select` |
 | distribution server | `server/` (`setup.sh`, `safespace-netboot`, units, nginx site, `server.conf.example`) |
 | shared shell code | `lib/repos.sh`, `lib/groups.sh`, `lib/keys.sh`, `lib/builds.sh` (the builds in `mkosi.output/combined_<version>/`: their parts, list, prune), `lib/stick.sh` (a stick assembled from the parts), `lib/verify.sh` (also installed on the servers; the release checks, a UKI's sections, the partition types and UUIDs of a stick: the one copy of each), `lib/assh.sh` (builds aSSH) |
-| machine identity | `assh/` (submodule, [aSSH](assh/README.md), Go: the host key in the TPM, its CA; built by `lib/assh.sh` with the build host's Go into `mkosi.extra/usr/bin/assh`), `mkosi.extra/etc/assh/assh.conf`, `assh-agent.service`, `safespace` (`identity`, `identity clear`, `update`, `issue`: the console before the login), `mkosi.extra/usr/local/lib/safespace/state.sh` (the identity's state, for the login and `safespace` alike), the initrd's `identity` (makes the machine-id and the CA at once; aSSH in the initrd); SECURITY.md "Machine identity" |
+| machine identity | `assh/` (submodule, [aSSH](assh/README.md), Go: the host key in the TPM, its CA; built by `lib/assh.sh` with the build host's Go into `mkosi.extra/usr/bin/assh`), `/etc/assh/assh.conf` (generated: `lib/settings.sh`), `assh-agent.service`, `safespace` (`identity`, `identity clear`, `update`, `issue`: the console before the login), `mkosi.extra/usr/local/lib/safespace/state.sh` (the identity's state, for the login and `safespace` alike), the initrd's `identity` (makes the machine-id and the CA at once; aSSH in the initrd); SECURITY.md "Machine identity" |
 | tests | `tests/run.sh` (no root), `tests/vm.sh` (integration in QEMU), `tests/lib/` |
-| per-host files (gitignored, templates `*.example`) | `users.conf`, `netboot.conf`, `release.conf`, `mkosi.local.conf`, `repos.local.conf`, `server/server.conf` |
+| per-host files (gitignored) | `safespace.local.conf` (the keys: `safespace.conf`), `users.conf`, `mkosi.local.conf` (raw mkosi only), `server/server.conf` (templates `*.example`) |
 
 ### Invariants — a change that breaks one of these needs the user's explicit OK
 
@@ -119,11 +120,15 @@ the network-boot reference, SECURITY.md the applied hardening. Arch Linux only, 
 - Run `tests/run.sh` after every change (no root, ~15 s). Add a test for new
   behaviour there: fixtures with throwaway keys are in `tests/lib/fixtures.sh`.
   A SKIP is not a pass: say which tool was missing.
-- After a change to the image, the initrd, the build, the release or the server, run the
-  integration test `tests/vm.sh` (test build with a throwaway user, release into its own
+- After a change to the image, the initrd, the build, the release or the server, the
+  integration test `tests/vm.sh` is due - but only once the user has acknowledged that the
+  rework is complete. Every run, a single step too, builds every combination, and a full
+  one boots them all: it takes a long while, so it is not run after each step or fix.
+  Until then `tests/run.sh`; then say the rework is done and ask before running it (also
+  again after a fix for a failed run). `tests/vm.sh` (test build with a throwaway user, release into its own
   share, server check, QEMU boots from a stick and over the network, sealing, Secure Boot,
   every combination booted through the selection; the boots run side by side, `--jobs N`;
-  one mkosi run per combination, so the build's duration grows with `combinations.conf`). It needs the build host's sudo rule for `build.sh`; if a prerequisite is
+  one mkosi run per combination, so the build's duration grows with `COMBINATIONS`). It needs the build host's sudo rule for `build.sh`; if a prerequisite is
   missing it says which: hand that to the user instead of working around it. Never release
   a test build (`mkosi.test/vm/builds/`) to a real server: it carries the test key.
 - Not testable without root or hardware — say so and hand it to the user with

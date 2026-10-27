@@ -98,10 +98,17 @@ An Arch Linux machine (not a container: the build needs loop devices and root).
 git clone <this repository> safearch && cd safearch
 sudo pacman -S --needed mkosi systemd-ukify sbctl efitools sbsigntools dosfstools mtools erofs-utils zstd cpio rsync skopeo go
 cp users.conf.example users.conf             # your users and their ssh public keys
-cp netboot.conf.example netboot.conf         # NETROOT_URL=http://<distribution server>/safespace/ (or none: sticks only)
-cp release.conf.example release.conf         # RELEASE_TARGETS="safespace@<distribution server>"
-cp mkosi.local.conf.example mkosi.local.conf # optional: erofs threads, a dedicated key set
+cat >safespace.local.conf <<'END'            # this host's choices; every key: safespace.conf
+NETROOT_URL=http://<distribution server>/safespace/
+RELEASE_TARGETS="safespace@<distribution server>"
+END
 ```
+
+Everything a build can be told is in **one file**, [`safespace.conf`](safespace.conf): the
+combinations, the users file, the package source, the netroot URLs, the release targets,
+the Secure Boot keys and the machine identity's policy (PCRs, key types). This host's
+choices go into `safespace.local.conf` (gitignored); see
+[The configuration](#the-configuration-safespaceconf).
 
 Secure Boot keys, once — the host's sbctl, or a key set of its own for safespace
 (see [Secure Boot keys](#secure-boot-keys)):
@@ -218,17 +225,16 @@ else refers to it). Under the kernel lockdown (`lockdown=integrity`,
 
 ## Combinations: the whole stack in one build
 
-`combinations.conf` lists what a build holds, `<name>=<groups>`, one per line. The
-repository ships two, which keeps builds and the integration test short; the others are
-there as comments, to enable for a real build:
+`COMBINATIONS=` in `safespace.conf` lists what a build holds, `<name>=<groups>`, space
+separated. The default holds three; others are a line in `safespace.local.conf` away:
 
-| Combination | Groups | In `combinations.conf` |
+| Combination | Groups | In the default |
 |---|---|---|
 | `root` (the default: booted without a selection) | base | yes |
 | `containers` | base, docker | yes |
-| `remotedesktop` | base, xfce4-headless-vnc | commented out |
-| `remote-workstation` | base, docker, xfce4-headless-vnc | commented out |
-| `debug` | base, debug | commented out |
+| `debug` | base, debug | yes |
+| `remotedesktop` | base, xfce4-headless-vnc | no |
+| `remote-workstation` | base, docker, xfce4-headless-vnc | no |
 
 `sudo ./build.sh` builds every combination with a mkosi run of its own (the groups as
 profiles) and composes them into one build, `mkosi.output/combined_<version>/`:
@@ -290,7 +296,7 @@ only **names** a combination; its root hash always comes from the signed command
 whoever can write the variable (root on the machine, or the firmware setup without a
 password) can choose between the signed roots, never boot an unsigned one. An unknown name
 stops the boot with a message instead of falling back silently: renaming a combination in
-`combinations.conf` stops machines preselected to the old name (`safespace select --default`
+`COMBINATIONS` stops machines preselected to the old name (`safespace select --default`
 before the update). The choice is measured into the TPM (PCR 15): only the combination a
 sealed machine belongs to gets its identity ([Machine identity](#machine-identity)).
 
@@ -307,7 +313,7 @@ and db (`<keydir>/<K>/<K>.{key,pem}`) plus its GUID file:
 | | Setting | Create it |
 |---|---|---|
 | the host's sbctl (default) | `SecureBootKey=/var/lib/sbctl/keys/db/db.key` in `mkosi.conf` | `sudo sbctl create-keys` |
-| a dedicated key set for safespace | `Environment=SAFESPACE_SBCTL_CONFIG=/var/lib/safespace/sbctl/sbctl.conf` in `mkosi.local.conf` | see below |
+| a dedicated key set for safespace | `SBCTL_CONFIG=/var/lib/safespace/sbctl/sbctl.conf` in `safespace.local.conf` | see below |
 
 A dedicated set keeps the safespace keys apart from the ones that sign the build host's own
 boot chain, and can be rotated on its own:
@@ -316,7 +322,7 @@ boot chain, and can be rotated on its own:
 sudo install -d -m 0700 /var/lib/safespace/sbctl
 printf 'keydir: /var/lib/safespace/sbctl/keys\nguid: /var/lib/safespace/sbctl/GUID\n' | sudo tee /var/lib/safespace/sbctl/sbctl.conf
 sudo sbctl --config /var/lib/safespace/sbctl/sbctl.conf create-keys
-echo 'Environment=SAFESPACE_SBCTL_CONFIG=/var/lib/safespace/sbctl/sbctl.conf' >>mkosi.local.conf   # under [Build]
+echo 'SBCTL_CONFIG=/var/lib/safespace/sbctl/sbctl.conf' >>safespace.local.conf
 ```
 
 `build.sh` then signs the UKI and systemd-boot with that set's db key, and **exports the
@@ -398,7 +404,8 @@ sudo ./build.sh                                   # the whole stack; -f to rebui
 ./release.sh                                      # the newest build
 ```
 
-Targets: `RELEASE_TARGETS=` in `release.conf`, or `--push safespace@dist1 --push …`. Before
+Targets: `RELEASE_TARGETS=` in `safespace.local.conf`, or `--push safespace@dist1 --push …`
+(a build from another directory, `--builds`, as the test's, goes only where `--push` says). Before
 pushing, `release.sh` prints the build it picked (combinations, built at, snapshot, commit,
 packages) and warns if a newer build was never released. Every push is
 appended to the build's `released.log`.
@@ -607,9 +614,10 @@ lockdown, and none of what the roots leave out: Wi-Fi/Bluetooth/NVIDIA drivers a
 firmware packages but the selected ones (both microcode packages present), headers, docs, man
 pages, locales but en_US), and the machine identity on a software TPM. It touches no real
 user, key, build or server. Exit 0 only if every step passed. The test build has combinations
-of its own, `tests/vm.combinations.conf` (`build.sh --combinations`): `root` (base) and
-`containers` (base, docker), few to keep it fast and independent of what `combinations.conf`
-builds for real.
+of its own, `tests/vm.safespace.conf` (`build.sh --config`, on top of `safespace.conf`):
+`root` (base) and `containers` (base, docker), few to keep it fast and independent of what
+is built for real; the step `identity-policy` builds once more with `tests/vm.policy.conf` on
+top (another identity policy).
 
 ```sh
 tests/vm.sh                          # build the whole stack, release, all steps
@@ -625,13 +633,14 @@ tests/vm.sh --no-build --jobs 2      # at most two VMs at a time
 | `seal` | Setup Mode → `safespace seal` → the sealed firmware | Secure Boot `enabled (user)`, `verified`, `running` |
 | `net-sb` | network boot with enforced Secure Boot | Secure Boot enabled, `verified`, `running` |
 | `select` | on the sealed firmware, one VM, one boot after the other: no selection, `safespace select <second>`, `once <first>`, the second again (persistent), `clear`, the first again. Side by side, every further combination in a VM of its own: `SafespaceSelectOnce=<name>` written into a copy of the sealed variables (`virt-fw-vars`) | the booted combination's name (the initrd's choice, `/usr/lib/safespace/combination`, `PRETTY_NAME`, the login banner) and groups (`/usr/lib/safespace/groups`; the docker command exactly with the docker group); a preset `SafespaceSelectOnce` deleted by the initrd; `debug` has exactly the default's setuid/setgid files, file capabilities and enabled units; each Secure Boot enabled and `verified` |
-| `identity` | on a TPM of its own (swtpm, `test-vm.sh --tpm`) and a copy of the sealed firmware, the first two boots first, then each further case side by side on a copy of their TPM and variables, with a client that trusts only the CA (`@cert-authority`, `StrictHostKeyChecking yes`): the first sealed boot, the default again, `containers` once, over the network, an option ROM more (PCR 2), another db certificate (PCR 7), the stick of a second build (B, built while A boots), `safespace identity clear`, the agent failing; beside them a new TPM with the SHA-1 bank only (`--tpm-banks sha1`); last `safespace update` on a network boot (B into the share) | first boot: the initrd makes the machine-id and the CA at once, certified through slot 0 in the same boot; the default again: slot 0, the same machine-id, an agent restart gets no certificate (window closed; sshd restarts with it, the first state is kept), its root can't unseal the machine-id (also not after extending PCR 15); `containers`: temporary key, nothing released; network, PCR 2: slot 1; PCR 7: temporary; build B: slot 0 with no step, the same CA and machine-id; identity clear: the next boot a new CA (the old line refused) and machine-id; the agent failing: the throwaway key, the reason on the console; SHA-1 only: without `safespace tpm sha1 on` nothing made, with it the identity on SHA-1, after `tpm sha1 off` neither; `safespace update`: up to date, then B checked and booted, slot 0, the same CA and machine-id ([Machine identity](#machine-identity)) |
+| `identity` | on a TPM of its own (swtpm, `test-vm.sh --tpm`) and a copy of the sealed firmware, the first two boots first, then each further case side by side on a copy of their TPM and variables, with a client that trusts only the CA (`@cert-authority`, `StrictHostKeyChecking yes`): the first sealed boot, the default again, `containers` once, over the network, an option ROM more (PCR 2), another db certificate (PCR 7), the stick of a second build (B, built while A boots), `safespace identity clear`, the agent failing; beside them a new TPM with the SHA-1 bank only (`--tpm-banks sha1`); last `safespace update` on a network boot (B into the share) | first boot: the initrd makes the machine-id and the CA at once, certified through slot 0 in the same boot; the default again: slot 0, the same machine-id, an agent restart gets no certificate (window closed; sshd restarts with it, the first state is kept), its root can't unseal the machine-id (also not after extending PCR 15); `containers`: temporary key, nothing released; network, PCR 2: slot 1; PCR 7: temporary; build B: slot 0 with no step, the same CA and machine-id; identity clear: the next boot a new CA (the old line refused) and machine-id; the agent failing: the throwaway key, the reason on the console; SHA-1 only: without `safespace tpm sha1 on` nothing made, with it the identity on SHA-1, after `tpm sha1 off` neither; `safespace update`: up to date, then B checked and booted, slot 0, the same CA and machine-id; build C (`tests/vm.policy.conf`: one slot `0,7,15+11`, `KEY_TYPES=p256`) on a new TPM: the identity made under that policy - certified through that slot, an ECDSA CA and host key, `safespace identity` names the policy ([Machine identity](#machine-identity)) |
 
 **Kept apart from everything real**, in `mkosi.test/vm/` (gitignored): the test user
 `tester` and its key (created on the first run, used for nothing else), the test builds
-(`build.sh --users mkosi.test/vm/users.conf --output-root mkosi.test/vm/builds`; the newest is
-kept; `./build.sh list` and `./release.sh` never see them, so a build with the test key
-cannot reach a real server by accident), and one directory per run with the share and the
+(`build.sh --config tests/vm.safespace.conf --output-root mkosi.test/vm/builds`; the newest is
+kept; `./build.sh list` and `./release.sh` never see them, and `release.sh --builds` never
+pushes to `RELEASE_TARGETS`, so a build with the test key cannot reach a real server by
+accident), and one directory per run with the share and the
 logs. The test build loads its root from `http://10.0.2.2:8790/` (QEMU's view of the build
 host), where one HTTP server serves the share to every network boot.
 
@@ -686,7 +695,7 @@ Common to both:
 - **DHCP and DNS** come from the virtual network (QEMU's user network or a libvirt NAT
   network), which uses the **resolver of the VM host**. A host name in the root URL (the
   `NETROOT_URL` signed into the UKI) only resolves if that host's DNS knows it. If not, use
-  the server's IP in `netboot.conf`, or the name plus the IP as fallback
+  the server's IP in `NETROOT_URL` (`safespace.local.conf`), or the name plus the IP as fallback
   (`NETROOT_URL="http://arch.boot.internal/safespace/ http://10.0.0.1/safespace/"`, tried in
   order), and rebuild. Check on the VM host: `getent hosts arch.boot.internal`.
 - **RAM:** at least the booted root image + 2 GiB (4 GiB).
@@ -1018,7 +1027,7 @@ Everything below is on top of what `mkosi build` with `Distribution=arch` and st
 packages would give you. Stock Arch defaults (e.g. the nftables ruleset in
 `/etc/nftables.conf`: input policy drop, ssh allowed) are not listed.
 
-### Build configuration (`mkosi.conf`, `mkosi.profiles/`, `repos.conf`)
+### Build configuration (`mkosi.conf`, `mkosi.profiles/`, `safespace.conf`)
 
 `mkosi.conf` holds the whole image, for both boot paths; `mkosi.profiles/<group>/` add the
 package groups, which mkosi merges in when the profile is active (`build.sh` passes a
@@ -1036,7 +1045,7 @@ combination's groups as `--profile=<group>`).
 | `SplitArtifacts=uki,roothash,partitions`, `ManifestFormat=json` | the UKI, the root hash, the root and verity partitions as separate files, and the package list; `build.sh` keeps only these (plus systemd-boot and the partition table) and deletes the disk image |
 | `CompressOutput=no` | the parts are kept and shipped as they are (the root is erofs, compressed already) |
 | `OutputDirectory=mkosi.output` | outputs out of the project root |
-| `--snapshot=`/`--mirror=` from `repos.conf` | set by `build.sh`, not in `mkosi.conf`: pinned Arch Linux Archive day or `latest`, default or own mirror (see ["Package source"](#package-source-snapshot-and-mirror)) |
+| `--snapshot=`/`--mirror=` from `safespace.conf` | set by `build.sh`, not in `mkosi.conf`: pinned Arch Linux Archive day or `latest`, default or own mirror (see ["Package source"](#package-source-snapshot-and-mirror)) |
 | `Incremental=yes`, `CacheDirectory=`, `PackageCacheDirectory=` | two cache levels: downloaded packages and the installed system |
 | `Environment=SYSTEMD_REPART_MKFS_OPTIONS_VFAT=-S512` | FAT with 512-byte sectors (many firmwares don't read 4K-sector FAT on USB), while erofs and verity keep 4K blocks |
 | `Ssh=never` | no sshd-over-vsock units for `mkosi vm` |
@@ -1044,7 +1053,7 @@ combination's groups as `--profile=<group>`).
 | `KernelModules=` (all but Wi-Fi, Bluetooth, nouveau/nova), `FirmwareFiles=-nvidia/` | every network client downloads its whole root (and holds it in RAM); modules and firmware are zstd already, so erofs cannot shrink them, and they were 2/3 of the base root. With a module filter mkosi keeps only the firmware the remaining modules declare, plus microcode. The image has no Wi-Fi tools; a headless machine needs no nouveau. Applied on every build, after mkosi's cache |
 | `RemoveFiles=` `/usr/include`, docs, man/info pages; `mkosi.postinst`: locales other than `en`/`en_US` | nothing on a read-only machine without compilers reads them. Not `WithDocs=no`/pacman `NoExtract`: mkosi's cache manifest does not cover them, so a cached tree would keep the files |
 | `mkosi.version` | `ImageVersion` is the build timestamp, so every build gets its own directory. `build.sh` runs it once and passes `--image-version` |
-| `mkosi.local.conf.example` | per-host settings, e.g. more erofs compression threads |
+| `mkosi.local.conf.example` | raw mkosi settings of this host (everything safespace decides is in `safespace.conf`) |
 
 ### Disk layout (`mkosi.repart/`)
 
@@ -1085,21 +1094,26 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 - **The path is chosen at boot** by `LoaderDevicePartUUID` (`mkosi.initrd.conf/mkosi.extra/`):
   - set (systemd-boot started the UKI from a partition): `usb-bootdev.service` +
     `/usr/local/lib/safespace/usb-bootdev`: authorizes the USB path to the stick (see "USB
-    lockdown"), waits for the selected combination's root and hash partitions by the UUIDs
+    lockdown"), waits for the chosen combination's root and hash partitions by the UUIDs
     derived from its root hash, sets the stick read-only and opens the root with the signed root hash as
     `/dev/mapper/root` (`--panic-on-corruption`).
   - not set (the firmware loaded the UKI over the network): `20-netboot.network` (DHCP on
     physical ethernet) and `netroot.service` + `/usr/local/lib/safespace/netroot`, which
     waits for DHCP, checks the server's `roothash-<name>`, downloads `root-<name>.verity` and
-    `root-<name>.img` of the selected combination into a tmpfs under `/run/netroot` (checking `MemAvailable` first), and opens them the same
+    `root-<name>.img` of the chosen combination into a tmpfs under `/run/netroot` (checking `MemAvailable` first), and opens them the same
     way. The tmpfs stays after switch-root: that file *is* the root filesystem. Several
     `safespace.netroot=` URLs are tried in order.
   - Setting the variable from outside only switches to the other path, which then finds no
     root: the machine does not boot, but cannot boot anything unverified either.
-- **The combination is measured** by both paths (`select`: PCR 15
-  `safespace-combination:<name>`, once), then `safespace-identity.service` +
-  `/usr/local/lib/safespace/identity` creates (first sealed boot, or `--assign`) or releases
-  the machine identity and closes PCR 15. The identity key's public part is appended to the
+- **The combination is chosen and measured first**, before either path:
+  `safespace-select.service` + `/usr/local/lib/safespace/choose` (`select`: PCR 15
+  `safespace-combination:<name>`, once); both paths require it and open the chosen one. Then,
+  before the network (`network-pre.target`), `safespace-identity.service` +
+  `/usr/local/lib/safespace/identity` creates (first sealed boot) or releases the machine
+  identity and closes PCR 15. The released machine-id is the initrd's own from then on
+  (written in place into `/run/machine-id`, which PID 1 bind-mounts as `/etc/machine-id`), so
+  over the network the initrd asks DHCP as the running system does: the same address
+  already for the download. The identity key's public part is appended to the
   initrd by `lib/compose.sh` (`usr/local/lib/safespace/identity.pem`). See
   [Machine identity](#machine-identity).
 
@@ -1153,12 +1167,13 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 | File | Purpose |
 |---|---|
 | `build.sh` | the build entry point (build host): fixes the version, puts the netboot URL on the signed command line, runs mkosi once per combination, keeps the parts, composes and checks the build |
-| `combinations.conf`, `lib/compose.sh` | the combinations a build holds (the first is the default); composing them into one UKI and build, and checking it |
-| `release.sh`, `release.conf.example` | build host: bundles a build as a release, checks it as the servers do, pushes it to the distribution servers (`RELEASE_TARGETS=` in `release.conf`) |
+| `safespace.conf`, `lib/conf.sh` | the build host's configuration, every key with its default; this host's in `safespace.local.conf` (gitignored); parsed, not sourced |
+| `lib/settings.sh`, `lib/assh.conf.in` | the identity's policy checked and written into the image (`/etc/assh/assh.conf`, `/usr/local/lib/safespace/settings`: the scripts' shared constants), root and initrd |
+| `lib/compose.sh` | the combinations a build holds (the first is the default); composing them into one UKI and build, and checking it |
+| `release.sh` | build host: bundles a build as a release, checks it as the servers do, pushes it to the distribution servers (`RELEASE_TARGETS=`) |
 | `server/` | distribution server: `setup.sh` (preparation), `safespace-netboot` (verify, status, dnsmasq config), `server.conf.example`, `systemd/` (verify path + service, `safespace-dhcp`), `nginx/safespace.conf` |
 | `mkosi.profiles/docker/`, `mkosi.profiles/xfce4-headless-vnc/`, `mkosi.profiles/debug/` | the package groups: packages, files and presets of each |
 | `mkosi.conf` | the image: the base packages, kernel command line, UKI, Secure Boot key, verity, compression, caches |
-| `repos.conf`, `repos.local.conf.example` | package source: `SNAPSHOT=` (date or `latest`) and `MIRROR=`; per-host override in `repos.local.conf` (gitignored); parsed by `lib/repos.sh` |
 | `mkosi.repart/` | ESP, erofs root (verity data) and root-verity |
 | `mkosi.extra/` | files of the base system: sshd, sudo, networkd, usbguard drop-in, fstab, guest agent restrictions, service presets, unit masks, volatile `/var` |
 | `mkosi.initrd.conf/` | initrd configuration: unit masks, both boot paths (`usb-bootdev`, `netroot` and the initrd network config), each run only on its path |
@@ -1167,10 +1182,9 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 | `mkosi.postoutput` | UKI size and signature checks, netroot URL check (see above) |
 | `docker-images.txt`, `fetch-images.sh` | images to ship and their downloader |
 | `users.conf.example`, `safespace.env` | users and ssh keys (copy to `users.conf`); groups and VNC settings |
-| `netboot.conf.example` | the root URL for network boot on the distribution servers (`<SERVER_URL>/`); copy to `netboot.conf` |
-| `mkosi.local.conf.example` | per-host settings (erofs threads, key paths); copy to `mkosi.local.conf` |
+| `mkosi.local.conf.example` | raw mkosi settings of this host; copy to `mkosi.local.conf` |
 | `burn.sh`, `diagnose.sh` | write a stick from a build (the newest in `mkosi.output/`), a release directory, a share or a distribution server's URL; read-only check incl. signatures against `db.pem` (`--db-cert`), `veritysetup verify` of every root and which build is on it |
-| `lib/` | shared shell helpers: `repos.sh` (package source), `groups.sh` (package groups), `keys.sh` (Secure Boot keys: which set, export into the image, PCR signing key), `builds.sh` (the builds in `mkosi.output/`: their parts, list, show, diff, prune), `stick.sh` (a usb stick assembled from the parts: `burn.sh`, `test-vm.sh`), `verify.sh` (release checks, used by `release.sh` and the servers) |
+| `lib/` | shared shell helpers: `conf.sh` (safespace.conf), `settings.sh` (what the image is told), `repos.sh` (package source), `groups.sh` (package groups), `keys.sh` (Secure Boot keys: which set, export into the image, PCR signing key), `builds.sh` (the builds in `mkosi.output/`: their parts, list, show, diff, prune), `stick.sh` (a usb stick assembled from the parts: `burn.sh`, `test-vm.sh`), `verify.sh` (release checks, used by `release.sh` and the servers) |
 | `SECURITY.md` | the hardening of the standard installation, each measure with where it is configured |
 | `NETBOOT.md` | network boot in depth: trust model, what the clients need, DHCP for other servers, Secure Boot enrollment, QEMU test, old firmware, troubleshooting |
 | `test-vm.sh` | optional rehearsal in QEMU: boot an image as a USB stick, or `--netboot` a released network build (DHCP + HTTP boot, no disk), optionally with enforced Secure Boot, in Setup Mode or sealed; `--work DIR` keeps a VM's files apart (several at once, `tests/vm.sh`) |
@@ -1183,11 +1197,12 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 
 | Task | Command |
 |---|---|
-| Build | `sudo ./build.sh` (every combination of `combinations.conf`; `-f` to rebuild unchanged; erofs threads: all CPUs, `--workers N` for this run) |
+| Build | `sudo ./build.sh` (every combination of `COMBINATIONS`; `-f` to rebuild unchanged; erofs threads: all CPUs, `EROFS_WORKERS=`, `--workers N` for this run) |
+| Change what is built or how | `safespace.local.conf` (the keys: `safespace.conf`), then `sudo ./build.sh` |
 | Release | `./release.sh [--build BUILD] [--push safespace@<server>]` (an older `--build` = going back) |
 | Builds on this host | `./build.sh list`, `./build.sh show BUILD`, `./build.sh diff A B`, `./build.sh prune` |
 | On a distribution server | `safespace-netboot status`, `sudo safespace-netboot verify`, `journalctl -u safespace-netboot-verify` |
-| Other mirror / newest packages | `SNAPSHOT=`/`MIRROR=` in `repos.local.conf` (["Package source"](#package-source-snapshot-and-mirror)) |
+| Other mirror / newest packages | `SNAPSHOT=`/`MIRROR=` in `safespace.local.conf` (["Package source"](#package-source-snapshot-and-mirror)) |
 | Update packages | `./update-snapshot.sh && sudo ./build.sh -f` |
 | Update shipped images | edit `docker-images.txt`, `./fetch-images.sh`, `sudo ./build.sh -f` |
 | Force reinstalling all packages | `sudo ./build.sh -ff` |
@@ -1202,8 +1217,8 @@ The partition table of this image is what the build keeps as `layout.sfdisk` and
 
 **CPUs, disk, RAM:** most of the build time goes into compressing the erofs root.
 `build.sh` gives `mkfs.erofs` all available CPUs (`nproc`, which respects CPU affinity and
-limits), unless `--workers N` (this run) or `Environment=SYSTEMD_REPART_MKFS_OPTIONS_EROFS=--workers=N`
-in `mkosi.local.conf` (this host) says otherwise, e.g. to leave cores free on a shared host
+limits), unless `--workers N` (this run) or `EROFS_WORKERS=N` in `safespace.local.conf`
+(this host) says otherwise, e.g. to leave cores free on a shared host
 (`--workers=0` would mean single-threaded, not "all"). zstd for the initrd already uses all
 cores. Before a build it checks the free disk space where the build lands (8 GiB + 3 GiB per
 combination: each disk image next to the parts of the combinations before it) and in `/var/tmp` (mkosi's work tree, ~8 GiB), and stops if there is
@@ -1215,13 +1230,50 @@ Caches: `mkosi.pkgcache/` (packages) and `mkosi.cache/` (installed system,
 `Incremental=yes`). The cache skips package installation, not the erofs compression, which
 runs on every build. After editing `Packages=`, build with `-ff` to be safe.
 
+## The configuration: `safespace.conf`
+
+One file holds everything a build can be told, each key with its default and its meaning:
+[`safespace.conf`](safespace.conf) (tracked). This host's choices go into
+`safespace.local.conf` (gitignored), whose keys win; `build.sh --config FILE` adds one more
+layer on top (the integration test). The files are parsed, not sourced: `KEY=VALUE`, `#`
+comments, only the keys below - an unknown key is an error, nothing in them runs. Read by
+`build.sh`, `release.sh` and `update-snapshot.sh` (`lib/conf.sh`); a leftover file of before
+(`netboot.conf`, `release.conf`, `repos.local.conf`, ...) stops them, so that none of its
+keys is dropped without a word.
+
+| Key | Default | What |
+|---|---|---|
+| `COMBINATIONS` | `root=base containers=base,docker debug=base,debug` | the combinations, the first is the default ([Combinations](#combinations-the-whole-stack-in-one-build)) |
+| `USERS` | `users.conf` | the users and their ssh keys, a file inside the checkout |
+| `SNAPSHOT`, `MIRROR` | `latest`, `https://ftp.fau.de/archlinux` | the package source ([below](#package-source-snapshot-and-mirror)) |
+| `NETROOT_URL` | empty: sticks only | the distribution servers' share, signed into the UKI (`--url` wins) |
+| `RELEASE_TARGETS` | empty: stage only | where `release.sh` pushes without `--push` |
+| `EROFS_WORKERS` | all CPUs | threads for the erofs compression (`--workers` wins) |
+| `SBCTL_CONFIG` | the host's sbctl | a dedicated Secure Boot key set ([Secure Boot keys](#secure-boot-keys)) |
+| `IDENTITY_SLOTS` | `0,2,7,15+11 7,15` | aSSH's slots, in order: the PCRs as at the creation, `+11` PCR 11 signed by the build |
+| `MACHINE_ID_PCRS` | `7,15+11` | the machine-id's seal |
+| `KEY_TYPES` | `rsa2048,p256` | the CA's and the host key's types, the first the TPM takes |
+| `PCR_BANK` | `auto` | SHA-256, or SHA-1 where only that is active and allowed |
+
+**The identity's policy is decided on the build host** and written into the image, never
+configured on a machine (the image is signed and read-only): `build.sh` writes
+`/etc/assh/assh.conf` (from `lib/assh.conf.in`) and `/usr/local/lib/safespace/settings`
+(the constants the image's scripts share, and the machine-id's PCRs) into the root and the
+initrd alike, and aSSH checks its file before the build goes on. `build.sh` refuses a policy
+that weakens the identity: every slot and the machine-id need PCR 7 (Secure Boot) and PCR 15
+(the combination, aSSH's window); only PCR 11 can be signed, and the machine-id needs it
+(it unseals only in the build's initrd); PCRs 0 to 22, not 16. `safespace identity` shows the
+policy an image was built with. **A changed policy applies to identities made after it**:
+the machine-id's seal is in its credential and the CA's slots were approved at its creation,
+so an existing identity keeps its own (a slot it never approved certifies nothing: a
+temporary host key); `safespace identity clear` and a reboot make one under the new policy.
+`build.sh` notes when the policy differs from the last build's (`build.json`).
+
 ## Package source: snapshot and mirror
 
-`build.sh` reads `repos.conf` (tracked, the project default) and then `repos.local.conf`
-(gitignored, per host, `cp repos.local.conf.example repos.local.conf`); keys in the local file
-win. Only `SNAPSHOT=` and `MIRROR=` are accepted, the files are parsed, not sourced. mkosi's
-own `--mirror`/`--snapshot` are refused on the `build.sh` command line, so the files are the
-only source. Before a build, `build.sh` fetches `core.db` from the resulting URL and stops
+`build.sh` takes `SNAPSHOT=` and `MIRROR=` from `safespace.conf` (and `safespace.local.conf`,
+which wins). mkosi's own `--mirror`/`--snapshot` are refused on the `build.sh` command line,
+so the configuration is the only source. Before a build, `build.sh` fetches `core.db` from the resulting URL and stops
 with the expected layout if it is not there.
 
 `MIRROR=` is a base URL **without** `$repo/os/$arch`; mkosi appends the repository path:
@@ -1244,7 +1296,7 @@ with the expected layout if it is not there.
   unchanged, so build with `-f` to get the current packages. Changing `SNAPSHOT` or `MIRROR`
   invalidates the incremental cache (both are part of mkosi's cache manifest);
   `mkosi.pkgcache/` is kept.
-- `./update-snapshot.sh` sets `SNAPSHOT=` in `repos.conf` to the newest archive day (asked from
+- `./update-snapshot.sh` sets `SNAPSHOT=` in `safespace.conf` to the newest archive day (asked from
   `MIRROR`, else archive.archlinux.org); `latest` becomes a date again.
 - Running `mkosi build` directly bypasses `build.sh` and installs from the current
   repositories (no snapshot); build with `build.sh`.
@@ -1323,7 +1375,7 @@ sectors and a CD boot header; both are fixed (`-S512`, `ElTorito=no`).
   command line and cannot be served by a distribution server. Rebuild.
 - **Still open from the security review:**
   - by default the UKI is signed with the build host's sbctl `db` key; a dedicated key set
-    (`SAFESPACE_SBCTL_CONFIG`) is the cleaner choice;
+    (`SBCTL_CONFIG`) is the cleaner choice;
   - the build runs as root from a folder a normal user can write to;
   - old signed images stay bootable wherever someone has a copy (a server only serves the
     newest, but an old usb stick or a copied UKI still boots on a sealed machine; builds

@@ -58,7 +58,9 @@ fx_uki() {
 # need, so tests can fill its mkosi.output/ without touching the real one.
 fx_checkout() {
 	mkdir -p "$1/lib" "$1/mkosi.output" "$1/mkosi.extra/usr/share/safespace/secureboot"
-	cp "$2/release.sh" "$2/build.sh" "$2/burn.sh" "$1/"
+	cp "$2/release.sh" "$2/build.sh" "$2/burn.sh" "$2/safespace.conf" "$1/"
+	# Nothing of this checkout goes anywhere, whatever safespace.conf's defaults say.
+	printf 'RELEASE_TARGETS=\nNETROOT_URL=\n' >"$1/safespace.local.conf"
 	cp "$2/lib/"*.sh "$1/lib/"
 }
 

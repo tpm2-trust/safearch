@@ -6,7 +6,7 @@
 #   tests/run.sh [--keep] [TEST...]
 #
 #   --keep   keep the temporary directory (printed at the end)
-#   TEST     run only these (default: all): syntax groups keys builds
+#   TEST     run only these (default: all): syntax conf groups keys builds
 #            release server stick upload netroot initrd compose dnsmasq nginx
 #            assh units
 #
@@ -54,6 +54,17 @@ need() { # TOOL...: all present, else SKIP the current test
 	for t in "$@"; do command -v "$t" >/dev/null || { skip "$CURRENT: '$t' not installed"; return 1; }; done
 }
 wanted() { ((${#ONLY[@]} == 0)) || [[ " ${ONLY[*]} " == *" $1 "* ]]; }
+# The image's settings and assh.conf as build.sh writes them from safespace.conf's
+# defaults (lib/settings.sh): the image's scripts are tested against them.
+IMG=$W/image
+conf_defaults() { # the keys of safespace.conf alone (no host's file)
+	local k
+	for k in "${CONF_KEYS[@]}"; do printf -v "$k" '%s' ""; done
+	conf_parse "$REPO/safespace.conf"
+}
+(HERE=$REPO; die() { echo "$*" >&2; exit 1; }; source "$REPO/lib/conf.sh"; source "$REPO/lib/settings.sh"
+	conf_defaults && settings_write "$IMG") || { echo "cannot write the image's settings" >&2; exit 1; }
+export SAFESPACE_SETTINGS=$IMG/usr/local/lib/safespace/settings
 section() { CURRENT=$1; printf '\e[1m== %s\e[0m\n' "$1"; }
 port() { python3 -I -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
 serve() { # DIR PORT: a static HTTP server in the background
@@ -118,8 +129,89 @@ if wanted syntax; then
 		head -1 "$f" | grep -q '^#!/bin/sh' && check "sh -n $f" sh -n "$f" || check "bash -n ${f#"$REPO"/}" bash -n "$f"
 	done < <(cd "$REPO" && find . -path ./mkosi.output -prune -o -path ./mkosi.cache -prune -o -path ./.git -prune -o \
 		-type f \( -name '*.sh' -o -name 'mkosi.postinst' -o -name 'mkosi.finalize' -o -name 'mkosi.postoutput' \
-		-o -name netroot -o -name usb-bootdev -o -name select -o -name safespace -o -name safespace-netboot -o -name load-docker-images \) -print |
+		-o -name netroot -o -name usb-bootdev -o -name select -o -name choose -o -name identity -o -name safespace -o -name safespace-netboot -o -name load-docker-images \) -print |
 		sed "s|^\.|$REPO|")
+fi
+
+# --- the build host's configuration (safespace.conf, lib/conf.sh, lib/settings.sh) ------------
+if wanted conf; then
+	section conf
+	CF=$W/conf
+	t_conf() { # LOCAL EXTRA KEY EXPECTED: safespace.conf (the repository's) + local + extra
+		rm -rf "$CF" && mkdir -p "$CF" && cp "$REPO/safespace.conf" "$CF/"
+		[[ -z $1 ]] || printf '%s\n' "$1" >"$CF/safespace.local.conf"
+		[[ -z $2 ]] || printf '%s\n' "$2" >"$CF/extra.conf"
+		(die() { echo "$*"; exit 1; }; source "$REPO/lib/conf.sh"; conf_load "$CF" ${2:+"$CF/extra.conf"} && [[ ${!3} == "$4" ]])
+	}
+	check "conf: the defaults (safespace.conf)" t_conf "" "" IDENTITY_SLOTS "0,2,7,15+11 7,15"
+	check "conf: the host's safespace.local.conf wins" t_conf "KEY_TYPES=p256" "" KEY_TYPES p256
+	check "conf: --config wins over both" t_conf "KEY_TYPES=p256" "KEY_TYPES=rsa2048" KEY_TYPES rsa2048
+	check "conf: a value in quotes, as it stands" t_conf 'NETROOT_URL="http://a/ http://b/"' "" NETROOT_URL "http://a/ http://b/"
+	check "conf: a key the local file does not set keeps its default" t_conf "KEY_TYPES=p256" "" SNAPSHOT latest
+	refuse "conf: an unknown key" t_conf "FOO=1" "" FOO 1
+	refuse "conf: a line that is no KEY=VALUE" t_conf "export X=1" "" X 1
+	refuse "conf: code is not run (parsed, not sourced)" t_conf 'NETROOT_URL=$(touch '"$W"'/ran)' "" NETROOT_URL x
+	check "... nothing ran" test ! -e "$W/ran"
+	for f in repos.conf repos.local.conf netboot.conf release.conf combinations.conf; do
+		t_left() { rm -rf "$CF" && mkdir -p "$CF" && cp "$REPO/safespace.conf" "$CF/" && touch "$CF/$1" &&
+			(die() { echo "$*"; exit 1; }; source "$REPO/lib/conf.sh"; conf_load "$CF"); }
+		refuse "conf: a leftover $f stops it (its keys would be dropped)" t_left "$f"
+	done
+	check "conf: every key of CONF_KEYS is in safespace.conf, no other" bash -c 'source "$1/lib/conf.sh"
+		[[ $(sed -n "s/^\([A-Z_0-9]*\)=.*/\1/p" "$1/safespace.conf" | sort | tr "\n" " ") == "$(printf "%s\n" "${CONF_KEYS[@]}" | sort | tr "\n" " ")" ]]' _ "$REPO"
+	check "conf: tests/vm.safespace.conf and vm.policy.conf set known keys only" bash -c 'source "$1/lib/conf.sh"; die() { exit 1; }; conf_parse "$1/tests/vm.safespace.conf" && conf_parse "$1/tests/vm.policy.conf"' _ "$REPO"
+
+	# The identity's policy: what build.sh refuses (lib/settings.sh).
+	t_policy() { # SLOTS MACHINE_ID_PCRS [KEY_TYPES] [PCR_BANK]
+		(die() { echo "$*"; exit 1; }; source "$REPO/lib/settings.sh"
+		IDENTITY_SLOTS=$1 MACHINE_ID_PCRS=$2 KEY_TYPES=${3:-rsa2048,p256} PCR_BANK=${4:-auto}; settings_check)
+	}
+	check "policy: the default" t_policy "0,2,7,15+11 7,15" 7,15+11
+	check "policy: one slot, other PCRs" t_policy "0,1,7,15+11" 0,7,15+11
+	refuse "policy: a slot without PCR 15 (the combination, the window)" t_policy "0,2,7+11 7,15" 7,15+11
+	refuse "policy: a slot without PCR 7 (Secure Boot)" t_policy "0,2,7,15+11 2,15" 7,15+11
+	refuse "policy: the machine-id without PCR 15" t_policy "7,15" 7+11
+	refuse "policy: the machine-id without PCR 7" t_policy "7,15" 15+11
+	refuse "policy: the machine-id without PCR 11 signed (it would unseal in a root)" t_policy "7,15" 7,15
+	refuse "policy: a signed PCR other than 11" t_policy "7,15+4" 7,15+11
+	refuse "policy: PCR 16 (any process resets it)" t_policy "7,15,16" 7,15+11
+	refuse "policy: PCR 23" t_policy "7,15,23" 7,15+11
+	refuse "policy: a PCR twice" t_policy "7,15,7" 7,15+11
+	refuse "policy: no slot" t_policy "" 7,15+11
+	refuse "policy: a slot that is no PCR list" t_policy "7,15;x" 7,15+11
+	refuse "policy: an unknown bank" t_policy "7,15" 7,15+11 rsa2048 sha384
+	S0=$IMG/usr/local/lib/safespace/settings
+	check "settings: every constant the image's scripts share, and the policy" bash -c '. "$1"
+		[[ $SAFESPACE_GUID == 8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34 && $SAFESPACE_SELECT_VAR == SafespaceSelect && $SAFESPACE_SELECT_ONCE_VAR == SafespaceSelectOnce &&
+			$SAFESPACE_MID_VAR == SAFEmachineID && $SAFESPACE_MID_CRED == safespace-machine-id &&
+			$SAFESPACE_CA_VAR == SAFEasshCA-24415b90-39be-45c0-a9a3-d547ebe28ea0 && $SAFESPACE_PCR == 15 &&
+			$SAFESPACE_MID_PCRS == 7+15 && $SAFESPACE_MID_SIGNED_PCRS == 11 && $SAFESPACE_EFI_GLOBAL == 8be4df61-93ca-11d2-aa0d-00e098032b8c &&
+			$SAFESPACE_POLICY == "slots 0,2,7,15+11 7,15; machine-id 7,15+11; keys rsa2048,p256; bank auto" ]]' _ "$S0"
+	check "settings: the CA's variable is assh.conf's ASSH_CA" bash -c '. "$1"; grep -qx "ASSH_CA=efi:${SAFESPACE_CA_VAR%%-*}" "$2"' _ "$S0" "$IMG/etc/assh/assh.conf"
+	t_other_policy() {
+		(HERE=$REPO; die() { echo "$*"; exit 1; }; source "$REPO/lib/settings.sh"
+		IDENTITY_SLOTS="0,7,15+11" MACHINE_ID_PCRS="0,7,15+11" KEY_TYPES=p256 PCR_BANK=sha256; settings_write "$W/image2") &&
+		C2=$W/image2/etc/assh/assh.conf &&
+		[[ $(grep "^ASSH_CA_SLOT_\|^ASSH_CA_TYPE\|^ASSH_HOSTKEY_TYPE\|^ASSH_CA_BANK" "$C2" | tr "\n" " ") == "ASSH_CA_BANK=sha256 ASSH_CA_SLOT_0=0,7,15 ASSH_CA_SLOT_0_SIGNED=11 ASSH_CA_TYPE=p256 ASSH_HOSTKEY_TYPE=p256 " ]] &&
+		(. "$W/image2/usr/local/lib/safespace/settings"; [[ $SAFESPACE_MID_PCRS == 0+7+15 && $SAFESPACE_MID_SIGNED_PCRS == 11 ]])
+	}
+	check "settings: another policy reaches assh.conf (slots, key types, bank) and the machine-id's seal" t_other_policy
+	check "settings: the image's scripts keep no constant of their own" bash -c '! grep -nE "8a3e6c1d|24415b90|8be4df61|eda1fc8c|=SafespaceSelect|=SAFEmachineID|pcr=15|tpm2-pcrs=[0-9]|public-key-pcrs=[0-9]|\"15:" "$@"' _ \
+		"$REPO"/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/{select,choose,identity,netroot,usb-bootdev} \
+		"$REPO/mkosi.extra/usr/local/lib/safespace/state.sh" "$REPO/mkosi.extra/usr/local/sbin/safespace" "$REPO/mkosi.extra/etc/profile.d/safespace-status.sh"
+	# Every upper-case name an image script reads is set: by itself, by what it sources
+	# (state.sh, select, settings) or read with a default (tests/lib/unset.py).
+	X=$REPO/mkosi.extra IR0=$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace
+	for set in "$X/usr/local/sbin/safespace $X/usr/local/lib/safespace/state.sh" \
+		"$X/etc/profile.d/safespace-status.sh $X/usr/local/lib/safespace/state.sh" \
+		"$IR0/choose $IR0/select" "$IR0/identity $IR0/select" "$IR0/netroot $IR0/select" "$IR0/usb-bootdev $IR0/select"; do
+		# shellcheck disable=SC2086
+		check "settings: ${set%% *} reads no name nothing sets" python3 -I "$REPO/tests/lib/unset.py" $set "$S0"
+	done
+	printf 'f() { echo "$GLOBAL ${OK:-x}"; }\nOTHER=1\n' >"$W/unset-sample"
+	refuse "... the check finds one (\$GLOBAL, the seal's bug)" python3 -I "$REPO/tests/lib/unset.py" "$W/unset-sample" "$S0"
+	check "settings: build.sh writes them into the root and the initrd, aSSH checks assh.conf" bash -c 'grep -q "for t in \"\$HERE/mkosi.extra\" \"\$HERE/mkosi.initrd.conf/mkosi.extra\"; do settings_write \"\$t\"; done" "$1" && grep -q "^assh_check_conf " "$1"' _ "$REPO/build.sh"
+	check "settings: the generated files are not tracked" bash -c 'cd "$1" && [[ $(git check-ignore mkosi.extra/etc/assh/assh.conf mkosi.extra/usr/local/lib/safespace/settings mkosi.initrd.conf/mkosi.extra/etc/assh/assh.conf mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/settings safespace.local.conf | wc -l) == 5 ]]' _ "$REPO"
 fi
 
 # --- groups and combinations -----------------------------------------------------------------
@@ -138,22 +230,24 @@ if wanted groups; then
 		[[ $(ls -A "$1/mkosi.profiles/debug") == mkosi.conf ]] &&
 		[[ -z $(grep -v "^[[:space:]]*#" "$1/mkosi.profiles/debug/mkosi.conf" | grep . | grep -vx "\[Content\]" | grep -vx "Packages=" | grep -v "^[[:space:]]\+[a-z0-9][a-z0-9.+_-]*$") ]] &&
 		! grep -rhw debug "$1/mkosi.postinst" "$1/mkosi.finalize" "$1/mkosi.postoutput" "$1/mkosi.conf" "$1/mkosi.extra" "$1/mkosi.initrd.conf" | grep -qv "^[[:space:]]*#"' _ "$REPO"
-	t_combos() { # CONF EXPECTED
+	t_combos() { # COMBINATIONS EXPECTED
 		(die() { exit 1; }; source "$REPO/lib/groups.sh"; source "$REPO/lib/compose.sh"
-		printf '%s\n' "$1" >"$W/combos.conf"; combos_load "$W/combos.conf" && [[ "${COMBO_NAMES[*]}|${COMBO_GROUPS[*]}" == "$2" ]])
+		combos_load "$1" && [[ "${COMBO_NAMES[*]}|${COMBO_GROUPS[*]}" == "$2" ]])
 	}
-	check "combinations.conf of the repository" t_combos "$(cat "$REPO/combinations.conf")" \
+	combos_of() { sed -n 's/^COMBINATIONS=//p' "$1" | tail -1 | tr -d '"'; }
+	check "COMBINATIONS of safespace.conf" t_combos "$(combos_of "$REPO/safespace.conf")" \
 		"root containers debug|base base,docker base,debug"
-	check "tests/vm.combinations.conf (the test build's)" t_combos "$(cat "$REPO/tests/vm.combinations.conf")" "root containers|base base,docker"
-	check "any combination may come first (it is the default)" t_combos $'x=docker\ny=base' "x y|base,docker base"
-	refuse "a name twice" t_combos $'base=base\nx=docker\nx=docker' ""
-	refuse "an invalid name" t_combos $'base=base\nX;y=docker' ""
+	check "tests/vm.safespace.conf (the test build's)" t_combos "$(combos_of "$REPO/tests/vm.safespace.conf")" "root containers|base base,docker"
+	check "any combination may come first (it is the default)" t_combos 'x=docker y=base' "x y|base,docker base"
+	refuse "a name twice" t_combos 'base=base x=docker x=docker' ""
+	refuse "an invalid name" t_combos 'base=base X;y=docker' ""
 	refuse "a name too long for its partition names" t_combos 'abcdefghijklmnopqrstuvwxy=base' ""
-	refuse "an unknown group" t_combos $'base=base\nx=foo' ""
-	refuse "no combination" t_combos '# nothing' ""
-	for a in "--groups base" --debug --combined "--version 1" summary shell; do
-		check "build.sh: '$a' is refused (combinations.conf decides, build.sh only builds)" \
-			bash -c '! "$1" $2 >"$3" 2>&1 && grep -Eq "combinations.conf decides|only builds" "$3"' _ "$REPO/build.sh" "$a" "$W/refused.log"
+	refuse "an unknown group" t_combos 'base=base x=foo' ""
+	refuse "no combination" t_combos '' ""
+	refuse "a glob is no combination" t_combos '*' ""
+	for a in "--groups base" --debug --combined "--version 1" summary shell "--users x" "--combinations x"; do
+		check "build.sh: '$a' is refused (safespace.conf decides, build.sh only builds)" \
+			bash -c '! "$1" $2 >"$3" 2>&1 && grep -Eq "in safespace.conf|only builds" "$3"' _ "$REPO/build.sh" "$a" "$W/refused.log"
 	done
 	if need mkosi; then
 		pk() { mkosi --directory "$REPO" "$@" --json summary 2>/dev/null |
@@ -193,12 +287,12 @@ fi
 # --- keys ------------------------------------------------------------------------------------
 if wanted keys && fixtures && need cert-to-efi-sig-list sign-efi-sig-list; then
 	section keys
-	printf '{"Images":[{"SecureBoot":true,"SecureBootKey":"/var/lib/sbctl/keys/db/db.key","SecureBootCertificate":"/var/lib/sbctl/keys/db/db.pem","SignExpectedPcrKey":"/x/pcr.key","SignExpectedPcrCertificate":"/x/pcr.crt","Environment":{"SAFESPACE_SBCTL_CONFIG":"%s"}}]}' \
-		"$W/keys/sbctl.conf" >"$W/summary.json"
+	printf '{"Images":[{"SecureBoot":true,"SecureBootKey":"/var/lib/sbctl/keys/db/db.key","SecureBootCertificate":"/var/lib/sbctl/keys/db/db.pem","SignExpectedPcrKey":"/x/pcr.key","SignExpectedPcrCertificate":"/x/pcr.crt"}]}' \
+		>"$W/summary.json"
 	t_export() (
 		set -e
 		source "$REPO/lib/keys.sh"
-		keys_load "$W/summary.json"
+		keys_load "$W/summary.json" "$W/keys/sbctl.conf"
 		[[ $KEYS_DEDICATED == 1 && $(keys_mkosi_args | head -1) == "--secure-boot-key=$KD/db/db.key" ]]
 		keys_export "$W/export"
 	)
@@ -213,8 +307,7 @@ if wanted keys && fixtures && need cert-to-efi-sig-list sign-efi-sig-list; then
 	sed -i "s|$W/keys|$W/keys-yk|g" "$W/keys-yk/sbctl.conf"
 	chmod u+w "$W/keys-yk/keys/db/db.key"
 	echo '{"yubikey": "9c"}' >"$W/keys-yk/keys/db/db.key"
-	sed "s|$W/keys/sbctl.conf|$W/keys-yk/sbctl.conf|" "$W/summary.json" >"$W/summary-yk.json"
-	refuse "a key that is no key file (YubiKey) is refused" bash -c "source '$REPO/lib/keys.sh'; die() { exit 1; }; keys_load '$W/summary-yk.json'"
+	refuse "a key that is no key file (YubiKey) is refused" bash -c "source '$REPO/lib/keys.sh'; die() { exit 1; }; keys_load '$W/summary.json' '$W/keys-yk/sbctl.conf'"
 fi
 
 # --- builds on the build host ----------------------------------------------------------------
@@ -256,11 +349,20 @@ fi
 # --- release ---------------------------------------------------------------------------------
 if wanted release && fixtures && need rsync; then
 	section release
+	check "the test checkout pushes nowhere by itself (RELEASE_TARGETS cleared)" bash -c '[[ $(sed -n "s/^RELEASE_TARGETS=//p" "$1/safespace.local.conf") == "" ]]' _ "$CO"
 	check "release.sh stages and passes its own checks" "$CO/release.sh"
 	check "staged: all parts, combinations recorded" bash -c 'for f in boot.efi systemd-boot.efi layout.sfdisk cmdline release SHA256SUMS root-root.img root-root.verity roothash-root manifest-root.json root-containers.img root-containers.verity roothash-containers manifest-containers.json; do [[ -f $1/$f ]] || exit 1; done; [[ $(grep ^COMBINATIONS= $1/release) == COMBINATIONS=root,containers ]]' _ "$CO/mkosi.release"
 	check "release.sh --push into a share" "$CO/release.sh" --push "$SHARE"
 	check "the share serves the newest release" bash -c '[[ $(grep ^BUILD= $1/release) == BUILD=combined_20990101-0100 ]]' _ "$SHARE"
 	check "server status shows build, combinations, snapshot" bash -c '"$1" status | grep -q "combinations root,containers, built 2099-01-01T01:00:00+00:00, snapshot 2099/01/01, commit abc1234, 5 packages"' _ "$NB"
+	# Without --push: RELEASE_TARGETS (safespace.local.conf) - for the builds of mkosi.output only.
+	cp "$CO/safespace.local.conf" "$W/local.keep"
+	echo "RELEASE_TARGETS=$W/share-t" >"$CO/safespace.local.conf" && mkdir -p "$W/share-t"
+	check "release.sh without --push: to RELEASE_TARGETS of safespace.local.conf" bash -c '"$1/release.sh" >/dev/null 2>&1 && [[ -f $2/release ]]' _ "$CO" "$W/share-t"
+	rm -rf "$W/share-t" "$W/test-builds" && mkdir -p "$W/share-t" && cp -a "$CO/mkosi.output" "$W/test-builds"
+	check "a build from elsewhere (--builds: a test build, the test key) never goes to RELEASE_TARGETS" bash -c \
+		'"$1/release.sh" --builds "$2" --stage "$3" >"$4" 2>&1 && [[ -f $3/release && ! -e $5/release ]] && grep -q "not to RELEASE_TARGETS" "$4"' _ "$CO" "$W/test-builds" "$W/stage-t" "$W/release-t.log" "$W/share-t"
+	cp "$W/local.keep" "$CO/safespace.local.conf"
 fi
 
 # --- server: verify ------------------------------------------------------------------------
@@ -381,10 +483,11 @@ if wanted netroot && shared && need curl; then
 	serve "$W/old" "$P1"
 	serve "$SHARE" "$P2"
 	EV=$W/efivars SG=8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34
-	nr_cmd() { # CMDLINE: run netroot with it (efivars in a directory of the test)
-		rm -f "$W/systemctl.calls" "$W/veritysetup.calls"
+	nr_cmd() { # CMDLINE: choose the combination (safespace-select.service), then run netroot with it (efivars in a directory of the test)
+		rm -rf "$W/systemctl.calls" "$W/veritysetup.calls" "$W/nr-run"
 		mkdir -p "$EV"
-		NETROOT_CMDLINE="$1" NETROOT_DIR=$W/nr SAFESPACE_EFIVARS=$EV PATH="$S:$PATH" sh "$NR" >"$W/nr.log" 2>&1
+		cmdline=$1 SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$W/nr-run SAFESPACE_PCREXTEND=true sh -c 'msg() { :; }; . "$0"; select_root' "${NR%/*}/select" || return 1
+		NETROOT_CMDLINE="$1" NETROOT_DIR=$W/nr SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$W/nr-run PATH="$S:$PATH" sh "$NR" >"$W/nr.log" 2>&1
 	}
 	nr() { # ROOTHASH URL...: netroot against the servers, the hash as combination root
 		local h=$1; shift
@@ -430,8 +533,8 @@ if wanted initrd; then
 		objcopy -O binary --only-section=.initrd "$uki" "$W/initrd.img"
 		zstd -dc "$W/initrd.img" 2>/dev/null | cpio -t 2>/dev/null >"$W/initrd.list" || true
 		IS=$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace
-		for f in usb-bootdev netroot; do
-			# with select, which both source
+		for f in choose usb-bootdev netroot; do
+			# with select, which all source
 			cat "$IS/select" "$IS/$f" >"$W/initrd.$f"
 			missing=$(python3 -I "$REPO/tests/lib/shcmds.py" "$W/initrd.$f" | while IFS= read -r c; do
 				if [[ $c == /* ]]; then grep -qxF "${c#/}" "$W/initrd.list" || echo "$c"
@@ -553,6 +656,14 @@ if wanted compose && fixtures; then
 	check "select: a failing measurement does not stop the boot" t_failmeasure
 	t_unknown_measured() { t_select "$CL" "" nope ""; test -e "$W/pcrextend.log"; }
 	refuse "select: an unknown name is not measured" t_unknown_measured
+	t_chosen() { # CMDLINE (after a choice of containers): what the boot paths take
+		t_select "$CL" "" containers "containers:$H2" >/dev/null || return 1
+		[[ $(cmdline=$1 SAFESPACE_RUN=$SR sh -c 'msg() { :; }; . "$0"; select_chosen || exit 1; echo "$SELECT_NAME:$SELECT_HASH"' "$SEL") == "containers:$H2" ]]
+	}
+	check "select: the boot paths take the combination chosen before, its hash from the command line" t_chosen "$CL"
+	refuse "select: ... not one the command line does not name" t_chosen "ro safespace.root.root=$H1"
+	t_none_chosen() { rm -rf "$SR"; cmdline=$CL SAFESPACE_RUN=$SR sh -c 'msg() { :; }; . "$0"; select_chosen' "$SEL"; }
+	refuse "select: nothing chosen: the boot paths stop" t_none_chosen
 
 	# The machine's identity (initrd identity): systemd-creds replaced by a stub.
 	# encrypt: header type (signed for tpm2-with-public-key, else plain; STUB_TYPE=plain
@@ -598,10 +709,13 @@ if wanted compose && fixtures; then
 		printf '\x06\x00\x00\x00\x0'"$2" >"$EV/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
 		printf '\x06\x00\x00\x00\x0'"$3" >"$EV/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c"
 		[[ -z $1 ]] || echo "$1" >"$IR/run/combination"
+		# PID 1's /etc/machine-id: a bind mount of /run/machine-id (here: a hard link)
+		[[ -z ${T_BIND:-} ]] || { echo uninitialized >"$IR/machine-id" && ln "$IR/machine-id" "$IR/etc-machine-id"; }
 		env "${@:5}" \
 			SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$IR/run SAFESPACE_PCREXTEND=$PX SAFESPACE_CREDS=$CS \
 			SAFESPACE_ASSH="$W/assh-stub" \
 			SAFESPACE_IDENTITY_KEY=/dev/null SAFESPACE_PCRSIG=$4 SAFESPACE_MACHINE_ID=$IR/machine-id \
+			SAFESPACE_ETC_MACHINE_ID=$IR/etc-machine-id \
 			sh "$IDB/identity" 2>"$IR/log"
 	}
 	# The initrd's directory: identity, select, and pcr.pem as compose appends it.
@@ -617,6 +731,13 @@ if wanted compose && fixtures; then
 			[[ $(tail -1 "$W/pcrextend.log") == "--graceful --pcr=15 safespace-identity:sealed" ]]
 	}
 	check "identity: the first sealed boot makes it all at once - the machine-id and the CA (the root's PCR 15 ahead) - releases the machine-id, closes PCR 15" t_id_first
+	t_id_inplace() { # the initrd's network asks as the machine: /etc/machine-id shows it
+		rm -rf "$EV"; T_BIND=1 t_id containers 1 0 "$W/sig-good.json" &&
+			cmp -s "$IR/etc-machine-id" "$IR/run/identity/machine-id" && [[ $(stat -c %i "$IR/machine-id") == "$(stat -c %i "$IR/etc-machine-id")" ]]
+	}
+	check "identity: the released machine-id written in place, so the initrd's /etc/machine-id (PID 1's bind mount) is the machine's" t_id_inplace
+	t_id_etc() { rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" && cmp -s "$IR/etc-machine-id" "$IR/run/identity/machine-id"; }
+	check "identity: ... and where /etc/machine-id is a file of its own, it is written" t_id_etc
 	t_id_sboff() { rm -rf "$EV"; t_id containers 0 0 "$W/sig-good.json"; [[ ! -e $EV/SAFEmachineID-$SG && ! -e $EV/$CAV && ! -e $IR/machine-id && ! -e $W/assh.log ]] && grep -q 'identity:sealed' "$W/pcrextend.log"; }
 	check "identity: Secure Boot off: nothing made (and PCR 15 closed)" t_id_sboff
 	t_id_setup() { rm -rf "$EV"; t_id containers 1 1 "$W/sig-good.json"; [[ ! -e $EV/SAFEmachineID-$SG && ! -e $EV/$CAV ]]; }
@@ -719,14 +840,12 @@ if wanted compose && fixtures; then
 	}
 	check "state: the host key sshd serves, in full: aSSH's (HostKey names the .pub)" t_served host.pub host.pub
 	check "state: ... the throwaway one (HostKey names the private key)" t_served ssh_host_ed25519_key ssh_host_ed25519_key.pub
-	t_names() {
-		local id; id=$(cat "$ID")
-		bash -c '. "$1"; echo "${CA_VAR##*/} SAFEmachineID-$SELECT_GUID"' _ "$ST" | {
-			read -r ca mid
-			[[ $id == *"CA_VAR=$ca"* && $id == *"MID_VAR=SAFEmachineID"* && $mid == SAFEmachineID-$(sed -n 's/^SELECT_GUID=//p' "$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/select") ]]
-		}
+	t_names() { # the root and the initrd: one settings file (select sources it for identity)
+		bash -c '. "$1"; [[ ${CA_VAR##*/} == "$SAFESPACE_CA_VAR" && ${MID_VAR##*/} == "$SAFESPACE_MID_VAR-$SAFESPACE_GUID" ]]' _ "$ST" &&
+			grep -qF '. "${SAFESPACE_SETTINGS:-${0%/*}/settings}"' "${ID%/*}/select" &&
+			grep -qF '. "${SAFESPACE_SETTINGS:-/usr/local/lib/safespace/settings}"' "$ST"
 	}
-	check "state: the identity's variables named as the initrd names them" t_names
+	check "state: the identity's variables named as the initrd names them (the same settings)" t_names
 	check "state: the login and safespace decide by it, with no copy of their own" bash -c 'grep -q "state.sh" "$1" && grep -q "state.sh" "$2" && ! grep -q "od -An" "$1" "$2"' _ "$REPO/mkosi.extra/etc/profile.d/safespace-status.sh" "$REPO/mkosi.extra/usr/local/sbin/safespace"
 fi
 
@@ -794,12 +913,10 @@ if wanted assh && need go; then
 			go version -m "$AB" | grep -q 'CGO_ENABLED=0' && go version -m "$AB" | grep -q -- '-trimpath=true'
 	}
 	check "lib/assh.sh builds a static aSSH from the submodule" t_assh_build
-	C=$REPO/mkosi.extra/etc/assh/assh.conf
-	t_assh_conf() { # assh parses it: the CA file is what is missing, not a line
-		local out; out=$("$AB" ca show --config "$C" --ca "$W/no-ca" 2>&1) && return 1
-		[[ $out == *no-ca*"no such file"* && $out != *line* ]]
-	}
-	check "the image's assh.conf is aSSH's (it parses it)" t_assh_conf
+	C=$IMG/etc/assh/assh.conf
+	check "the image's assh.conf (generated) is aSSH's: assh_check_conf takes it" bash -c 'die() { echo "$*"; exit 1; }; . "$1/lib/assh.sh"; assh_check_conf "$2" "$3"' _ "$REPO" "$AB" "$C"
+	sed 's/^ASSH_HOSTKEY_TYPE=.*/ASSH_HOSTKEY_TYPE=ed448/' "$C" >"$W/assh-bad.conf"
+	refuse "... and refuses one aSSH does not take (an unknown key type)" bash -c 'die() { echo "$*"; exit 1; }; . "$1/lib/assh.sh"; assh_check_conf "$2" "$3"' _ "$REPO" "$AB" "$W/assh-bad.conf"
 	check "assh.conf: the CA in SAFEasshCA, its authority for the creation alone" bash -c 'grep -qx "ASSH_CA=efi:SAFEasshCA" "$1" && grep -qx "ASSH_AUTHORITY_ONCE=yes" "$1" && ! grep -q "^ASSH_AUTHORITY_TPM=" "$1"' _ "$C"
 	check "assh.conf: slot 0 = 0,2,7,15 + PCR 11 signed by the build, slot 1 = 7,15, window 15" bash -c 'grep -qx "ASSH_CA_SLOT_0=0,2,7,15" "$1" && grep -qx "ASSH_CA_SLOT_0_SIGNED=11" "$1" && grep -qx "ASSH_CA_SLOT_1=7,15" "$1" && grep -qx "ASSH_CA_WINDOW=15" "$1" && grep -qx "ASSH_PCR_SIGNATURE=/run/systemd/tpm2-pcr-signature.json" "$1" && [[ $(grep -c "^ASSH_CA_SLOT_[0-9]*=" "$1") == 2 ]]' _ "$C"
 	A=$REPO/mkosi.extra/usr/lib/systemd/system/assh-agent.service
@@ -833,6 +950,9 @@ if wanted units && need systemd-analyze; then
 	check "initrd: the stick path runs only when started from a partition" grep -qx "ConditionPathExists=$V" "$I/usb-bootdev.service"
 	check "initrd: the network path runs only when not" grep -qx "ConditionPathExists=!$V" "$I/netroot.service"
 	check "initrd: both paths are enabled" test -L "$I/initrd.target.wants/usb-bootdev.service" -a -L "$I/initrd.target.wants/netroot.service"
+	check "initrd: both paths require the combination chosen before (safespace-select.service)" bash -c 'for f in usb-bootdev netroot; do grep -q "^Requires=.*safespace-select.service" "$1/$f.service" && grep -q "^After=.*safespace-select.service" "$1/$f.service" || exit 1; done' _ "$I"
+	check "initrd: the identity after the choice, before the network (network-pre.target), not after a boot path" bash -c 'f=$1/safespace-identity.service; grep -qx "Before=network-pre.target" "$f" && grep -qx "Wants=network-pre.target" "$f" && grep -q "^After=safespace-select.service" "$f" && ! grep -qE "^After=.*(netroot|usb-bootdev)" "$f"' _ "$I"
+	check "initrd: netroot after the identity (DHCP as the machine)" grep -q "^After=.*safespace-identity.service" "$I/netroot.service"
 fi
 
 printf '\n\e[1m%d passed, %d failed, %d skipped\e[0m\n' "$PASS" "$FAIL" "$SKIP"

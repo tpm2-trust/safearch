@@ -1,12 +1,17 @@
 # The machine's identity: made at the first sealed boot, released in its
-# combination (/usr/local/lib/safespace/identity). After the boot path measured the
-# combination, while PCR 11 still holds enter-initrd (systemd-pcrphase-initrd
-# measures leave-initrd when it stops, after this), before the switch to the root.
-# Never blocks the boot: without a TPM or an identity it only logs.
+# combination (/usr/local/lib/safespace/identity). After the combination is
+# chosen and measured (safespace-select.service), while PCR 11 still holds
+# enter-initrd (systemd-pcrphase-initrd measures leave-initrd when it stops,
+# after this); before the network (network-pre.target: systemd-networkd, netroot),
+# so the initrd's DHCP asks with the machine's machine-id, as the running system
+# does. Nothing of it comes from the network. Never blocks the boot: without a
+# TPM or an identity it only logs.
 [Unit]
 Description=Make or release the machine's identity (its combination only)
 DefaultDependencies=no
-After=usb-bootdev.service netroot.service tpm2.target systemd-pcrphase-initrd.service systemd-tpm2-setup-early.service
+After=safespace-select.service tpm2.target systemd-pcrphase-initrd.service systemd-tpm2-setup-early.service
+Wants=network-pre.target
+Before=network-pre.target
 Before=initrd.target initrd-switch-root.target
 Conflicts=shutdown.target
 

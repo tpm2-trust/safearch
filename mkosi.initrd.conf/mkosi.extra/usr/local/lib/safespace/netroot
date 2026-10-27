@@ -8,8 +8,8 @@
 # UKI, nothing from the network:
 #   safespace.netroot=<url>/  base URL of a distribution server, may be given
 #                             more than once (tried in order)
-#   safespace.root.<name>=<hash>  dm-verity root hash per combination; select
-#                             (next to this script) picks the combination
+#   safespace.root.<name>=<hash>  dm-verity root hash per combination; the
+#                             combination is chosen before (safespace-select.service)
 # veritysetup refuses a hash tree that does not match that hash, and dm-verity
 # then checks every block that is read, with --panic-on-corruption. A
 # manipulated or wrong server can therefore only keep the machine from
@@ -48,9 +48,9 @@ args() { printf '%s\n' "$cmdline" | tr ' ' '\n' | sed -n "s/^$1=//p"; }
 
 urls=$(args safespace.netroot)
 [ -n "$urls" ] || { msg "no safespace.netroot= on the kernel command line, nothing to do"; exit 0; }
-# Which root: the selected combination's.
+# Which root: the chosen combination's.
 . "${0%/*}/select"
-select_root || die "no root to boot"
+select_chosen || die "no root to boot"
 roothash=$SELECT_HASH
 F_IMG=root-$SELECT_NAME.img F_VERITY=root-$SELECT_NAME.verity F_HASH=roothash-$SELECT_NAME
 
@@ -62,6 +62,14 @@ modprobe -a loop dm-verity erofs 2>/dev/null
 msg "waiting up to ${WAIT_ONLINE}s for a DHCP address"
 if /usr/lib/systemd/systemd-networkd-wait-online --any --timeout="$WAIT_ONLINE"; then
 	msg "link up: $(ip -o -4 addr show scope global 2>/dev/null | tr -s ' ' | cut -d' ' -f2,4 | tr '\n' ' ')"
+	# DHCP's client identifier comes from the machine-id (systemd-networkd, started
+	# after safespace-identity): the machine's where that released it, as the
+	# running system asks.
+	if [ -s "$SELECT_RUN/identity/machine-id" ] && [ "$(cat /etc/machine-id 2>/dev/null)" = "$(cat "$SELECT_RUN/identity/machine-id")" ]; then
+		msg "DHCP as the machine (its machine-id, released before the network)"
+	else
+		msg "DHCP with a temporary machine-id (no identity released this boot)"
+	fi
 else
 	msg "no link reported as online, trying anyway"
 fi

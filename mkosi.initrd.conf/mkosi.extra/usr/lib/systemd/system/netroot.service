@@ -10,8 +10,11 @@ ConditionKernelCommandLine=safespace.netroot
 ConditionPathExists=!/sys/firmware/efi/efivars/LoaderDevicePartUUID-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
 # systemd-networkd does the DHCP (20-netboot.network), udev loads the NIC
 # drivers from the kernel modules initrd.
-Requires=systemd-networkd.service
-After=systemd-networkd.service systemd-udevd.service systemd-udev-trigger.service
+# The combination chosen before (safespace-select.service); the machine-id
+# released before the network (safespace-identity.service, before
+# network-pre.target), so DHCP asks as the machine, as the running system does.
+Requires=systemd-networkd.service safespace-select.service
+After=systemd-networkd.service safespace-select.service safespace-identity.service systemd-udevd.service systemd-udev-trigger.service
 Wants=systemd-udev-trigger.service
 Before=initrd-root-device.target cryptsetup-pre.target veritysetup-pre.target sysroot.mount
 Conflicts=shutdown.target

@@ -9,7 +9,7 @@
 #   tests/vm.sh [--no-build | --build BUILD] [--jobs N] [STEP...]
 #
 #   (default)       build and test the whole stack: every combination of
-#                   combinations.conf, as build.sh builds it
+#                   tests/vm.safespace.conf, as build.sh builds it
 #   --no-build      test the newest existing test build
 #   --build BUILD   test this existing test build (mkosi.test/vm/builds/)
 #   --jobs N        at most N VMs at a time (default: what the free RAM allows
@@ -19,10 +19,12 @@
 #
 # Kept apart from everything real, in mkosi.test/vm/ (gitignored):
 #   id_ed25519, users.conf   the test user "tester" and its key: created here
-#                            once, used for nothing else (build.sh --users)
-# The test build's combinations: tests/vm.combinations.conf (build.sh
-# --combinations), few to keep the test fast: root (base), containers (base,docker).
-#   builds/<build>/          test builds (build.sh --users, --output-root); the
+#                            once, used for nothing else
+# The test build's combinations and users: tests/vm.safespace.conf (build.sh
+# --config), few to keep the test fast: root (base), containers (base,docker). The
+# step identity-policy builds a third time, with tests/vm.policy.conf on top
+# (builds-policy/): another identity policy.
+#   builds/<build>/          test builds (build.sh --config, --output-root); the
 #                            newest is kept. ./build.sh list and
 #                            ./release.sh never see them: a test build has the
 #                            test key and must never reach a real server.
@@ -167,8 +169,8 @@ avail=$(awk '/^MemAvailable:/ { print int($2 / 1048576) }' /proc/meminfo)
 ((avail >= 4)) || miss "4 GiB of available RAM (have $avail GiB)"
 mkdir -p "$VM/builds"
 free=$(df -BG --output=avail "$VM" | tail -1 | tr -dc 0-9)
-COMBOS_FILE=tests/vm.combinations.conf
-need_disk=$((6 + 4 * $(grep -c '^[a-z]' "$COMBOS_FILE")))
+VM_CONF=tests/vm.safespace.conf
+need_disk=$((8 + 4 * $(sed -n 's/^COMBINATIONS=//p' "$VM_CONF" | tr -d '"' | wc -w)))
 ((free >= need_disk)) || miss "$need_disk GiB free disk in mkosi.test/ (have $free GiB)"
 if ((${#MISSING[@]})); then
 	printf '\e[1;31m==> missing prerequisites:\e[0m\n' >&2
@@ -199,7 +201,7 @@ result() {
 case $BUILD_MODE in
 	build)
 		log "building the whole stack (test user, root from $URL)"
-		sudo "$REPO/build.sh" --users "$VM/users.conf" --combinations "$COMBOS_FILE" --output-root "$VM/builds" --url "$URL" \
+		sudo "$REPO/build.sh" --config "$VM_CONF" --output-root "$VM/builds" --url "$URL" \
 			>"$LOGS/build.log" 2>&1 || die "build failed (see ${LOGS#"$REPO"/}/build.log)"
 		BUILD=$(builds_newest)
 		# Only the newest test build stays.
@@ -236,10 +238,24 @@ if ((n)); then result PASS initrd-firmware; else result FAIL initrd-firmware "no
 # The update's build (B): the same configuration again, a later version - another
 # UKI, so another PCR 11 - built in the background while A boots.
 BUILD_B="" VERSION_B="" STICK_B=$RUN/stick-b.raw BUILD_B_PID=""
+# Then C, another identity policy (tests/vm.policy.conf), one combination, apart
+# from A and B (builds-policy/).
+STICK_C=$RUN/stick-c.raw
 if wants identity && [[ $BUILD_MODE == build ]]; then
-	log "building B, the update, in the background (${LOGS#"$REPO"/}/build-b.log)"
-	sudo "$REPO/build.sh" --users "$VM/users.conf" --combinations "$COMBOS_FILE" --output-root "$VM/builds" --url "$URL" \
-		>"$LOGS/build-b.log" 2>&1 &
+	log "building B, the update, then C, another identity policy, in the background (${LOGS#"$REPO"/}/build-b.log, build-c.log)"
+	(
+		sudo "$REPO/build.sh" --config "$VM_CONF" --output-root "$VM/builds" --url "$URL" >"$LOGS/build-b.log" 2>&1 || exit 1
+		BUILD_B=$(builds_newest)
+		"$REPO/release.sh" --builds "$BUILDS_ROOT" --build "$BUILD_B" --stage "$RUN/stage-b" >"$LOGS/release-b-stage.log" 2>&1 &&
+			(source "$REPO/lib/stick.sh"; stick_write "$STICK_B" "$RUN/stage-b") >"$LOGS/stick-b.log" 2>&1 || exit 1
+		echo "$BUILD_B" >"$RUN/build-b"
+		cat "$VM_CONF" tests/vm.policy.conf >"$RUN/policy.conf"
+		rm -rf "${VM:?}/builds-policy"
+		sudo "$REPO/build.sh" --config "$RUN/policy.conf" --output-root "$VM/builds-policy" --url "$URL" >"$LOGS/build-c.log" 2>&1 &&
+			BUILDS_ROOT=$REPO/$VM/builds-policy "$REPO/release.sh" --builds "$REPO/$VM/builds-policy" \
+				--build "$(BUILDS_ROOT=$REPO/$VM/builds-policy builds_newest)" --stage "$RUN/stage-c" >"$LOGS/release-c-stage.log" 2>&1 &&
+			(source "$REPO/lib/stick.sh"; stick_write "$STICK_C" "$RUN/stage-c") >"$LOGS/stick-c.log" 2>&1
+	) &
 	BUILD_B_PID=$!
 fi
 
@@ -252,7 +268,8 @@ fi
 
 SSH=(ssh -i "$REPO/$VM/id_ed25519" -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=no
 	-o UserKnownHostsFile=/dev/null -o BatchMode=yes -o LogLevel=error -o ConnectTimeout=5)
-SELECT_GUID=8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34
+# The image's constants, as build.sh writes them (lib/settings.sh).
+SELECT_GUID=$(die() { :; }; source "$REPO/lib/settings.sh"; echo "$SETTINGS_GUID")
 # A firmware variable (attributes NV, BS, RT) written into a copy of the
 # firmware's variable store (virt-fw-vars), as select or a damaged identity
 # leaves it.
@@ -325,7 +342,10 @@ if [ -n "$disk" ]; then
 fi
 echo state=$(systemctl is-system-running)
 echo failed=$(systemctl --failed --no-legend --plain | wc -l)
-echo combination=$(sudo dmesg | sed -n "s/.*\(usb-bootdev\|netroot\): combination \([a-z0-9-]*\) .*/\2/p" | tail -1)
+echo combination=$(sudo dmesg | sed -n "s/.*safespace-select: combination \([a-z0-9-]*\) .*/\1/p" | tail -1)
+# Over the network: whether the initrd asked DHCP as the machine (the machine-id
+# released before the network) or with a temporary one; empty from a stick.
+echo dhcp=$(sudo dmesg | sed -n "s/.*netroot: DHCP as the machine .*/machine/p; s/.*netroot: DHCP with a temporary machine-id .*/temporary/p" | tail -1)
 command -v docker >/dev/null && echo docker=yes || echo docker=no
 docker compose version >/dev/null 2>&1 && echo compose=yes || echo compose=no
 echo groups=$(cat /usr/lib/safespace/groups)
@@ -412,7 +432,7 @@ step_net() {
 	local want; read -ra want <<<"$(looks "${COMBOS[0]}")"
 	if vm_start net --netboot --tree "$RUN/share" --no-server --tpm; then
 		probe net
-		expect net path_var=unset usb_bootdev=0 netroot=1 "${COMMON[@]}" "${want[@]}"
+		expect net path_var=unset usb_bootdev=0 netroot=1 dhcp=temporary "${COMMON[@]}" "${want[@]}"
 	else
 		result FAIL net "$ERR"
 	fi
@@ -620,7 +640,7 @@ step_identity_net() {
 	# (seen: 0 alone, 2/7/11/15 equal): slot 1, purple.
 	id_boot identity-net --netboot --tree "$RUN/share" --no-server || return
 	vm_stop identity-net
-	expect identity-net combination="$first" netroot=1 identity=SAFEmachineID hostcert=yes assh_slot=1 cert_id=$ID_SLOT1 ca_login=yes secure_boot=enabled* "${COMMON[@]}"
+	expect identity-net combination="$first" netroot=1 dhcp=machine identity=SAFEmachineID hostcert=yes assh_slot=1 cert_id=$ID_SLOT1 ca_login=yes secure_boot=enabled* "${COMMON[@]}"
 }
 step_identity_pcr2() {
 	local first other mid
@@ -743,6 +763,25 @@ step_identity_sha1() {
 # boot makes the identity (slot 0 in its own state); safespace update: up to date;
 # then build B into the share: safespace update checks its signature and reboots;
 # the next boot is B's, certified through slot 0, the same CA and machine-id.
+# Another identity policy (build C, tests/vm.policy.conf: one slot 0,7,15+11, ECDSA
+# P-256 only), on a TPM and a sealed firmware of its own: the identity is made
+# under it - the certificate through that slot, an ECDSA CA and host key - and the
+# image says which policy it was built with.
+step_identity_policy() {
+	[[ -s $STICK_C ]] || { result FAIL identity-policy "no stick of the policy build (see ${LOGS#"$REPO"/}/build-c.log)"; return; }
+	cp "$RUN/sealed-vars.fd" "$WORK/sealed-vars.fd"
+	: >"$WORK/ca_known_hosts"
+	id_boot identity-policy "$STICK_C" || return
+	ca_line >"$WORK/ca_known_hosts"
+	ca_login | sed 's/^/after_/' >>"$LOGS/identity-policy.probe"
+	vm_ssh 'sudo safespace identity' >"$LOGS/identity-policy.out" 2>&1
+	vm_stop identity-policy
+	expect identity-policy combination=root identity=SAFEmachineID identity_created=1 hostkey_src=assh hostcert=yes assh_slot=0 \
+		cert_id=safespace_slot=0_pcrs=0,7,15_signed=11 after_ca_login=yes "${SEALED[@]}" || return
+	id_check identity-policy "ECDSA P-256: the CA and the host key; the image names its policy" \
+		"grep -q '^@cert-authority \\* ecdsa-sha2-nistp256 ' '$WORK/ca_known_hosts' && grep -q 'host key: *ecdsa-sha2-nistp256 ' '$LOGS/identity-policy.out' && grep -q 'policy: *slots 0,7,15+11; machine-id 7,15+11; keys p256; bank auto' '$LOGS/identity-policy.out'"
+}
+
 step_update() {
 	local first other mid
 	id_names
@@ -759,10 +798,10 @@ step_update() {
 	id_run update-run "safespace update: B checked against db.pem, reboot" "rebooting into $VERSION_B" vm_ssh "sudo safespace update --yes"
 	for _ in $(seq 120); do kill -0 "$VM_PID" 2>/dev/null || break; sleep 1; done
 	vm_kill
-	expect update-net combination="$first" netroot=1 pretty="safespace_${VERSION}_$first" identity=SAFEmachineID identity_created=1 hostcert=yes assh_slot=0 after_ca_login=yes "${COMMON[@]}"
+	expect update-net combination="$first" netroot=1 dhcp=machine pretty="safespace_${VERSION}_$first" identity=SAFEmachineID identity_created=1 hostcert=yes assh_slot=0 after_ca_login=yes "${COMMON[@]}"
 	id_boot update-b --netboot --tree "$RUN/share" --no-server || return
 	vm_stop update-b
-	expect update-b combination="$first" netroot=1 pretty="safespace_${VERSION_B}_$first" identity=SAFEmachineID identity_created=0 hostcert=yes assh_slot=0 cert_id=$ID_SLOT0 ca_login=yes "${COMMON[@]}"
+	expect update-b combination="$first" netroot=1 dhcp=machine pretty="safespace_${VERSION_B}_$first" identity=SAFEmachineID identity_created=0 hostcert=yes assh_slot=0 cert_id=$ID_SLOT0 ca_login=yes "${COMMON[@]}"
 	id_check update-b "the same machine-id after safespace update" "[[ '$(val update-b machine_id)' == '$mid' ]]"
 }
 
@@ -853,14 +892,14 @@ if [[ -n ${ID_PID:-} ]]; then
 	job 34-identity-pcr7 step_identity_pcr7
 	job 36-identity-fails step_identity_fails
 	job 38-identity-clear step_identity_clear
-	# The update: build B staged, its stick written.
+	# The update: build B staged, its stick written (and C's, the other policy).
 	if [[ -n $BUILD_B_PID ]]; then
-		if wait "$BUILD_B_PID"; then
-			BUILD_B=$(builds_newest) VERSION_B=$(builds_version_of "$(builds_newest)")
-			"$REPO/release.sh" --builds "$BUILDS_ROOT" --build "$BUILD_B" --stage "$RUN/stage-b" >"$LOGS/release-b-stage.log" 2>&1 &&
-				(source "$REPO/lib/stick.sh"; stick_write "$STICK_B" "$RUN/stage-b") >"$LOGS/stick-b.log" 2>&1 || BUILD_B="" VERSION_B=""
+		wait "$BUILD_B_PID"
+		if [[ -s $RUN/build-b ]]; then
+			BUILD_B=$(cat "$RUN/build-b") VERSION_B=$(builds_version_of "$(cat "$RUN/build-b")")
 		fi
 		job 35-identity-update step_identity_update
+		job 3a-identity-policy step_identity_policy
 	fi
 fi
 wait

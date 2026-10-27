@@ -14,16 +14,15 @@
 #               combination's, or Secure Boot changed
 #   throwaway   no TPM 2.0, or aSSH did not start: sshd's throwaway key
 #
-# SAFESPACE_EFIVARS, SAFESPACE_RUNDIR: only for tests/run.sh.
+# SAFESPACE_SETTINGS, SAFESPACE_EFIVARS, SAFESPACE_RUNDIR: only for tests/run.sh.
 
+# The names, GUIDs and the policy, as the initrd has them: settings (generated
+# by build.sh from safespace.conf, lib/settings.sh).
+. "${SAFESPACE_SETTINGS:-/usr/local/lib/safespace/settings}"
 EFIVARS=${SAFESPACE_EFIVARS:-/sys/firmware/efi/efivars}
-GLOBAL=8be4df61-93ca-11d2-aa0d-00e098032b8c
-# The selection's vendor GUID (the initrd's select), the machine-id's too.
-SELECT_GUID=8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34
-# The identity: aSSH's CA (assh.conf's ASSH_CA, aSSH's vendor GUID) and the
-# machine-id; the initrd's identity names them alike.
-CA_VAR=$EFIVARS/SAFEasshCA-24415b90-39be-45c0-a9a3-d547ebe28ea0
-MID_VAR=$EFIVARS/SAFEmachineID-$SELECT_GUID
+# The identity: aSSH's CA and the machine-id, in the firmware's variables.
+CA_VAR=$EFIVARS/$SAFESPACE_CA_VAR
+MID_VAR=$EFIVARS/$SAFESPACE_MID_VAR-$SAFESPACE_GUID
 # What this boot's host key is (the agent), and what sshd serves (the agent's
 # lines, or sshd-hostkeys.service's throwaway key).
 STATUS=${SAFESPACE_RUNDIR:-/run}/assh/status
@@ -31,7 +30,7 @@ SSHD_HOSTKEY=${SAFESPACE_RUNDIR:-/run}/safespace/sshd-hostkey.conf
 
 # Value byte of a global UEFI variable (after the 4-byte attribute header);
 # "" where the firmware has none (no Secure Boot), also under pipefail.
-var_byte() { od -An -tu1 -j4 -N1 "$EFIVARS/$1-$GLOBAL" 2>/dev/null | tr -d ' ' || true; }
+var_byte() { od -An -tu1 -j4 -N1 "$EFIVARS/$1-$SAFESPACE_EFI_GLOBAL" 2>/dev/null | tr -d ' ' || true; }
 sealed() { [[ $(var_byte SetupMode) == 0 && $(var_byte SecureBoot) == 1 ]]; }
 
 # The slot that certified this boot's host key; "" for none.

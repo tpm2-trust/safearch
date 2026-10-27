@@ -1,0 +1,17 @@
+#!/bin/sh
+# Chooses the combination to boot and measures it (select, next to this
+# script), once, before anything uses it: the machine's identity (released
+# before the network, so DHCP asks as the machine) and the boot path
+# (usb-bootdev or netroot, which open the chosen one's root). Started by
+# safespace-select.service. An unknown or missing combination stops the boot:
+# both boot paths require this.
+
+msg() {
+	echo "safespace-select: $*" >/dev/kmsg 2>/dev/null
+	echo "safespace-select: $*" >/dev/console 2>/dev/null
+	return 0
+}
+
+cmdline=$(cat /proc/cmdline)
+. "${0%/*}/select"
+select_root

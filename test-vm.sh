@@ -35,7 +35,7 @@
 # --url BOOT_URL: no local server; UEFI HTTP boot of a published UKI from a
 #   distribution server, e.g. http://10.0.0.1/safespace/boot.efi.
 #   The VM reaches it through QEMU's NAT and resolves names with the host's
-#   DNS, so a normal build (netboot.conf URL) is tested as published, exactly
+#   DNS, so a normal build (NETROOT_URL) is tested as published, exactly
 #   as a machine on the LAN would boot it.
 #
 # --secure-boot: enforced Secure Boot with only the UKI's own signing

@@ -113,7 +113,7 @@ Once per build host: `users.conf` and `safespace.env`. The public Secure Boot ke
 distribution servers (`SERVER_URL` of their `server.conf` + `/`):
 
 ```sh
-cp netboot.conf.example netboot.conf     # NETROOT_URL=http://10.0.0.1/safespace/
+echo NETROOT_URL=http://10.0.0.1/safespace/ >>safespace.local.conf
 sudo ./build.sh                          # the whole stack -> mkosi.output/combined_<time>/
 ./release.sh --push safespace@10.0.0.1
 ```
@@ -147,7 +147,7 @@ firmware loads the new `boot.efi`. If the image is refused although the server s
 this UKI's release, that is a real error and the boot stops (no reboot loop).
 
 **Which combination** (README "Combinations"): the initrd picks it (`safespace.select=`, the
-EFI variables set by `safespace select`, else the first of `combinations.conf`) and downloads
+EFI variables set by `safespace select`, else the first of `COMBINATIONS`) and downloads
 only that root. Without `safespace.root.<name>=` on the signed command line it opens nothing.
 
 ## The distribution server
@@ -351,15 +351,22 @@ Both work; the second needs no stick.
 - the kernel starts, and the initrd logs its progress on the console (and into the journal):
 
 ```
+safespace-select: combination root (no selection: the first), roothash=ea0e130f2f63...
 netroot: waiting up to 60s for a DHCP address
 netroot: link up: enp1s0 10.0.0.137/24
+netroot: DHCP as the machine (its machine-id, released before the network)
 netroot: fetching the root image from http://10.0.0.1/safespace
-netroot: combination root (no selection: the first), roothash=ea0e130f2f63...
 netroot: root-root.img 2013 MiB + root-root.verity 16 MiB, 15822 MiB RAM free
 netroot: got root-root.verity: 16 MiB in 1s (16 MiB/s)
 netroot: got root-root.img: 2013 MiB in 19s (105 MiB/s)
 netroot: root opened as /dev/mapper/root (/dev/loop0 = /run/netroot/root.img), verified against roothash=ea0e130f2f63...
 ```
+
+The initrd asks DHCP with the machine's machine-id, released before the network
+(`safespace-identity.service`), so a sealed machine in its combination gets the address the
+running system has, already for the download (netroot says `DHCP as the machine`). Without
+its identity (another combination, not sealed yet) the initrd's machine-id is a temporary
+one, and so is that address (`DHCP with a temporary machine-id`).
 
 **4. Check it on the machine** (ssh in with a key from `users.conf`, or at the console):
 
@@ -497,12 +504,12 @@ every file name and of the URL inside the UKI, so builds never overwrite each ot
 
 ```sh
 # 1. change what you want, e.g.
-./update-snapshot.sh                 # newest Arch Linux Archive day (repos.conf)
+./update-snapshot.sh                 # newest Arch Linux Archive day (safespace.conf)
 vim users.conf mkosi.conf            # users, packages, …
 ./fetch-images.sh                    # shipped Docker images (docker group)
 
 # 2. build (-f also rebuilds unchanged packages, -ff reinstalls everything)
-sudo ./build.sh -f                   # every combination of combinations.conf
+sudo ./build.sh -f                   # every combination of COMBINATIONS
 
 # 3. release: replaces the release on every server, which then checks it
 ./release.sh
@@ -684,7 +691,7 @@ real system loads them from the root image.
 | on a machine with Intel AMT (vPro, e.g. Intel I218-LM/I219-LM): nothing loaded over PXE runs, it reboots or hangs | disable Intel AMT in the BIOS ([Case found](#case-found-thinkpad-t450s-bios-jbet73ww)) |
 | files arrive completely, then reboot / hang / back to the boot menu, even for small images | the firmware cannot start a network-loaded image (ThinkPad T450s with AMT on): disable AMT, or boot from a stick (burn.sh) |
 | a VM (OVMF) shows `Start PXE over IPv4` before HTTP boot | OVMF tries its PXE entries first; switch them off with fw_cfg `opt/org.tianocore/IPv4PXESupport=n` / `IPv6PXESupport=n` ([README, "A netbooting VM"](README.md#a-netbooting-vm-qemu-libvirt--virt-manager)) |
-| a VM: `netroot: download … failed`, `Could not resolve host` | the VM's virtual network resolves through the VM host's resolver, which does not know the name in `NETROOT_URL`: put the IP (or the IP as a second URL) into `netboot.conf` and rebuild |
+| a VM: `netroot: download … failed`, `Could not resolve host` | the VM's virtual network resolves through the VM host's resolver, which does not know the name in `NETROOT_URL`: put the IP (or the IP as a second URL) into `NETROOT_URL` (`safespace.local.conf`) and rebuild |
 | boot stops in the initrd emergency shell | `journalctl -b -g netroot`, then `ip a`, `curl -I <url>/root-<name>.img` from the shell |
 | host key warnings on every ssh login | expected: `/var` is RAM, so ssh host keys are new on every boot (README, "Open decisions") |
 

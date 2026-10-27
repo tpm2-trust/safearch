@@ -1,19 +1,11 @@
-# Host-specific settings. Copy to mkosi.local.conf (ignored by git) on the
-# build host and adjust; mkosi merges it with mkosi.conf.
+# Raw mkosi settings of this build host. Copy to mkosi.local.conf (ignored by
+# git) and adjust; mkosi merges it with mkosi.conf. Everything safespace itself
+# decides - combinations, users, package source, netroot URLs, release targets,
+# erofs threads, Secure Boot keys, the identity's policy - is in safespace.conf
+# (this host's choices: safespace.local.conf), not here.
 #
-# Most of the build time goes into compressing the erofs root (zstd level 12).
-# build.sh uses all available CPUs for it (nproc) unless this line or
-# --workers says otherwise, e.g. to leave cores free on a shared host.
-# --workers=0 does NOT mean "all cores", it means single-threaded.
-# Image and initrd compression (zstd -T0) already use all cores.
+# The network UKI's size limits of mkosi.postoutput (NETBOOT.md, "Size of the
+# network UKI"): a warning above the first, a stop above the second.
 
 [Build]
-#Environment=SYSTEMD_REPART_MKFS_OPTIONS_EROFS=--workers=8
-
-# Secure Boot keys: without this, the host's sbctl keys (/var/lib/sbctl). A
-# dedicated key set for safespace (README.md, "Secure Boot keys"):
-#   sudo install -d -m 0700 /var/lib/safespace/sbctl
-#   sudo sbctl --config /var/lib/safespace/sbctl/sbctl.conf create-keys
-# with sbctl.conf holding keydir: /var/lib/safespace/sbctl/keys and
-# guid: /var/lib/safespace/sbctl/GUID. Several Environment= lines add up.
-#Environment=SAFESPACE_SBCTL_CONFIG=/var/lib/safespace/sbctl/sbctl.conf
+#Environment=SAFESPACE_UKI_WARN_MIB=85 SAFESPACE_UKI_LIMIT_MIB=128
