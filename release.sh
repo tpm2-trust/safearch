@@ -5,29 +5,34 @@
 # both boot paths: machines boot boot.efi over the network, burn.sh writes
 # sticks from it.
 #
-#   ./release.sh [--build BUILD | --groups LIST] [--push TARGET]...
+#   ./release.sh [--build BUILD] [--push TARGET]... [--builds DIR] [--stage DIR]
 #
 #   --build BUILD   the build to release, as ./build.sh list shows it
-#                   (e.g. base-remotedesktop_20261019-0930). Releasing an older
+#                   (e.g. combined_20261019-0930). Releasing an older
 #                   build again is how a release is rolled back.
-#   --groups LIST   the newest build with exactly this group set
-#   (neither)       the newest build, whatever its groups
+#   (without)       the newest build
+#   --builds DIR    where the builds are (default: mkosi.output; tests/vm.sh
+#                   keeps its test builds apart). A build from elsewhere goes
+#                   only where --push says, never to RELEASE_TARGETS: a test
+#                   build carries the test key and must never reach a real server.
+#   --stage DIR     where the release is staged (default: mkosi.release)
 #   --push TARGET   distribution server to push to, repeatable. TARGET is the
 #                   upload account, e.g. safespace@dist1.example.org (its ssh
 #                   key only reaches the share, see server/setup.sh), or a
 #                   local share directory, e.g. /srv/safespace/share. Without
-#                   --push: RELEASE_TARGETS= from release.conf (gitignored,
-#                   see release.conf.example); none at all = stage only.
+#                   --push: RELEASE_TARGETS= of safespace.conf (this host's
+#                   in safespace.local.conf); none at all = stage only.
 #
 # The bundle, mkosi.release/ (the newest release only): the build's parts as
 # hardlinks (nothing is copied or unpacked) plus the release files:
-#   boot.efi (signed UKI), root.img, root.verity, roothash, systemd-boot.efi,
-#   layout.sfdisk, manifest.json; cmdline (the UKI's signed command line,
-#   readable), release (VERSION, BUILD, GROUPS, BUILT, SNAPSHOT, COMMIT,
-#   PACKAGES), SHA256SUMS
+#   boot.efi (signed UKI), systemd-boot.efi, layout.sfdisk; per combination
+#   root-<name>.img, root-<name>.verity, roothash-<name>, manifest-<name>.json;
+#   cmdline (the UKI's signed command line, readable), release.p7s (the release
+#   file's signature by the db key, from the build), release (VERSION,
+#   BUILD, COMBINATIONS, BUILT, SNAPSHOT, COMMIT, PACKAGES), SHA256SUMS
 # It is checked here exactly as a server checks it (lib/verify.sh): Secure
-# Boot signatures against the exported db.pem, root image against the signed
-# root hash, the stick's partition table. test-vm.sh --netboot serves
+# Boot signatures against the exported db.pem, every root image against its
+# signed root hash, the stick's partition table. test-vm.sh --netboot serves
 # mkosi.release/.
 #
 # Pushing: rsync over ssh into the share. --delay-updates collects
@@ -46,25 +51,25 @@ usage() { sed -n '2,${/^#/!q;s/^# \?//;p}' "$0"; }
 source "$HERE/lib/verify.sh"
 # shellcheck source=lib/builds.sh
 source "$HERE/lib/builds.sh"
-# shellcheck source=lib/groups.sh
-source "$HERE/lib/groups.sh"
 
-case ${1:-} in
-	network | usb) die "there are no variants any more: one release serves sticks and the network ($0 [--build ...])" ;;
-esac
-BUILD="" WANT_GROUPS="" TARGETS=()
+BUILD="" TARGETS=() STAGE_DIR=$HERE/mkosi.release
 while (($#)); do
 	case $1 in
 		--build) BUILD=${2:?--build needs a build (./build.sh list)}; shift 2 ;;
-		--groups) WANT_GROUPS=${2:?--groups needs a comma-separated list}; shift 2 ;;
 		--push) TARGETS+=("${2:?--push needs a target}"); shift 2 ;;
+		--builds) BUILDS_ROOT=$(readlink -f "${2:?--builds needs a directory}"); shift 2 ;;
+		--stage) STAGE_DIR=$(readlink -f "${2:?--stage needs a directory}"); shift 2 ;;
 		-h | --help) usage; exit 0 ;;
 		*) usage >&2; die "unknown option $1" ;;
 	esac
 done
-if ((${#TARGETS[@]} == 0)) && [[ -f $HERE/release.conf ]]; then
-	targets=$(sed -n 's/^RELEASE_TARGETS=//p' "$HERE/release.conf" | tail -1 | tr -d '"'"'")
-	read -ra TARGETS <<<"$targets"
+# shellcheck source=lib/conf.sh
+source "$HERE/lib/conf.sh"
+conf_load "$HERE"
+if [[ $BUILDS_ROOT == "$HERE/mkosi.output" ]]; then
+	((${#TARGETS[@]})) || read -ra TARGETS <<<"$RELEASE_TARGETS"
+elif ((${#TARGETS[@]} == 0)) && [[ -n $RELEASE_TARGETS ]]; then
+	log "builds from ${BUILDS_ROOT#"$HERE"/}, not mkosi.output: not to RELEASE_TARGETS (only --push)"
 fi
 for cmd in sbverify objcopy veritysetup sha256sum openssl; do
 	command -v "$cmd" >/dev/null || die "missing '$cmd' (pacman -S sbsigntools binutils cryptsetup openssl)"
@@ -76,13 +81,7 @@ DB=$HERE/mkosi.extra/usr/share/safespace/secureboot/db.pem
 
 # --- pick the build ------------------------------------------------------------
 
-[[ -z $BUILD || -z $WANT_GROUPS ]] || die "--build or --groups, not both"
-if [[ -n $WANT_GROUPS ]]; then
-	groups_parse "$WANT_GROUPS"
-	WANT_GROUPS=$(IFS=,; echo "${SAFESPACE_GROUPS[*]}")
-	BUILD=$(builds_newest "$WANT_GROUPS")
-	[[ -n $BUILD ]] || die "no build with groups $WANT_GROUPS (./build.sh list)"
-elif [[ -n $BUILD ]]; then
+if [[ -n $BUILD ]]; then
 	BUILD=$(builds_find "$BUILD")
 else
 	BUILD=$(builds_newest)
@@ -90,11 +89,12 @@ else
 fi
 DIR=$(builds_dir "$BUILD")
 VERSION=$(builds_info "$DIR" version)
-GROUPS_SET=$(builds_info "$DIR" groups)
+COMBOS=$(builds_combo_names "$DIR")
+[[ -n $COMBOS ]] || die "$DIR/build.json names no combinations"
 verify_name_version "$VERSION" || die "invalid version '$VERSION' in $DIR/build.json"
 log "Release $BUILD"
-log "  groups $GROUPS_SET, built $(builds_info "$DIR" finished), snapshot $(builds_info "$DIR" snapshot), commit $(builds_info "$DIR" commit)$([[ $(builds_info "$DIR" uncommitted_changes) == yes ]] && echo ' + uncommitted changes'), $(builds_info "$DIR" packages) packages"
-# Newer builds of other group sets that were never released: maybe the one meant.
+log "  combinations $COMBOS, built $(builds_info "$DIR" finished), snapshot $(builds_info "$DIR" snapshot), commit $(builds_info "$DIR" commit)$([[ $(builds_info "$DIR" uncommitted_changes) == yes ]] && echo ' + uncommitted changes'), $(builds_info "$DIR" packages) packages"
+# Newer builds that were never released: maybe the one meant.
 while IFS= read -r b; do
 	[[ $b != "$BUILD" && $(builds_version_of "$b") > $VERSION && ! -s $(builds_dir "$b")/released.log ]] &&
 		warn "a newer build is not released: $b (release it with --build $b)"
@@ -102,26 +102,28 @@ done < <(builds_all)
 
 # --- bundle --------------------------------------------------------------------
 
-DEST=$HERE/mkosi.release
+DEST=$STAGE_DIR
+[[ $DEST != / && $DEST != "$HERE" ]] || die "--stage $DEST: not a staging directory"
 rm -rf "$DEST"
 mkdir -p "$DEST"
-for f in boot.efi root.img root.verity roothash systemd-boot.efi layout.sfdisk manifest.json; do
-	[[ -f $DIR/$f ]] || die "$DIR/$f missing (a build from before the parts layout? rebuild)"
+PARTS=(boot.efi systemd-boot.efi layout.sfdisk)
+# Per layer its image, hash tree and root hash (the layers on the UKI's signed
+# command line), per combination its package list.
+for l in $(verify_layers "$(uki_section "$DIR/boot.efi" .cmdline)"); do PARTS+=("root-$l.img" "root-$l.verity" "roothash-$l"); done
+for n in ${COMBOS//,/ }; do PARTS+=("manifest-$n.json"); done
+for f in "${PARTS[@]}"; do
+	[[ -f $DIR/$f ]] || die "$DIR/$f missing"
 	ln "$DIR/$f" "$DEST/$f" 2>/dev/null || cp --reflink=auto "$DIR/$f" "$DEST/$f"
 done
-uki_cmdline "$DEST/boot.efi" >"$DEST/cmdline"
+uki_section "$DEST/boot.efi" .cmdline >"$DEST/cmdline"
 echo >>"$DEST/cmdline"
-{
-	echo "VERSION=$VERSION"
-	echo "BUILD=$BUILD"
-	echo "GROUPS=$GROUPS_SET"
-	echo "BUILT=$(builds_info "$DIR" finished)"
-	echo "SNAPSHOT=$(builds_info "$DIR" snapshot)"
-	echo "COMMIT=$(builds_info "$DIR" commit)$([[ $(builds_info "$DIR" uncommitted_changes) == yes ]] && echo +uncommitted)"
-	echo "PACKAGES=$(builds_info "$DIR" packages)"
-} >"$DEST/release"
+# The release file and its signature, as the build wrote them.
+for f in release release.p7s; do
+	[[ -f $DIR/$f ]] || die "$DIR/$f missing"
+	cp "$DIR/$f" "$DEST/$f"
+done
 (cd "$DEST" && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\n' | sort | xargs sha256sum >SHA256SUMS)
-chmod 0644 "$DEST"/{cmdline,release,SHA256SUMS}
+chmod 0644 "$DEST"/{cmdline,release,release.p7s,SHA256SUMS}
 chmod 0755 "$DEST"
 
 # --- check it as a server will ---------------------------------------------------
@@ -151,4 +153,4 @@ for target in "${TARGETS[@]}"; do
 	echo "$(date -Is) $target" >>"$DIR/released.log"
 	log "  $target now serves $BUILD and checks it (there: safespace-netboot status)"
 done
-((${#TARGETS[@]})) || log "No --push target: staged only (RELEASE_TARGETS= in release.conf, or --push)"
+((${#TARGETS[@]})) || log "No --push target: staged only (RELEASE_TARGETS= in safespace.local.conf, or --push)"

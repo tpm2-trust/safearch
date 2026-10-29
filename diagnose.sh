@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Read-only check of a stick/SD card written by burn.sh:
-# ESP + signed UKI, dm-verity root (verified block by block), nothing writable.
+# ESP + signed UKI, one dm-verity root per combination (each verified block
+# by block against its hash on the signed command line), nothing writable.
 # Usage: sudo ./diagnose.sh [--db-cert db.pem] /dev/sdX
 #   --db-cert  the db certificate the signatures must verify against (default:
 #              the build host's exported db.pem, else a distribution server's
@@ -8,6 +9,10 @@
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# The checks the build host and the servers make: the combinations, the UKI's
+# sections, the partition table's types and UUIDs.
+# shellcheck source=lib/verify.sh
+source "$HERE/lib/verify.sh"
 DB_CERT=""
 [[ ${1:-} == --db-cert ]] && { DB_CERT=${2:?--db-cert needs a file}; shift 2; }
 DISK=${1:?usage: sudo $0 [--db-cert db.pem] /dev/sdX}
@@ -39,17 +44,11 @@ part_by_type() {
 hdr "Partition table"
 sfdisk -d "$DISK"
 lsblk -o NAME,SIZE,FSTYPE,PARTTYPENAME,PARTUUID "$DISK"
-ESP=$(part_by_type c12a7328-f81f-11d2-ba4b-00a0c93ec93b)
-ROOT=$(part_by_type 4f68bce3-e8cd-4db1-96e7-fbcaf984b709)
-VERITY=$(part_by_type 2c7357ed-ebd2-46d9-aec1-23d437ec2bf5)
-n=$(lsblk -lnpo TYPE "$DISK" | grep -c part)
-for p in ESP ROOT VERITY; do
-	[[ -n ${!p} ]] && ok "$p partition: ${!p}" || bad "no $p partition"
-done
-((n == 3)) && ok "exactly 3 partitions, nothing writable on the stick" ||
-	bad "$n partitions, expected 3 (ESP, root, root-verity)"
+ESP=$(part_by_type "${GPT_ESP,,}")
+[[ -n $ESP ]] && ok "ESP partition: $ESP" || { bad "no ESP partition"; exit 1; }
+NPARTS=$(lsblk -lnpo TYPE "$DISK" | grep -c part)
 if [[ $(dd if="$DISK" bs=1 skip=32769 count=5 status=none) == CD001 ]]; then
-	bad "ISO9660/El Torito header at 32 KiB (CD boot path; image built before ElTorito=no)"
+	bad "ISO9660/El Torito header at 32 KiB (a CD boot path: not a stick burn.sh wrote)"
 else
 	ok "no ISO9660/El Torito header"
 fi
@@ -90,16 +89,16 @@ if command -v sbverify >/dev/null; then
 else
 	echo "  NOTE sbverify missing (pacman -S sbsigntools): signatures not checked"
 fi
-CMDLINE=$(objcopy -O binary --only-section=.cmdline "$UKI" /dev/stdout 2>/dev/null | tr -d '\0')
+CMDLINE=$(uki_section "$UKI" .cmdline)
 [[ -n $CMDLINE ]] && ok "cmdline: $CMDLINE" || bad "UKI has no .cmdline section"
 [[ $CMDLINE == *usbcore.authorized_default=0* ]] && ok "USB lockdown on the kernel command line"
 [[ $CMDLINE == *systemd.volatile=state* ]] && ok "/var is a tmpfs (systemd.volatile=state)" ||
 	bad "systemd.volatile=state missing: /var would be on the read-only root"
 opts=(systemd.credentials_boot_policy=strict systemd.sysext=0 systemd.confext=0
 	rd.systemd.sysext=0 rd.systemd.confext=0)
-# The initrd opens root itself (usb-bootdev, --panic-on-corruption) as
-# /dev/mapper/root; systemd's verity generator stays out of it.
-opts+=(root=/dev/mapper/root systemd.verity=no rd.systemd.verity=no)
+# The initrd opens the layers itself (usb-bootdev, --panic-on-corruption) and
+# stacks them at /sysroot; systemd's verity and partition generators stay out.
+opts+=(systemd.verity=no rd.systemd.verity=no systemd.gpt_auto=0 rd.systemd.gpt_auto=0)
 for opt in "${opts[@]}"; do
 	[[ " $CMDLINE " == *" $opt "* ]] && ok "$opt" || bad "$opt missing from the kernel command line"
 done
@@ -108,72 +107,102 @@ done
 extra=$(cd "$TMP/esp" && find . -type f ! -ipath './efi/boot/bootx64.efi' ! -ipath './efi/linux/*.efi' | sed 's|^\./||')
 [[ -z $extra ]] && ok "ESP holds nothing but systemd-boot and the UKI" || { bad "unexpected files on the ESP:"; sed 's/^/       /' <<<"$extra"; }
 
-ROOTHASH=$(tr ' ' '\n' <<<"$CMDLINE" | sed -n 's/^roothash=//p')
+[[ " $CMDLINE " == *" lockdown=integrity "* ]] && ok "lockdown=integrity" || bad "lockdown=integrity missing from the kernel command line"
+[[ " $CMDLINE " != *" roothash="* && " $CMDLINE " != *" root="* ]] && ok "no roothash=, no root= (the initrd stacks the layers)" || bad "roothash= or root= on the command line"
+mapfile -t COMBOS < <(verify_combinations "$CMDLINE")
+((${#COMBOS[@]})) && ok "combinations: ${COMBOS[*]} (default ${COMBOS[0]})" || { bad "no safespace.root.<name>= on the kernel command line"; exit 1; }
+mapfile -t LAYERS < <(verify_layers "$CMDLINE")
+((${#LAYERS[@]})) && ok "layers: ${LAYERS[*]}" || { bad "no safespace.layer.<layer>= on the kernel command line"; exit 1; }
+for C in "${COMBOS[@]}"; do ok "  $C: $(verify_chain "$CMDLINE" "$C")"; done
+((NPARTS == 1 + 2 * ${#LAYERS[@]})) && ok "exactly $NPARTS partitions (ESP + a root/verity pair per layer), nothing writable on the stick" ||
+	bad "$NPARTS partitions, expected $((1 + 2 * ${#LAYERS[@]})) (ESP, root-<layer> and root-<layer>-verity per layer)"
 
-hdr "dm-verity root"
-if [[ -z $ROOTHASH ]]; then
-	bad "no roothash= on the kernel command line"
-else
-	ok "roothash=$ROOTHASH"
+check_root() { # NAME: what is inside a combination's root, mounted at $TMP/root (read-only)
+	local C=$1 list f l
+	hdr "Root content of $C (read-only)"
+	if mountpoint -q "$TMP/root"; then
+		ok "root of $C: its layers stacked as the initrd stacks them"
+		for f in etc/fstab etc/machine-id; do
+			[[ -e $TMP/root/$f ]] && { ok "/$f"; sed 's/^/       /' "$TMP/root/$f"; } || bad "/$f missing"
+		done
+		for l in home root; do
+			[[ -L $TMP/root/$l ]] && ok "/$l -> $(readlink "$TMP/root/$l")" || bad "/$l is not a symlink into /var"
+		done
+		ls "$TMP/root/etc/ssh/authorized_keys" 2>/dev/null | sed 's/^/  ssh keys for: /'
+		ls "$TMP/root/usr/lib/modules" | sed 's/^/  kernel modules: /'
+		sed 's/^/  package groups: /' "$TMP/root/usr/lib/safespace/groups" 2>/dev/null || bad "no /usr/lib/safespace/groups"
+	else
+		bad "cannot mount root"
+	fi
+
+	hdr "Volatile /var and Docker (inside root of $C)"
+	if mountpoint -q "$TMP/root"; then
+		[[ -d $TMP/root/usr/share/factory/var ]] &&
+			ok "factory /var: $(du -sh "$TMP/root/usr/share/factory/var" | cut -f1), homes: $(ls "$TMP/root/usr/share/factory/var/home" 2>/dev/null | tr '\n' ' ')" ||
+			bad "no /usr/share/factory/var"
+		[[ -z $(ls -A "$TMP/root/var" 2>/dev/null) ]] && ok "/var in root is an empty mount point" ||
+			bad "/var in root is not empty"
+		sed 's/^/  daemon.json: /' "$TMP/root/etc/docker/daemon.json" 2>/dev/null | tr -d '\n'; echo
+		grep -v '^#' "$TMP/root/etc/fstab" 2>/dev/null | grep . | sed 's/^/  fstab: /'
+		list=$TMP/root/usr/share/safespace/docker-images/images.list
+		if [[ -f $list ]]; then
+			grep -v '^#' "$list" | awk '{ print "  shipped image: " $3 " (" $2 ")" }'
+		else
+			echo "  no Docker images shipped"
+		fi
+	fi
+	umount -q "$TMP/root" 2>/dev/null
+}
+
+part_by_uuid() { lsblk -lnpo NAME,PARTUUID "$DISK" | awk -v u="$1" 'tolower($2) == u { print $1; exit }'; }
+# The layers, each checked as the initrd opens it: partitions by the UUIDs
+# derived from its signed hash, every block against that hash.
+declare -A LAYER_PART=()
+for C in "${LAYERS[@]}"; do
+	ROOTHASH=$(verify_layer_hash "$CMDLINE" "$C")
+	hdr "dm-verity layer $C"
+	ok "safespace.layer.$C=$ROOTHASH"
 	# The build on this host with that root hash, if any.
-	build=$(grep -lx "$ROOTHASH" "$HERE"/mkosi.output/*/roothash 2>/dev/null | head -1)
+	build=$(grep -lx "$ROOTHASH" "$HERE"/mkosi.output/*/roothash-"$C" 2>/dev/null | head -1)
 	if [[ -n $build ]]; then
 		ok "build: $(basename "$(dirname "$build")") (./build.sh show for its packages)"
 	else
 		echo "  NOTE build: no build with this root hash on this host"
 	fi
-	uuid() { sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12}).*/\1-\2-\3-\4-\5/' <<<"$1"; }
-	want_data=$(uuid "${ROOTHASH:0:32}")
-	want_hash=$(uuid "${ROOTHASH: -32}")
-	have_data=$(blkid -p -s PART_ENTRY_UUID -o value "$ROOT")
-	have_hash=$(blkid -p -s PART_ENTRY_UUID -o value "$VERITY")
-	[[ ${have_data,,} == "$want_data" ]] && ok "root partition UUID matches the root hash" ||
-		bad "root partition UUID $have_data, expected $want_data"
-	[[ ${have_hash,,} == "$want_hash" ]] && ok "verity partition UUID matches the root hash" ||
-		bad "verity partition UUID $have_hash, expected $want_hash"
-	echo "  verifying every block of root against the root hash (takes a while)..."
+	ROOT=$(part_by_uuid "$(layout_uuid "${ROOTHASH:0:32}")")
+	VERITY=$(part_by_uuid "$(layout_uuid "${ROOTHASH: -32}")")
+	[[ -n $ROOT ]] && ok "root partition $ROOT: UUID from the root hash" || { bad "no partition with the root UUID $(layout_uuid "${ROOTHASH:0:32}")"; continue; }
+	[[ -n $VERITY ]] && ok "verity partition $VERITY: UUID from the root hash" || { bad "no partition with the verity UUID $(layout_uuid "${ROOTHASH: -32}")"; continue; }
+	# The initrd mounts each layer as erofs: libblkid does not detect erofs with
+	# 512-byte blocks.
+	[[ $(blkid -p -s TYPE -o value "$ROOT") == erofs && $(blkid -p -s FSBLOCKSIZE -o value "$ROOT") == 4096 ]] &&
+		ok "blkid sees erofs, block size 4096" || bad "layer $C is no erofs with 4096-byte blocks"
+	echo "  verifying every block of the layer against the root hash (takes a while)..."
 	if veritysetup verify "$ROOT" "$VERITY" "$ROOTHASH"; then
-		ok "root is exactly what was signed"
+		ok "layer $C is exactly what was signed"
+		LAYER_PART[$C]=$ROOT
 	else
-		bad "verity verification FAILED: root was modified or the write is damaged"
+		bad "verity verification FAILED: layer $C was modified or the write is damaged"
 	fi
-fi
-
-hdr "Root content (read-only)"
-# udev's blkid must recognise root, or systemd never marks /dev/mapper/root
-# ready (99-systemd.rules) and the initrd times out. libblkid does not detect
-# erofs with 512-byte blocks.
-root_fs=$(blkid -p -s TYPE -o value "$ROOT")
-root_bs=$(blkid -p -s FSBLOCKSIZE -o value "$ROOT")
-[[ $root_fs == erofs && $root_bs == 4096 ]] && ok "blkid sees erofs, block size 4096" ||
-	bad "blkid sees '${root_fs:-nothing}' (block size ${root_bs:-?}): the initrd will wait for /dev/mapper/root forever"
-if mount -o ro "$ROOT" "$TMP/root"; then
-	ok "root mounted ($(blkid -p -s TYPE -o value "$ROOT"))"
-	for f in etc/fstab etc/machine-id; do
-		[[ -e $TMP/root/$f ]] && { ok "/$f"; sed 's/^/       /' "$TMP/root/$f"; } || bad "/$f missing"
+done
+# Each combination as the initrd stacks it (lib/settings.sh: its overlayfs options).
+# shellcheck source=lib/settings.sh
+source "$HERE/lib/settings.sh"
+for C in "${COMBOS[@]}"; do
+	lower="" stacked=1
+	for L in $(verify_chain "$CMDLINE" "$C"); do
+		[[ -n ${LAYER_PART[$L]:-} ]] || { bad "$C: layer $L did not verify, not stacked"; stacked=0; break; }
+		mkdir -p "$TMP/layer-$L"
+		mountpoint -q "$TMP/layer-$L" || mount -t erofs -o ro "${LAYER_PART[$L]}" "$TMP/layer-$L" || { bad "cannot mount layer $L"; stacked=0; break; }
+		lower=$TMP/layer-$L${lower:+:$lower}
 	done
-	for l in home root; do
-		[[ -L $TMP/root/$l ]] && ok "/$l -> $(readlink "$TMP/root/$l")" || bad "/$l is not a symlink into /var"
-	done
-	ls "$TMP/root/etc/ssh/authorized_keys" 2>/dev/null | sed 's/^/  ssh keys for: /'
-	ls "$TMP/root/usr/lib/modules" | sed 's/^/  kernel modules: /'
-else
-	bad "cannot mount root"
-fi
-
-hdr "Volatile /var and Docker (inside root)"
-if mountpoint -q "$TMP/root"; then
-	[[ -d $TMP/root/usr/share/factory/var ]] &&
-		ok "factory /var: $(du -sh "$TMP/root/usr/share/factory/var" | cut -f1), homes: $(ls "$TMP/root/usr/share/factory/var/home" 2>/dev/null | tr '\n' ' ')" ||
-		bad "no /usr/share/factory/var"
-	[[ -z $(ls -A "$TMP/root/var" 2>/dev/null) ]] && ok "/var in root is an empty mount point" ||
-		bad "/var in root is not empty"
-	sed 's/^/  daemon.json: /' "$TMP/root/etc/docker/daemon.json" 2>/dev/null | tr -d '\n'; echo
-	grep -v '^#' "$TMP/root/etc/fstab" 2>/dev/null | grep . | sed 's/^/  fstab: /'
-	list=$TMP/root/usr/share/safespace/docker-images/images.list
-	if [[ -f $list ]]; then
-		grep -v '^#' "$list" | awk '{ print "  shipped image: " $3 " (" $2 ")" }'
+	((stacked)) || continue
+	if [[ $lower == *:* ]]; then
+		mount -t overlay overlay -o "$SETTINGS_OVERLAY,lowerdir=$lower" "$TMP/root" || { bad "cannot stack $C"; continue; }
 	else
-		echo "  no Docker images shipped"
+		mount --bind -o ro "$lower" "$TMP/root" || { bad "cannot mount $C"; continue; }
 	fi
-fi
+	check_root "$C"
+done
+for L in "${LAYERS[@]}"; do umount -q "$TMP/layer-$L" 2>/dev/null; done
+

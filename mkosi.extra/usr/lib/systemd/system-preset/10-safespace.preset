@@ -4,6 +4,11 @@ enable systemd-networkd.service
 enable systemd-resolved.service
 enable systemd-timesyncd.service
 enable sshd.service
+# The host key in the TPM (aSSH); the throwaway one without a TPM 2.0 is pulled
+# in by sshd.
+enable assh-agent.service
+# The overview on the console before the login (safespace issue).
+enable safespace-issue.service
 enable nftables.service
 enable usbguard.service
 # systemd-sysext/confext are masked in /etc/systemd/system (and switched off

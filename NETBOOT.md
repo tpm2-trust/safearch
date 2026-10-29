@@ -9,7 +9,7 @@ it from a partition.)
 
 **The whole path, for an x86-64 UEFI machine:**
 
-1. on the build host: `sudo ./build.sh --groups …` — [Build and release](#build-and-release)
+1. on the build host: `sudo ./build.sh` — [Build and release](#build-and-release)
 2. on the build host: `./release.sh --push safespace@SERVER` — the same section;
    it replaces the server's release, and the server checks it
 3. once on the server: `sudo server/setup.sh …` (nginx, the check, optional
@@ -30,14 +30,16 @@ commands in order, per role (build host, distribution server), are in README.md,
   2. HTTP GET /safespace/boot.efi ▶ nginx
      firmware verifies the signature against db
   3. UKI starts: kernel + initrd, command line fixed at build time
-     (roothash=…, safespace.netroot=http://10.0.0.1/safespace/)
-  4. initrd: DHCP, then
-     HTTP GET /safespace/roothash    ──▶ nginx   (still this UKI's release?)
-     HTTP GET /safespace/root.verity ──▶ nginx
-     HTTP GET /safespace/root.img    ──▶ nginx   (into a tmpfs)
-  5. veritysetup open … roothash=…  → /dev/mapper/root
-  6. root mounted read-only, /var is a tmpfs, machine is independent of the
-     server from here on
+     (safespace.layer.<layer>=<hash> per layer, safespace.root.<name>=<layer>,...
+     per combination, safespace.netroot=http://10.0.0.1/safespace/)
+  4. initrd: picks the combination (EFI variable, else the first), DHCP, then per layer
+     of its chain:
+     HTTP GET /safespace/roothash-<layer>    ──▶ nginx   (still this UKI's release?)
+     HTTP GET /safespace/root-<layer>.verity ──▶ nginx
+     HTTP GET /safespace/root-<layer>.img    ──▶ nginx   (into a tmpfs)
+  5. veritysetup open … <its signed hash>  → /dev/mapper/layer-<layer>, per layer
+  6. the layers stacked read-only at /sysroot, /var is a tmpfs, machine is
+     independent of the server from here on
 ```
 
 **The machine needs nothing local for this.** There is no boot medium, no bootloader and no
@@ -55,7 +57,7 @@ server unverified:
 |---|---|---|
 | kernel, initrd, command line | the UKI, signed with your sbctl `db` key, checked by the firmware | firmware refuses to start it |
 | which URL to load root from | `safespace.netroot=` on the signed command line | cannot be changed |
-| root filesystem | `root.img`, checked against `roothash=` from the signed command line | `veritysetup` refuses to open it, every later block is checked by dm-verity (`--panic-on-corruption`) |
+| root filesystem | the combination's layers, `root-<layer>.img`, each checked against `safespace.layer.<layer>=` from the signed command line; which layers, from `safespace.root.<name>=` there (an EFI variable only names the combination) | `veritysetup` refuses to open a layer, every later block is checked by dm-verity (`--panic-on-corruption`) |
 
 So plain HTTP is enough: an attacker on the network can keep a machine from booting,
 but cannot change what it boots. HTTPS only adds confidentiality, and needs a
@@ -74,7 +76,7 @@ only UEFI x86-64 clients.
 | | Where | What it is for | Needed for a real machine? |
 |---|---|---|---|
 | `./build.sh` | build host | builds the image (for sticks and network boot alike) | **yes** |
-| `./release.sh` | build host | the **release step**: turns mkosi's output into the files the firmware and the initrd ask for (`boot.efi`, `root.img`, `root.verity`), checks them, pushes them to the distribution servers | **yes** |
+| `./release.sh` | build host | the **release step**: turns mkosi's output into the files the firmware and the initrd ask for (`boot.efi`, per layer `root-<layer>.img`, `root-<layer>.verity`), checks them, pushes them to the distribution servers | **yes** |
 | `server/setup.sh` | distribution server | nginx, the check after every upload, optionally dnsmasq (`safespace-dhcp`) | **yes**, once per server |
 | `./test-vm.sh --netboot` | build host | a rehearsal in QEMU before you touch hardware | no, optional |
 
@@ -97,9 +99,10 @@ Nothing is installed on the machine itself, and the machine needs no local file.
 - **A PCI/PCIe NIC.** USB NICs do not work: the kernel authorizes no USB device
   (`usbcore.authorized_default=0`), and over the network there is no initrd step that
   authorizes anything (only the stick path authorizes the way to its stick).
-- **RAM for the root image plus the system.** `root.img` lives in a tmpfs for as long
-  as the machine runs (erofs, decompressed on read), so budget
-  `size of root.img (~2 GiB) + 2 GiB`, i.e. 8 GiB to be comfortable. The initrd
+- **RAM for the layers plus the system.** The booted combination's layers (`root-<layer>.img`)
+  live in a tmpfs for as long as the machine runs (erofs, decompressed on read), so budget
+  `their size (the base ~400 MiB, docker ~100 MiB, more with the desktop) + 2 GiB`, i.e. 4 GiB
+  to be comfortable. The initrd
   checks `MemAvailable` before downloading and says so if it is not enough.
 - **Your `db` certificate enrolled**, if Secure Boot is to be enforced — see
   [Secure Boot on the clients](#secure-boot-on-the-clients).
@@ -109,12 +112,12 @@ Nothing is installed on the machine itself, and the machine needs no local file.
 ## Build and release
 
 Once per build host: `users.conf` and `safespace.env`. The public Secure Boot keys for
-`safespace-seal` are exported by `build.sh` on every build. Then set the URL of the
+`safespace seal` are exported by `build.sh` on every build. Then set the URL of the
 distribution servers (`SERVER_URL` of their `server.conf` + `/`):
 
 ```sh
-cp netboot.conf.example netboot.conf     # NETROOT_URL=http://10.0.0.1/safespace/
-sudo ./build.sh --groups base            # -> mkosi.output/base_<time>/
+echo NETROOT_URL=http://10.0.0.1/safespace/ >>safespace.local.conf
+sudo ./build.sh                          # the whole stack -> mkosi.output/combined_<time>/
 ./release.sh --push safespace@10.0.0.1
 ```
 
@@ -123,27 +126,33 @@ release, in its share (`/srv/safespace/share/`, served as `http://10.0.0.1/safes
 
 ```
 /srv/safespace/share/
-├── boot.efi           the signed UKI (what the firmware downloads)
-├── root.img           erofs root partition, ~2 GiB (dm-verity data)
-├── root.verity        its dm-verity hash tree, ~17 MiB
-├── roothash           the release's root hash (the initrd compares it first)
+├── boot.efi             the signed UKI (what the firmware downloads), all combinations
+├── root-<layer>.img     per layer: its erofs image (dm-verity data), the base ~400 MiB
+├── root-<layer>.verity  its dm-verity hash tree
+├── roothash-<layer>     its root hash (the initrd compares it first)
+├── manifest-<name>.json per combination: its packages
 ├── systemd-boot.efi, layout.sfdisk    for writing sticks (burn.sh)
-└── cmdline, release, manifest.json, SHA256SUMS
+└── cmdline, release, SHA256SUMS
 ```
 
 `release.sh` refuses to release artifacts that do not belong together: it checks the
-signatures against the exported `db.pem`, compares the root hash on the UKI's signed command
-line with the build's, runs `veritysetup verify` over the whole root image and checks the
-partition table for sticks — so a bad set is caught on the build host instead of on 50
+signatures against the exported `db.pem`, requires `lockdown=integrity` on the UKI's signed
+command line, compares each layer's root hash there with the build's, checks that every
+combination consists of those layers, runs `veritysetup verify` over every layer's image and
+checks the partition table for sticks — so a bad set is caught on the build host instead of on 50
 machines. Every distribution server repeats exactly these checks (`lib/verify.sh`) after the
 upload and reports the result.
 
 **Replacing a release while machines boot:** the files are renamed into place in one go at the
 end of the upload (`rsync --delay-updates`), and a download already running finishes on the
-old file. A machine that got the old `boot.efi` and then asks for the root image fetches
-`roothash` first: if the server has another release by now, it reboots after 10 s and the
+old file. A machine that got the old `boot.efi` and then asks for its layers fetches each
+`roothash-<layer>` first: if the server has another release by now, it reboots after 10 s and the
 firmware loads the new `boot.efi`. If the image is refused although the server still claims
 this UKI's release, that is a real error and the boot stops (no reboot loop).
+
+**Which combination** (README "Combinations"): the initrd picks it (`safespace.select=`, the
+EFI variables set by `safespace select`, else the first of `COMBINATIONS`) and downloads
+only that root. Without `safespace.root.<name>=` on the signed command line it opens nothing.
 
 ## The distribution server
 
@@ -219,8 +228,6 @@ dhcp-boot=tag:httpclient,http://10.0.0.1/safespace/boot.efi
 dhcp-boot=tag:efi64,boot.efi
 enable-tftp
 tftp-root=/srv/safespace/share
-# all of TFTP on port 69, so a firewall only needs UDP 69 (and 67/4011 for DHCP)
-tftp-single-port
 log-dhcp
 conf-dir=/etc/safespace/dnsmasq.d/,*.conf
 ```
@@ -348,28 +355,42 @@ Both work; the second needs no stick.
 - the kernel starts, and the initrd logs its progress on the console (and into the journal):
 
 ```
+safespace-select: combination root (no selection: the first), roothash=ea0e130f2f63...
 netroot: waiting up to 60s for a DHCP address
 netroot: link up: enp1s0 10.0.0.137/24
-netroot: fetching the root image from http://10.0.0.1/safespace
-netroot: root.img 2013 MiB + root.verity 16 MiB, 15822 MiB RAM free
-netroot: got root.verity: 16 MiB in 1s (16 MiB/s)
-netroot: got root.img: 2013 MiB in 19s (105 MiB/s)
-netroot: root opened as /dev/mapper/root (/dev/loop0 = /run/netroot/root.img), verified against roothash=ea0e130f2f63...
+netroot: DHCP as the machine (its machine-id, released before the network)
+netroot: fetching layers base docker from http://10.0.0.1/safespace
+netroot: root-base.img 389 MiB + root-base.verity 3 MiB
+netroot: root-docker.img 96 MiB + root-docker.verity 0 MiB
+netroot: 488 MiB for the layers, 15822 MiB RAM free
+netroot: got root-base.verity: 3 MiB in 1s (3 MiB/s)
+netroot: got root-base.img: 389 MiB in 4s (97 MiB/s)
+netroot: layer base opened as /dev/mapper/layer-base, verified against ea0e130f2f63...
+netroot: got root-docker.verity: 0 MiB in 1s (0 MiB/s)
+netroot: got root-docker.img: 96 MiB in 1s (96 MiB/s)
+netroot: layer docker opened as /dev/mapper/layer-docker, verified against 5d1c0a77e4b2...
+netroot: root: layers base docker stacked read-only (overlayfs, ro,metacopy=off,redirect_dir=off,index=off)
 ```
+
+The initrd asks DHCP with the machine's machine-id, released before the network
+(`safespace-identity.service`), so a sealed machine in its combination gets the address the
+running system has, already for the download (netroot says `DHCP as the machine`). Without
+its identity (another combination, not sealed yet) the initrd's machine-id is a temporary
+one, and so is that address (`DHCP with a temporary machine-id`).
 
 **4. Check it on the machine** (ssh in with a key from `users.conf`, or at the console):
 
 ```sh
 journalctl -b -g netroot      # the lines above, from this boot
-findmnt /                     # /dev/mapper/root, erofs, ro
-veritysetup status root       # verity device, read-only, the root hash from the UKI
-df -h /run/netroot            # the root image in RAM (tmpfs), as large as root.img
+findmnt /                     # one layer: /dev/mapper/layer-base, erofs, ro; more: overlay, ro, lowerdir=...
+veritysetup status layer-base # a verity device per layer, read-only, the root hash from the UKI
+df -h /run/netroot            # the layers in RAM (tmpfs), as large as their images
 bootctl status                # "Secure Boot: enabled" once the machine is sealed
 cat /proc/cmdline             # the signed command line incl. safespace.netroot=
 ```
 
-On the server side, one boot shows up as three requests in nginx's access log:
-`boot.efi`, `root.verity`, `root.img`.
+On the server side, one boot shows up in nginx's access log as `boot.efi`, then per layer
+`roothash-<layer>`, `root-<layer>.verity`, `root-<layer>.img`.
 
 **5. Repeat for the next machine** — there is nothing per-machine to do except the firmware
 settings and, if you enforce Secure Boot, the key enrollment.
@@ -407,7 +428,9 @@ Afterwards `sudo systemctl disable --now safespace-dhcp`, or
 `DHCP_MODE=off` and rerun `server/setup.sh`.
 
 A firewall between the machine and the build host has to let through UDP 67 and 4011 (proxy
-DHCP) and UDP 69 (TFTP, all of it with `tftp-single-port`). Proxy DHCP only works on the
+DHCP) and UDP 69 (TFTP; the data then comes from ephemeral ports, which a stateful firewall lets back in
+as established traffic). `tftp-single-port` is not used: together with `bind-interfaces`
+dnsmasq 2.93 sends no TFTP reply at all. Proxy DHCP only works on the
 machine's own L2 segment: a build host in a VM behind NAT never sees the broadcasts.
 
 In this mode the ~82 MiB UKI comes over TFTP, which takes about a minute; the ~2 GiB root
@@ -426,12 +449,12 @@ but the `db` certificate has to be on the machine. Three ways, all using the key
    Mode* / *Clear Secure Boot keys*. With no keys enrolled, Secure Boot cannot be
    enforced, so the machine netboots. Then on the machine:
    ```sh
-   sudo safespace-seal          # enrolls db, KEK, PK (see README, "Sealing")
+   sudo safespace seal          # enrolls db, KEK, PK (see README, "Sealing")
    ```
    Reboot, check that Secure Boot is on, set a firmware password. From now on the
    machine only boots UKIs signed with your `db` key — including the one it downloads.
 2. **Seal from a stick**: `sudo ./burn.sh /dev/sdX` (the same build), boot it
-   once per machine, `sudo safespace-seal`. Useful when netbooting in Setup Mode is not
+   once per machine, `sudo safespace seal`. Useful when netbooting in Setup Mode is not
    possible.
 3. **Enroll by hand in firmware setup**: most firmwares can load `db`/`KEK`/`PK` from a
    FAT medium. The files are in
@@ -441,7 +464,7 @@ but the `db` certificate has to be on the machine. Three ways, all using the key
 
 Notes:
 
-- `safespace-seal` **adds** your keys by default and keeps vendor/Microsoft
+- `safespace seal` **adds** your keys by default and keeps vendor/Microsoft
   certificates, so option ROMs of GPUs and NICs still load. That matters more here than
   for a stick: the NIC's own option ROM is what does HTTP boot. Do not use
   `--replace` on a machine that netboots through an add-in NIC.
@@ -491,12 +514,12 @@ every file name and of the URL inside the UKI, so builds never overwrite each ot
 
 ```sh
 # 1. change what you want, e.g.
-./update-snapshot.sh                 # newest Arch Linux Archive day (repos.conf)
+./update-snapshot.sh                 # newest Arch Linux Archive day (safespace.conf)
 vim users.conf mkosi.conf            # users, packages, …
 ./fetch-images.sh                    # shipped Docker images (docker group)
 
 # 2. build (-f also rebuilds unchanged packages, -ff reinstalls everything)
-sudo ./build.sh --groups base,remotedesktop -f
+sudo ./build.sh -f                   # every combination of COMBINATIONS
 
 # 3. release: replaces the release on every server, which then checks it
 ./release.sh
@@ -529,7 +552,7 @@ host):
 
 ```sh
 ./test-vm.sh --netboot --url http://10.0.0.1/safespace/boot.efi --ssh 2222
-./test-vm.sh --netboot --url http://10.0.0.1/safespace/boot.efi --setup-mode --ssh 2222   # then safespace-seal inside, then --sealed
+./test-vm.sh --netboot --url http://10.0.0.1/safespace/boot.efi --setup-mode --ssh 2222   # then safespace seal inside, then --sealed
 ```
 
 A netbooting VM of its own (plain QEMU, or a persistent libvirt machine for virt-manager,
@@ -564,11 +587,11 @@ own output):
   Downloading...100%
 BdsDxe: starting Boot0004 "UEFI HTTPv4 (MAC:525400123456)" … /Uri()
 netroot: waiting up to 60s for a DHCP address
-netroot: fetching the root image from http://10.0.2.2:8000
-netroot: got root.verity: 15 MiB in 1s
-netroot: got root.img: 1956 MiB in 15s (130 MiB/s)
-netroot: root opened as /dev/mapper/root (/dev/loop0 = /run/netroot/root.img)
-[  OK  ] Mounted /sysroot.
+netroot: fetching layers base from http://10.0.2.2:8000
+netroot: got root-base.verity: 3 MiB in 1s
+netroot: got root-base.img: 389 MiB in 3s (130 MiB/s)
+netroot: layer base opened as /dev/mapper/layer-base, verified against ...
+netroot: root: layer base (erofs, read-only)
 …
 safespace login:
 ```
@@ -660,13 +683,14 @@ real system loads them from the root image.
 | "unsupported image", "invalid boot file" or the firmware restarts the boot menu | the machine booted in legacy BIOS/CSM mode: the boot file is a UEFI binary. Set the firmware to UEFI only and use the "UEFI …" network entry |
 | DHCP but no download | `journalctl -u safespace-dhcp -f` (or your DHCP server's log): does the client get option 60/67? HTTP boot needs both. `curl -I` the URL from another machine |
 | firmware downloads, then "Access Denied" / nothing | Secure Boot is enforced but `db` does not have your certificate: seal the machine (see above). `release.sh` and `safespace-netboot verify` say which key signed it |
-| firmware resets or hangs on the download | the UKI may be too large for this firmware: shrink it (`KernelInitrdModules=` in `mkosi.conf`, e.g. only `/drivers/net/ethernet/intel/`) and rebuild; or use the usb variant |
+| firmware resets or hangs on the download | the UKI may be too large for this firmware: shrink it (`KernelInitrdModules=` in `mkosi.conf`, e.g. only `/drivers/net/ethernet/intel/`) and rebuild; or boot from a stick (burn.sh) |
 | `netroot: no link reported as online` | NIC driver missing in the initrd (add it to `KernelInitrdModules=`), no DHCP on that port, or the NIC is on USB (not supported) |
 | `netroot: not enough RAM` | the machine cannot hold the root image; more RAM, or a smaller image (fewer packages) |
 | `netroot: download … failed` | nginx not running, wrong path, or firewall; the message contains curl's own error |
-| `netroot: dm-verity refused the image` | `root.img`/`root.verity` in that directory are not the ones the UKI was signed for: release it again with `release.sh` (it checks this before pushing; `safespace-netboot status` on the server says whether what it serves is broken) |
+| `netroot: ERROR: dm-verity refused layer <layer>` | `root-<layer>.img`/`.verity` in that directory are not the ones the UKI was signed for: release it again with `release.sh` (it checks this before pushing; `safespace-netboot status` on the server says whether what it serves is broken) |
 | the screen says `Start PXE over IPv4`, `Station IP address …`, but nginx sees nothing | that is the firmware's **PXE** client, not HTTP boot: it wants a TFTP file name and a TFTP server, an HTTP URL in option 67 fails. Enable HTTP boot and pick the "HTTPv4" entry, or serve the UKI over TFTP (dnsmasq `pxe-service` / proxy DHCP, [Quick one-off test](#quick-one-off-test-on-an-existing-lan)) |
-| proxy DHCP (dnsmasq) logs nothing when the client boots | the broadcasts do not reach dnsmasq: another L2 segment (e.g. the build host is a VM behind NAT), or a firewall in between. Proxy DHCP needs UDP 67 and 4011, TFTP UDP 69 (with `tftp-single-port` nothing else) |
+| proxy DHCP (dnsmasq) logs nothing when the client boots | the broadcasts do not reach dnsmasq: another L2 segment (e.g. the build host is a VM behind NAT), or a firewall in between. Proxy DHCP needs UDP 67 and 4011, TFTP UDP 69 |
+| dnsmasq: `failed to send packet: Network is unreachable`, the firmware gets no boot file | a configuration with both `bind-interfaces` and `tftp-single-port` (older `safespace-netboot`, or a snippet in `/etc/safespace/dnsmasq.d/`): update the server (`sudo server/setup.sh`), remove `tftp-single-port` from the snippets |
 | dnsmasq: `error 8 User aborted the transfer` | harmless if a `sent …` follows: UEFI PXE asks for the file size first (`tsize`) and aborts on purpose. Without a second request the firmware refused the file (too large for it) |
 | the client fetches the old boot file after a change | `safespace-dhcp` still runs with the old settings: `sudo systemctl restart safespace-dhcp` (it regenerates its configuration from `server.conf`) |
 | the server serves a broken release | `safespace-netboot status` / `journalctl -u safespace-netboot-verify` say which check failed; the server repairs nothing: release again from the build host |
@@ -675,10 +699,10 @@ real system loads them from the root image.
 | a machine reboots once during the boot after a release | expected: it loaded the old `boot.efi`, the server then had the new release (`netroot: … holds another release`) |
 | a UKI over PXE: downloaded completely, then back to PXE or stuck after `NBP file …` | too large for this firmware's network boot (T450s: 82 MiB works, 112 MiB fails): check the size `mkosi.postoutput` prints, keep the network UKI below the limit ([Size of the network UKI](#size-of-the-network-uki)) |
 | on a machine with Intel AMT (vPro, e.g. Intel I218-LM/I219-LM): nothing loaded over PXE runs, it reboots or hangs | disable Intel AMT in the BIOS ([Case found](#case-found-thinkpad-t450s-bios-jbet73ww)) |
-| files arrive completely, then reboot / hang / back to the boot menu, even for small images | the firmware cannot start a network-loaded image (ThinkPad T450s with AMT on): disable AMT, or use the usb variant |
+| files arrive completely, then reboot / hang / back to the boot menu, even for small images | the firmware cannot start a network-loaded image (ThinkPad T450s with AMT on): disable AMT, or boot from a stick (burn.sh) |
 | a VM (OVMF) shows `Start PXE over IPv4` before HTTP boot | OVMF tries its PXE entries first; switch them off with fw_cfg `opt/org.tianocore/IPv4PXESupport=n` / `IPv6PXESupport=n` ([README, "A netbooting VM"](README.md#a-netbooting-vm-qemu-libvirt--virt-manager)) |
-| a VM: `netroot: download … failed`, `Could not resolve host` | the VM's virtual network resolves through the VM host's resolver, which does not know the name in `NETROOT_URL`: put the IP (or the IP as a second URL) into `netboot.conf` and rebuild |
-| boot stops in the initrd emergency shell | `journalctl -b -g netroot`, then `ip a`, `curl -I <url>/root.img` from the shell |
+| a VM: `netroot: download … failed`, `Could not resolve host` | the VM's virtual network resolves through the VM host's resolver, which does not know the name in `NETROOT_URL`: put the IP (or the IP as a second URL) into `NETROOT_URL` (`safespace.local.conf`) and rebuild |
+| boot stops in the initrd emergency shell | `journalctl -b -g netroot`, then `ip a`, `curl -I <url>/root-<layer>.img` from the shell |
 | host key warnings on every ssh login | expected: `/var` is RAM, so ssh host keys are new on every boot (README, "Open decisions") |
 
 ## Known limits
@@ -695,15 +719,14 @@ real system loads them from the root image.
 - The download is ~2 GiB per machine and boot. Over a 1 Gbit/s link that is ~20 s, over
   100 Mbit/s ~3 min. Many machines booting at once need the bandwidth on the server.
 - TFTP for the UKI is a fallback, not a plan: ~100 MiB over TFTP takes minutes.
-- One release per server: every machine of a server boots the same image (package groups
-  are the only difference between images, so different machine kinds need different
-  servers). A server only serves the newest release, but an old signed UKI or usb stick
+- One release per server: every machine of a server boots the same build; machine kinds
+  differ by the combination they select (`safespace select`), all from the same release. A server only serves the newest release, but an old signed UKI or usb stick
   still boots on a sealed machine wherever someone kept a copy (and a server with its
   release).
 - Real hardware: a ThinkPad T450s (no HTTP boot) network-boots over PXE/TFTP only with
   Intel AMT disabled and a UKI that is not much larger than the current 82 MiB (see
   [Case found](#case-found-thinkpad-t450s-bios-jbet73ww)); with AMT on it boots from a
   stick. UEFI HTTP boot is tested end to end in QEMU and libvirt (OVMF, no disk):
-  DHCP → signed UKI over HTTP → DHCP in the initrd → `root.verity` and `root.img` over
-  HTTP → dm-verity against the signed root hash → login. Real firmware differs in how it
+  DHCP → signed UKI over HTTP → DHCP in the initrd → the layers' `root-<layer>.verity` and
+  `root-<layer>.img` over HTTP → dm-verity against their signed root hashes → stacked → login. Real firmware differs in how it
   offers HTTP boot and how large a boot file it accepts.

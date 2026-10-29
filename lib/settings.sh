@@ -1,0 +1,131 @@
+# What the image is told: the machine identity's policy from safespace.conf
+# (IDENTITY_SLOTS, MACHINE_ID_PCRS, KEY_TYPES, PCR_BANK), checked, and the
+# constants the image's scripts share, written into the image once. Sourced by
+# build.sh and tests/run.sh; expects die().
+#
+#   settings_check           the policy is one build.sh builds (see there)
+#   settings_policy          the policy in one line (build.json, safespace identity)
+#   settings_write DIR       DIR/etc/assh/assh.conf (lib/assh.conf.in with the
+#                            policy) and DIR/usr/local/lib/safespace/settings
+#                            (the constants and the machine-id's PCRs), for the
+#                            root's and the initrd's tree
+#
+# On the machine they are fixed: the image is signed and read-only.
+
+# The constants. The firmware variables of safespace, all under one vendor GUID:
+# the selection (select, safespace select) and the machine-id (identity).
+SETTINGS_GUID=8a3e6c1d-4b2f-4e9a-b7d5-1c0f9e2a6b34
+SETTINGS_SELECT_VAR=SafespaceSelect
+SETTINGS_SELECT_ONCE_VAR=SafespaceSelectOnce
+SETTINGS_MID_VAR=SAFEmachineID
+SETTINGS_MID_CRED=safespace-machine-id
+# UEFI's own vendor GUID (SecureBoot, SetupMode).
+SETTINGS_EFI_GLOBAL=8be4df61-93ca-11d2-aa0d-00e098032b8c
+# aSSH's CA in an EFI variable (ASSH_CA=efi:NAME), under aSSH's vendor GUID.
+SETTINGS_CA_VAR=SAFEasshCA
+SETTINGS_ASSH_GUID=24415b90-39be-45c0-a9a3-d547ebe28ea0
+# The combination's PCR: measured once (select: "safespace-combination:<name>"),
+# closed after the identity ("safespace-identity:sealed"); aSSH's window too.
+SETTINGS_PCR=15
+SETTINGS_COMBINATION_EVENT=safespace-combination:
+SETTINGS_SEALED_EVENT=safespace-identity:sealed
+# How the initrd stacks a combination's layers, and the build proves the stack:
+# read-only overlayfs, no upper layer, nothing it would follow across layers.
+SETTINGS_OVERLAY=ro,metacopy=off,redirect_dir=off,index=off
+# The inventory ID: the machine-id hashed for this application (machine-id(5)).
+SETTINGS_APP_ID=eda1fc8c35e94e2087addff88d0b4e91
+
+# settings_pcrs WHAT SPEC: SPEC ("PCR,PCR...+PCR") into _PLAIN and _SIGNED
+# (comma separated), refused unless it holds PCR 7 and the combination's, and
+# signs only PCR 11. WHAT names it in the message.
+settings_pcrs() {
+	local what=$1 spec=$2 p seen=,
+	[[ $spec =~ ^([0-9]+(,[0-9]+)*)(\+([0-9]+(,[0-9]+)*))?$ ]] ||
+		die "$what: '$spec' is not PCR,PCR,...[+PCR] (safespace.conf)"
+	_PLAIN=${BASH_REMATCH[1]} _SIGNED=${BASH_REMATCH[4]}
+	for p in ${_PLAIN//,/ } ${_SIGNED//,/ }; do
+		[[ $p =~ ^(0|[1-9][0-9]?)$ ]] && ((p <= 22 && p != 16)) ||
+			die "$what: PCR $p is not one to bind to (0 to 22, not 16: any process can reset 16 and 23)"
+		[[ $seen != *",$p,"* ]] || die "$what: PCR $p twice"
+		seen+=$p,
+	done
+	[[ ,$_PLAIN, == *,7,* ]] || die "$what: without PCR 7 (Secure Boot as at the creation) it holds with Secure Boot off"
+	[[ ,$_PLAIN, == *,$SETTINGS_PCR,* ]] ||
+		die "$what: without PCR $SETTINGS_PCR (the combination, aSSH's window) it is not per combination, and signs after the window closed"
+	[[ -z $_SIGNED || $_SIGNED == 11 ]] ||
+		die "$what: only PCR 11 can be signed (the build signs the UKI's PCR 11; systemd-stub hands over nothing else)"
+	return 0
+}
+
+settings_check() {
+	local s n=0 slots
+	read -ra slots <<<"$IDENTITY_SLOTS"
+	((${#slots[@]})) || die "IDENTITY_SLOTS: no slot (safespace.conf)"
+	for s in "${slots[@]}"; do
+		settings_pcrs "IDENTITY_SLOTS, slot $n" "$s"
+		n=$((n + 1))
+	done
+	settings_pcrs MACHINE_ID_PCRS "$MACHINE_ID_PCRS"
+	[[ $_SIGNED == 11 ]] ||
+		die "MACHINE_ID_PCRS: needs +11 - the machine-id unseals only in the build's initrd (PCR 11 signed for enter-initrd), never in a root"
+	[[ $KEY_TYPES =~ ^[a-z0-9-]+(,[a-z0-9-]+)*$ ]] || die "KEY_TYPES: '$KEY_TYPES' is not type,type,... (safespace.conf)"
+	[[ $PCR_BANK == auto || $PCR_BANK == sha256 || $PCR_BANK == sha1 ]] ||
+		die "PCR_BANK: auto, sha256 or sha1, not '$PCR_BANK'"
+	return 0
+}
+
+settings_policy() {
+	echo "slots $IDENTITY_SLOTS; machine-id $MACHINE_ID_PCRS; keys $KEY_TYPES; bank $PCR_BANK"
+}
+
+settings_write() { # DIR
+	local dir=$1 s n=0 slots="" list mid_plain mid_signed line
+	settings_check
+	read -ra list <<<"$IDENTITY_SLOTS"
+	for s in "${list[@]}"; do
+		settings_pcrs slot "$s"
+		slots+="ASSH_CA_SLOT_$n=$_PLAIN"$'\n'
+		[[ -z $_SIGNED ]] || slots+="ASSH_CA_SLOT_${n}_SIGNED=$_SIGNED"$'\n'
+		n=$((n + 1))
+	done
+	settings_pcrs MACHINE_ID_PCRS "$MACHINE_ID_PCRS"
+	mid_plain=${_PLAIN//,/+} mid_signed=${_SIGNED//,/+}
+	install -d -m 0755 "$dir/etc/assh" "$dir/usr/local/lib/safespace"
+	while IFS= read -r line; do
+		case $line in
+			@SLOTS@) printf '%s' "$slots" ;;
+			*)
+				line=${line//@CA_VAR@/$SETTINGS_CA_VAR} line=${line//@PCR_BANK@/$PCR_BANK}
+				line=${line//@PCR@/$SETTINGS_PCR} line=${line//@KEY_TYPES@/$KEY_TYPES}
+				printf '%s\n' "$line" ;;
+		esac
+	done <"$HERE/lib/assh.conf.in" >"$dir/etc/assh/assh.conf"
+	cat >"$dir/usr/local/lib/safespace/settings" <<-EOF
+		# Generated by build.sh (lib/settings.sh, from safespace.conf): what the
+		# image's scripts share, in the root and the initrd alike. Sourced (POSIX sh).
+
+		# safespace's firmware variables, under one vendor GUID.
+		SAFESPACE_GUID=$SETTINGS_GUID
+		SAFESPACE_SELECT_VAR=$SETTINGS_SELECT_VAR
+		SAFESPACE_SELECT_ONCE_VAR=$SETTINGS_SELECT_ONCE_VAR
+		SAFESPACE_MID_VAR=$SETTINGS_MID_VAR
+		SAFESPACE_MID_CRED=$SETTINGS_MID_CRED
+		# UEFI's global variables (SecureBoot, SetupMode).
+		SAFESPACE_EFI_GLOBAL=$SETTINGS_EFI_GLOBAL
+		# aSSH's CA (assh.conf's ASSH_CA): its EFI variable, as efivarfs names it.
+		SAFESPACE_CA_VAR=$SETTINGS_CA_VAR-$SETTINGS_ASSH_GUID
+		# The combination's PCR and what is measured into it.
+		SAFESPACE_PCR=$SETTINGS_PCR
+		SAFESPACE_COMBINATION_EVENT=$SETTINGS_COMBINATION_EVENT
+		SAFESPACE_SEALED_EVENT=$SETTINGS_SEALED_EVENT
+		# The machine-id's seal: these PCRs as at the creation, these signed by the build.
+		SAFESPACE_MID_PCRS=$mid_plain
+		SAFESPACE_MID_SIGNED_PCRS=$mid_signed
+		SAFESPACE_APP_ID=$SETTINGS_APP_ID
+		# overlayfs' options for a combination's layers (the initrd's stack).
+		SAFESPACE_OVERLAY=$SETTINGS_OVERLAY
+		# The policy this image was built with (safespace.conf).
+		SAFESPACE_POLICY="$(settings_policy)"
+	EOF
+	chmod 0644 "$dir/etc/assh/assh.conf" "$dir/usr/local/lib/safespace/settings"
+}

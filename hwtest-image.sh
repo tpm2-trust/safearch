@@ -23,6 +23,9 @@
 set -Eeuo pipefail
 
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+# The partition types (GPT_ESP).
+# shellcheck source=lib/verify.sh
+source "$HERE/lib/verify.sh"
 die() { printf '\e[1;31m==> ERROR:\e[0m %s\n' "$*" >&2; exit 1; }
 log() { printf '\e[1;32m==>\e[0m %s\n' "$*"; }
 
@@ -76,8 +79,8 @@ entry t6 "6 kernel + microcode + initrd, no stub" "linux /EFI/hwtest/linux.efi" 
 log "Writing $IMG"
 rm -f "$IMG"
 truncate -s 514M "$IMG"
-printf 'label: gpt\nstart=2048, size=%d, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name="esp"\n' \
-	$((512 * 2048)) | sfdisk -q "$IMG"
+printf 'label: gpt\nstart=2048, size=%d, type=%s, name="esp"\n' \
+	$((512 * 2048)) "$GPT_ESP" | sfdisk -q "$IMG"
 # Same FAT as the real stick: FAT32, 512-byte sectors.
 mkfs.fat -F 32 -S 512 -n HWTEST --offset 2048 "$IMG" $((512 * 1024)) >/dev/null 2>&1
 (cd "$W/tree" && mcopy -s -i "$IMG@@1M" EFI loader ::/)

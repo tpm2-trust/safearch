@@ -13,14 +13,31 @@ die() { echo "safespace: ERROR: $*" >&2; exit 1; }
 # base is always in; the other groups are profiles of their own name.
 has_group() { case " ${PROFILES:-} " in *" $1 "*) return 0 ;; esac; return 1; }
 groups=base
-for g in remotedesktop docker; do has_group "$g" && groups+=",$g"; done
+for g in ${PROFILES:-}; do groups+=",$g"; done
 log "package groups: $groups"
 install -d "$BUILDROOT/usr/lib/safespace"
 echo "$groups" >"$BUILDROOT/usr/lib/safespace/groups"
 
+# --- the name the system shows: "safespace <build> <combination>" -----------------
+# Every combination is a root of its own, so its name is fixed here, not chosen at
+# runtime. ID/NAME stay Arch's: tools key on them. /etc/issue (mkosi.extra) shows
+# PRETTY_NAME; mkosi adds IMAGE_ID/IMAGE_VERSION after this script.
+combo=${SAFESPACE_COMBINATION:-}
+[[ $combo =~ ^[a-z][a-z0-9-]{0,23}$ ]] || die "SAFESPACE_COMBINATION='$combo' is no combination name (build.sh sets it)"
+[[ ${IMAGE_VERSION:-} =~ ^[0-9]{8}-[0-9]{4,6}$ ]] || die "IMAGE_VERSION='${IMAGE_VERSION:-}' is no build version (build.sh sets it)"
+echo "$combo" >"$BUILDROOT/usr/lib/safespace/combination"
+osrel=$BUILDROOT/usr/lib/os-release
+[[ -f $osrel && ! -L $osrel ]] || die "no /usr/lib/os-release in the image"
+sed -i -E '/^(PRETTY_NAME|VARIANT|VARIANT_ID)=/d' "$osrel"
+printf 'PRETTY_NAME="safespace %s %s"\nVARIANT="%s (%s)"\nVARIANT_ID=%s\n' \
+	"$IMAGE_VERSION" "$combo" "$combo" "$groups" "$combo" >>"$osrel"
+log "system name: safespace $IMAGE_VERSION $combo"
+
 # --- users from users.conf ("username:ssh-public-key", one key per line) --------
 
-[[ -f $SRCDIR/users.conf ]] || die "users.conf missing: cp users.conf.example users.conf and add your ssh keys"
+# build.sh --users picks another file (tests/vm.sh: a throwaway test user).
+USERS_CONF=$SRCDIR/${SAFESPACE_USERS_CONF:-users.conf}
+[[ -f $USERS_CONF ]] || die "${SAFESPACE_USERS_CONF:-users.conf} missing: cp users.conf.example users.conf and add your ssh keys"
 declare -A KEYS=()
 USERS=()
 while IFS= read -r line; do
@@ -31,7 +48,7 @@ while IFS= read -r line; do
 	[[ $key =~ ^(ssh-|ecdsa-|sk-) ]] || die "users.conf: '$user' has no valid ssh public key"
 	[[ -v KEYS[$user] ]] || USERS+=("$user")
 	KEYS[$user]+="$key"$'\n'
-done <"$SRCDIR/users.conf"
+done <"$USERS_CONF"
 ((${#USERS[@]})) || die "users.conf defines no users"
 
 # Root (and with it /etc and /home) is read-only (dm-verity), so home
@@ -57,6 +74,13 @@ install -d -m 0755 "$BUILDROOT/etc/ssh/authorized_keys"
 user_groups=$USER_GROUPS
 has_group docker && user_groups+=,docker
 for user in "${USERS[@]}"; do
+	# On a layer's tree (build.sh: a copy of the layer below) the users exist:
+	# only this group's memberships are added.
+	if mkosi-chroot id "$user" >/dev/null 2>&1; then
+		log "user $user: groups $user_groups"
+		mkosi-chroot usermod -a -G "$user_groups" "$user"
+		continue
+	fi
 	log "creating user $user"
 	mkosi-chroot useradd -m -G "$user_groups" -s /bin/bash "$user"
 	# '*' = no password at all. Not '!' (locked): sshd refuses locked
@@ -95,9 +119,9 @@ set_conf "$conf" IPCAllowedGroups wheel
 [[ -f $BUILDROOT/etc/usbguard/rules.conf ]] || install -m 600 /dev/null "$BUILDROOT/etc/usbguard/rules.conf"
 chmod 600 "$BUILDROOT/etc/usbguard/rules.conf"
 
-# --- VNC desktop (group remotedesktop) -------------------------------------------
+# --- VNC desktop (group xfce4-headless-vnc) --------------------------------------
 
-if has_group remotedesktop; then
+if has_group xfce4-headless-vnc; then
 	VNC_USER=${VNC_USER:-${USERS[0]}}
 	[[ -v KEYS[$VNC_USER] ]] || die "VNC_USER '$VNC_USER' is not defined in users.conf"
 	generated=0
@@ -113,7 +137,7 @@ if has_group remotedesktop; then
 	mkosi-chroot chown -R "$VNC_USER:$VNC_USER" "/home/$VNC_USER/.config"
 	echo ":$VNC_DISPLAY=$VNC_USER" >"$BUILDROOT/etc/tigervnc/vncserver.users"
 	if ((generated)); then
-		# Files in $OUTPUTDIR end up in the build's directory (mkosi.output/<variant>/<build>/).
+		# Files in $OUTPUTDIR end up in the build's directory (lib/compose.sh: vnc-password-<combination>).
 		(umask 077; printf '%s\n' "$VNC_PASSWORD" >"$OUTPUTDIR/${IMAGE_ID}_${IMAGE_VERSION}.vnc-password")
 		log "generated VNC password: ${IMAGE_ID}_${IMAGE_VERSION}.vnc-password in the build directory"
 	fi
@@ -125,8 +149,16 @@ fi
 # containerd only start when /opt/docker is a mount point.
 if has_group docker; then
 	install -d "$BUILDROOT/opt/docker"
-	printf 'LABEL=safespace-docker\t/opt/docker\tauto\tnofail,noatime,x-systemd.device-timeout=10s\t0 2\n' >>"$BUILDROOT/etc/fstab"
+	grep -q '^LABEL=safespace-docker[[:space:]]' "$BUILDROOT/etc/fstab" ||
+		printf 'LABEL=safespace-docker\t/opt/docker\tauto\tnofail,noatime,x-systemd.device-timeout=10s\t0 2\n' >>"$BUILDROOT/etc/fstab"
 fi
+
+# --- locales: en_US only (Locale= in mkosi.conf) -----------------------------------
+# Translations are downloaded with every network boot. en_US is the untranslated
+# original; gettext falls back from en_US to en. locale.alias (a file) stays, and
+# /usr/share/i18n stays for locale-gen. (Here, not as pacman NoExtract: mkosi's
+# cache would keep a tree installed before the setting changed.)
+find "$BUILDROOT/usr/share/locale" -mindepth 1 -maxdepth 1 -type d ! -name en ! -name en_US -exec rm -rf -- {} +
 
 # Mount points in the read-only root (see /etc/fstab).
 install -d "$BUILDROOT/efi" "$BUILDROOT/var"

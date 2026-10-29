@@ -2,9 +2,9 @@
 # The boot path from a stick / SD card. Runs in mkosi's default initrd (bash as
 # sh, coreutils, sed, kmod, veritysetup), started by usb-bootdev.service when
 # systemd-boot started the UKI from a partition (LoaderDevicePartUUID). The
-# partitions to wait for are named by the signed root hash: the root data
-# partition's UUID is its first 128 bits, the hash partition's its last 128
-# bits (as systemd-repart sets them).
+# partitions to wait for are the chosen combination's layers, each named by its
+# signed root hash: the data partition's UUID is its first 128 bits, the hash
+# partition's its last 128 bits (as systemd-repart sets them).
 #
 # 1. Interfaces start unauthorized on every controller, so authorizing a device
 #    only configures it; no driver binds until we authorize an interface.
@@ -13,16 +13,17 @@
 #    The kernel does not probe drivers for an interface that becomes
 #    authorized later, so every authorized interface is passed to
 #    /sys/bus/usb/drivers_probe explicitly.
-# 3. Once the root partition exists, revoke every USB device that is not an
-#    ancestor of it. If root is not on USB at all, every USB device is revoked.
+# 3. Once the layers' partitions exist, revoke every USB device that is not an
+#    ancestor of them. If they are not on USB at all, every USB device is revoked.
 #    The boot disk is then set read-only (blockdev --setro), so nothing can
 #    write to the stick, not even root.
 # 4. Restore interface_authorized_default=1 so devices that usbguard later
 #    allows work normally; new devices are still denied at device level.
-# 5. Open the root through dm-verity with the signed root hash as
-#    /dev/mapper/root (root= on the command line), --panic-on-corruption: a
-#    modified or damaged block stops the machine. (systemd's own verity
-#    generator is switched off, systemd.verity=no, as for the network path.)
+# 5. Open each layer through dm-verity with its signed root hash,
+#    --panic-on-corruption: a modified or damaged block stops the machine, and
+#    stack them read-only at /sysroot (stack, next to this script). (systemd's
+#    own verity generator is switched off, systemd.verity=no, as for the
+#    network path.)
 #
 # Progress goes to the kernel log, so it shows on the console and in
 # `journalctl -b -g usb-bootdev` after boot.
@@ -30,22 +31,36 @@
 U=/sys/bus/usb/devices
 TIMEOUT=30
 
-msg() { echo "usb-bootdev: $*" >/dev/kmsg; }
+# To the kernel log (journalctl -b -g usb-bootdev) and to the console: a stick
+# boot that stops is watched on the screen.
+msg() {
+	echo "usb-bootdev: $*" >/dev/kmsg 2>/dev/null
+	echo "usb-bootdev: $*" >/dev/console 2>/dev/null
+	return 0
+}
 
 cmdline=$(cat /proc/cmdline)
-arg() { printf '%s\n' "$cmdline" | tr ' ' '\n' | sed -n "s/^$1=//p" | tail -n 1; }
 
-roothash=$(arg roothash)
-# (No grep in the initrd: a shell pattern instead.)
-case $roothash in
-	*[!0-9a-f]* | '') roothash="" ;;
-esac
-[ ${#roothash} -eq 64 ] || { msg "ERROR: no valid roothash= on the kernel command line"; exit 1; }
+# Which layers: the chosen combination's (safespace-select.service; select and
+# stack, next to this script).
+. "${0%/*}/select"
+. "${0%/*}/stack"
+select_chosen || exit 1
 uuid() { printf '%s' "$1" | sed 's/^\(.\{8\}\)\(.\{4\}\)\(.\{4\}\)\(.\{4\}\)\(.\{12\}\)$/\1-\2-\3-\4-\5/'; }
-partuuid=$(uuid "$(printf '%s' "$roothash" | cut -c1-32)")
-hashuuid=$(uuid "$(printf '%s' "$roothash" | cut -c33-64)")
-part=/dev/disk/by-partuuid/$partuuid
-hashpart=/dev/disk/by-partuuid/$hashuuid
+# A layer's data or hash partition (1: the first half of its root hash, 2: the second).
+part_of() { # LAYER 1|2
+	h=$(select_layer_hash "$1")
+	if [ "$2" = 1 ]; then h=$(printf '%s' "$h" | cut -c1-32); else h=$(printf '%s' "$h" | cut -c33-64); fi
+	echo "/dev/disk/by-partuuid/$(uuid "$h")"
+}
+# The bottom layer's data partition stands for the stick (all are on it).
+part=$(part_of "${SELECT_LAYERS%% *}" 1)
+partuuid=${part##*/}
+all_there() {
+	for l in $SELECT_LAYERS; do
+		[ -e "$(part_of "$l" 1)" ] && [ -e "$(part_of "$l" 2)" ] || return 1
+	done
+}
 
 # udev loads these on the interface uevent anyway; loading them up front means
 # the explicit probe below finds the driver already registered.
@@ -85,11 +100,11 @@ authorize_pass() {
 	udevadm settle -t 5
 }
 
-msg "waiting up to ${TIMEOUT}s for root partition $partuuid"
+msg "waiting up to ${TIMEOUT}s for the partitions of layers $SELECT_LAYERS ($partuuid ...)"
 n=0
-while [ ! -e "$part" ] && [ $n -lt $TIMEOUT ]; do
+while ! all_there && [ $n -lt $TIMEOUT ]; do
 	authorize_pass
-	[ -e "$part" ] && break
+	all_there && break
 	sleep 1
 	n=$((n + 1))
 done
@@ -98,7 +113,7 @@ authorize_pass
 
 if [ -e "$part" ]; then
 	rootsys=$(readlink -f "/sys/class/block/$(basename "$(readlink -f "$part")")")
-	msg "root partition is $(readlink -f "$part") ($rootsys)"
+	msg "layer ${SELECT_LAYERS%% *} is $(readlink -f "$part") ($rootsys)"
 	# The stick is never written to: mark the whole boot disk and all its
 	# partitions read-only at block level, before anything opens them.
 	disk=$(basename "$(dirname "$rootsys")")
@@ -106,7 +121,7 @@ if [ -e "$part" ]; then
 		blockdev --setro "/dev/$dev" && msg "read-only: /dev/$dev"
 	done
 else
-	msg "root partition $partuuid NOT found after ${TIMEOUT}s, revoking all USB devices"
+	msg "layer partition $partuuid NOT found after ${TIMEOUT}s, revoking all USB devices"
 	for d in "$U"/*; do
 		case ${d##*/} in usb* | *:*) continue ;; esac
 		msg "  seen: $(describe "$d") authorized=$(cat "$d/authorized")"
@@ -130,15 +145,13 @@ for hc in "$U"/usb*; do
 	[ -e "$hc/interface_authorized_default" ] && echo 1 >"$hc/interface_authorized_default"
 done
 
-[ -e "$part" ] || { msg "ERROR: no root partition, cannot boot"; exit 1; }
+[ -e "$part" ] || { msg "ERROR: no partition of layer ${SELECT_LAYERS%% *}, cannot boot"; exit 1; }
 udevadm settle -t 5
-[ -e "$hashpart" ] || { msg "ERROR: no hash partition $hashuuid next to the root partition"; exit 1; }
-# The root hash comes from the signed command line: this is the step that
-# decides whether the partition is the one that was signed.
-if ! out=$(veritysetup open "$part" root "$hashpart" "$roothash" --panic-on-corruption 2>&1); then
-	msg "ERROR: dm-verity refused the root partition: $out"
-	exit 1
-fi
-msg "root opened as /dev/mapper/root, verified against roothash=$(printf %.12s "$roothash")..."
+for l in $SELECT_LAYERS; do
+	[ -e "$(part_of "$l" 1)" ] && [ -e "$(part_of "$l" 2)" ] ||
+		{ msg "ERROR: no partitions of layer $l ($(part_of "$l" 1), $(part_of "$l" 2))"; exit 1; }
+	stack_open "$l" "$(part_of "$l" 1)" "$(part_of "$l" 2)" || exit 1
+done
 udevadm settle -t 15
+stack_mount || exit 1
 exit 0

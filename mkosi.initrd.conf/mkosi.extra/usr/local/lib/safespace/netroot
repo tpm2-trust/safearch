@@ -1,27 +1,32 @@
 #!/bin/sh
-# Runs in mkosi's default initrd of the network variant (bash as sh, coreutils,
+# Runs in the initrd of a network boot (bash as sh, coreutils,
 # sed, kmod, curl, veritysetup), started by netroot.service. It downloads the
-# root image and its dm-verity hash tree into a tmpfs and opens them as
-# /dev/mapper/root, which the signed kernel command line names as root=.
+# chosen combination's layers - each an image and its dm-verity hash tree - into
+# a tmpfs, opens each against its signed root hash and stacks them read-only at
+# /sysroot (stack, next to this script): there is no root= on the command line.
 #
 # Everything it trusts comes from the kernel command line inside the signed
 # UKI, nothing from the network:
 #   safespace.netroot=<url>/  base URL of a distribution server, may be given
 #                             more than once (tried in order)
-#   roothash=<hash>           dm-verity root hash (added by mkosi)
-# veritysetup refuses a hash tree that does not match roothash=, and dm-verity
+#   safespace.layer.<layer>=<hash>  dm-verity root hash per layer
+#   safespace.root.<name>=<layer>,...  a combination's layers, bottom first; the
+#                             combination is chosen before (safespace-select.service)
+# veritysetup refuses a hash tree that does not match that hash, and dm-verity
 # then checks every block that is read, with --panic-on-corruption. A
 # manipulated or wrong server can therefore only keep the machine from
 # booting, never change what boots. Plain HTTP is enough for that; HTTPS only
 # adds confidentiality (and needs a certificate curl trusts).
 #
-# Files expected under each URL (one release, written by release.sh):
-#   roothash      the release's root hash
-#   root.img      the root partition (erofs, dm-verity data)
-#   root.verity   its dm-verity hash tree
+# Files expected under each URL (one release, written by release.sh), of the
+# chosen combination's layers only:
+#   roothash-<layer>      its root hash
+#   root-<layer>.img      its erofs image (dm-verity data)
+#   root-<layer>.verity   its dm-verity hash tree
 # A server only ever holds the newest release. If no server has this UKI's
-# release any more (another roothash), a newer one was published after the
-# firmware loaded this UKI: reboot, and the firmware loads the new boot.efi.
+# release any more (a layer with another roothash), a newer one was published
+# after the firmware loaded this UKI: reboot, and the firmware loads the new
+# boot.efi.
 #
 # Progress goes to the kernel log (so `journalctl -b -g netroot` has it after
 # boot) and to /dev/console, because the kernel log at info level does not
@@ -46,8 +51,11 @@ args() { printf '%s\n' "$cmdline" | tr ' ' '\n' | sed -n "s/^$1=//p"; }
 
 urls=$(args safespace.netroot)
 [ -n "$urls" ] || { msg "no safespace.netroot= on the kernel command line, nothing to do"; exit 0; }
-roothash=$(args roothash | tail -n 1)
-[ -n "$roothash" ] || die "no roothash= on the kernel command line"
+# Which layers: the chosen combination's.
+. "${0%/*}/select"
+. "${0%/*}/stack"
+select_chosen || die "no root to boot"
+LAYERS=$SELECT_LAYERS
 
 modprobe -a loop dm-verity erofs 2>/dev/null
 
@@ -57,6 +65,14 @@ modprobe -a loop dm-verity erofs 2>/dev/null
 msg "waiting up to ${WAIT_ONLINE}s for a DHCP address"
 if /usr/lib/systemd/systemd-networkd-wait-online --any --timeout="$WAIT_ONLINE"; then
 	msg "link up: $(ip -o -4 addr show scope global 2>/dev/null | tr -s ' ' | cut -d' ' -f2,4 | tr '\n' ' ')"
+	# DHCP's client identifier comes from the machine-id (systemd-networkd, started
+	# after safespace-identity): the machine's where that released it, as the
+	# running system asks.
+	if [ -s "$SELECT_RUN/identity/machine-id" ] && [ "$(cat /etc/machine-id 2>/dev/null)" = "$(cat "$SELECT_RUN/identity/machine-id")" ]; then
+		msg "DHCP as the machine (its machine-id, released before the network)"
+	else
+		msg "DHCP with a temporary machine-id (no identity released this boot)"
+	fi
 else
 	msg "no link reported as online, trying anyway"
 fi
@@ -94,51 +110,65 @@ get() { # url file
 }
 
 cleanup() {
-	veritysetup close root 2>/dev/null
-	[ -n "$data" ] && losetup -d "$data" 2>/dev/null
-	[ -n "$hash" ] && losetup -d "$hash" 2>/dev/null
+	for l in $LAYERS; do
+		umount "$SELECT_RUN/layers/$l" 2>/dev/null
+		veritysetup close "layer-$l" 2>/dev/null
+	done
+	for d in $loops; do losetup -d "$d" 2>/dev/null; done
 	umount "$DIR" 2>/dev/null
-	data="" hash=""
+	loops=""
 }
 
-# The release this server holds: 0 = this UKI's, 1 = another one (newer),
-# 2 = unknown (no roothash served, or not reachable).
+# The release this server holds: 0 = this UKI's (every layer's roothash the
+# signed one), 1 = another one (newer), 2 = unknown (no roothash served, or not
+# reachable).
 served_release() { # base url
-	served=$(curl -fsS --retry 2 --max-time 20 "$1/roothash" 2>/dev/null | tr -d '[:space:]')
-	[ -n "$served" ] || return 2
-	[ "$served" = "$roothash" ] && return 0
-	return 1
+	for l in $LAYERS; do
+		served=$(curl -fsS --retry 2 --max-time 20 "$1/roothash-$l" 2>/dev/null | tr -d '[:space:]')
+		[ -n "$served" ] || return 2
+		[ "$served" = "$(select_layer_hash "$l")" ] || return 1
+	done
+	return 0
 }
 
-data="" hash="" other=0 same=0
+loops="" other=0 same=0
 try() { # base url (without trailing slash)
 	base=$1
 	tmpfs_size="" tmpfs_size_opt=""
 	served_release "$base"
 	case $? in
-		1) msg "$base holds another release (roothash $(printf %.12s "$served")..., this UKI: $(printf %.12s "$roothash")...)"
+		1) msg "$base holds another release (roothash-$l $(printf %.12s "$served")..., this UKI: $(printf %.12s "$(select_layer_hash "$l")")...)"
 			other=1
 			return 1 ;;
-		2) msg "$base serves no roothash, trying the image anyway" ;;
+		2) msg "$base serves no roothash, trying the images anyway" ;;
 		*) same=1 ;;
 	esac
-	msg "fetching the root image from $base"
+	msg "fetching layers $LAYERS from $base"
 
-	# Reserve RAM for both images before downloading: the root image stays in
-	# this tmpfs for as long as the machine runs, because it *is* the root
+	# Reserve RAM for every image before downloading: the layers stay in this
+	# tmpfs for as long as the machine runs, because they *are* the root
 	# filesystem (erofs, decompressed on read).
-	isize=$(size_of "$base/root.img")
-	vsize=$(size_of "$base/root.verity")
-	if [ -n "$isize" ] && [ -n "$vsize" ]; then
-		need_kb=$(((isize + vsize) / 1024 + 262144))
+	total=0 sizes=yes
+	for l in $LAYERS; do
+		isize=$(size_of "$base/root-$l.img")
+		vsize=$(size_of "$base/root-$l.verity")
+		if [ -n "$isize" ] && [ -n "$vsize" ]; then
+			msg "root-$l.img $((isize / 1048576)) MiB + root-$l.verity $((vsize / 1048576)) MiB"
+			total=$((total + isize + vsize))
+		else
+			sizes=no
+		fi
+	done
+	if [ $sizes = yes ]; then
+		need_kb=$((total / 1024 + 262144))
 		avail_kb=$(sed -n 's/^MemAvailable:[[:space:]]*\([0-9][0-9]*\) kB$/\1/p' /proc/meminfo)
 		[ -n "$avail_kb" ] || avail_kb=0
-		msg "root.img $((isize / 1048576)) MiB + root.verity $((vsize / 1048576)) MiB, $((avail_kb / 1024)) MiB RAM free"
+		msg "$((total / 1048576)) MiB for the layers, $((avail_kb / 1024)) MiB RAM free"
 		if [ "$avail_kb" -gt 0 ] && [ "$avail_kb" -lt "$need_kb" ]; then
 			msg "not enough RAM: need $((need_kb / 1024)) MiB free, have $((avail_kb / 1024)) MiB"
 			return 1
 		fi
-		tmpfs_size=$((isize + vsize + 16777216))
+		tmpfs_size=$((total + 16777216))
 	else
 		msg "server does not report sizes (no Content-Length), using 90% of RAM for the images"
 		tmpfs_size_opt=90%
@@ -148,25 +178,23 @@ try() { # base url (without trailing slash)
 	mount -t tmpfs -o "size=${tmpfs_size:-${tmpfs_size_opt}},mode=0700" netroot "$DIR" ||
 		{ msg "cannot mount the tmpfs for the images"; return 1; }
 
-	get "$base/root.verity" "$DIR/root.verity" || return 1
-	get "$base/root.img" "$DIR/root.img" || return 1
-
-	data=$(losetup -f --show -r "$DIR/root.img") || { msg "losetup for root.img failed"; return 1; }
-	hash=$(losetup -f --show -r "$DIR/root.verity") || { msg "losetup for root.verity failed"; return 1; }
-	# The root hash comes from the signed command line: this is the step that
-	# decides whether the downloaded image is the one that was signed.
-	if ! out=$(veritysetup open "$data" root "$hash" "$roothash" --panic-on-corruption 2>&1); then
-		msg "dm-verity refused the image: $out"
-		# Replaced while downloading?
-		served_release "$base"
-		[ $? -eq 1 ] && { msg "$base published another release meanwhile"; other=1; }
-		return 1
-	fi
-	msg "root opened as /dev/mapper/root ($data = $DIR/root.img), verified against roothash=$(printf %.12s "$roothash")..."
-	# systemd waits for dev-mapper-root.device, which udev only marks ready
-	# once blkid has recognised the erofs on it.
+	for l in $LAYERS; do
+		get "$base/root-$l.verity" "$DIR/root-$l.verity" || return 1
+		get "$base/root-$l.img" "$DIR/root-$l.img" || return 1
+		data=$(losetup -f --show -r "$DIR/root-$l.img") || { msg "losetup for root-$l.img failed"; return 1; }
+		loops="$loops $data"
+		hash=$(losetup -f --show -r "$DIR/root-$l.verity") || { msg "losetup for root-$l.verity failed"; return 1; }
+		loops="$loops $hash"
+		if ! stack_open "$l" "$data" "$hash"; then
+			# Replaced while downloading?
+			served_release "$base"
+			[ $? -eq 1 ] && { msg "$base published another release meanwhile"; other=1; }
+			return 1
+		fi
+	done
+	# systemd and udev settle the devices before they are mounted.
 	udevadm settle -t 15
-	[ -e /dev/mapper/root ] || { msg "/dev/mapper/root did not appear"; return 1; }
+	stack_mount || return 1
 }
 
 for url in $urls; do

@@ -180,7 +180,7 @@ log "Ready."
 cat <<EOF
     upload (build host):  ./release.sh --push $USER_NAME@$host
     served:               ${SERVER_URL%/}/boot.efi   (DHCP option 67); sticks: burn.sh ${SERVER_URL%/}/ /dev/sdX
-    build host netboot:   NETROOT_URL=${SERVER_URL%/}/   (netboot.conf)
+    build host netboot:   NETROOT_URL=${SERVER_URL%/}/   (safespace.local.conf)
     state:                safespace-netboot status;  journalctl -u safespace-netboot-verify
     firewall:             TCP 22 (upload), TCP 80 (HTTP)$( [[ ${DHCP_MODE:-off} != off ]] && echo ", UDP 67, 69 and 4011 (DHCP/PXE/TFTP)")
 EOF

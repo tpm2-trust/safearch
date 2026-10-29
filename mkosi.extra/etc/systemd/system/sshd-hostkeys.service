@@ -1,13 +1,20 @@
 # Replaces Arch's sshdgenkeys.service, which writes to the read-only /etc/ssh.
+# The fallback: when aSSH (assh-agent.service) wrote no host key - no TPM 2.0,
+# or the agent failed or timed out - sshd gets a throwaway ed25519 key, new on
+# every boot, in /var, so the machine stays reachable. Why is said on the
+# console and in the journal.
 [Unit]
-Description=Generate SSH host keys in /var
+Description=SSH host key when aSSH has none: a throwaway one
 Before=sshd.service
+After=assh-agent.service
 RequiresMountsFor=/var/lib
-ConditionPathExists=!/var/lib/sshd/etc/ssh/ssh_host_ed25519_key
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/install -d -m 0755 /var/lib/sshd/etc/ssh
-# -f: prefix for the key paths, so the keys land in /var/lib/sshd/etc/ssh/.
-ExecStart=/usr/bin/ssh-keygen -A -f /var/lib/sshd
+StandardOutput=journal+console
+ExecStart=/bin/sh -c 'c=/run/safespace/sshd-hostkey.conf; [ -s "$c" ] && exit 0; \
+	k=/var/lib/sshd/etc/ssh/ssh_host_ed25519_key; install -d -m 0755 /var/lib/sshd/etc/ssh /run/safespace; \
+	[ -s "$k" ] || ssh-keygen -q -t ed25519 -N "" -C "" -f "$k" || exit 1; echo "HostKey $k" >"$c"; \
+	if [ -e /dev/tpmrm0 ]; then why="aSSH did not start (journalctl -b -u assh-agent)"; else why="no TPM 2.0"; fi; \
+	echo "ssh host key: THROWAWAY ($why): $(ssh-keygen -lf "$k" | cut -d" " -f2)"'

@@ -9,7 +9,7 @@
 SHARE=/srv/safespace/share
 
 # How machines reach this server: the share's URL. The build host's
-# NETROOT_URL (netboot.conf) is $SERVER_URL/, the HTTP boot file
+# NETROOT_URL (safespace.conf) is $SERVER_URL/, the HTTP boot file
 # $SERVER_URL/boot.efi.
 SERVER_URL=http://10.0.0.1/safespace
 

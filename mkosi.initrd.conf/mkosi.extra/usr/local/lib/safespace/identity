@@ -1,0 +1,186 @@
+#!/bin/sh
+# The machine's identity (SECURITY.md, "Machine identity"): made here once, all
+# of it at once, and its machine-id released here at every boot of its
+# combination. Runs in the initrd after safespace-select.service chose and
+# measured the combination (select: PCR 15 "safespace-combination:<name>", the
+# name in /run/safespace/combination), before the network and the boot path
+# (usb-bootdev or netroot); started by safespace-identity.service.
+#
+# The identity, both in EFI variables:
+#   SAFEmachineID  the machine-id, a systemd-creds credential (vendor GUID as
+#                  select's; credential safespace-machine-id), sealed to this TPM
+#                  with the policy
+#                    PCR 11 signed by the build host's identity key for the phase
+#                      enter-initrd only (identity.pem, appended to this initrd by
+#                      lib/compose.sh): a safespace UKI, and only while its initrd
+#                      runs - no process of a root can unseal
+#                    PCR 7  as at the creation: Secure Boot with exactly these keys
+#                    PCR 15 as at the creation: one measurement, of the combination
+#   SAFEasshCA     aSSH's CA (its private key in the TPM; the variable holds its
+#                  TPM-wrapped blob and its approvals): the host key's certificate,
+#                  in the root (assh-agent.service, /etc/assh/assh.conf)
+#
+# 1. The creation: at the first boot with Secure Boot on (SecureBoot=1,
+#    SetupMode=0) with neither variable, both, or neither: a new machine-id,
+#    sealed, checked (the signed policy type; an empty signature must not
+#    unseal); then 'assh ca create' - an authority that exists for this alone
+#    approves, for the root's state as it will be (PCR 15: the combination, then
+#    "safespace-identity:sealed"), slot 0 (PCR 0, 2, 7, 15; PCR 11 signed by the
+#    build) and slot 1 (PCR 7, 15), and is gone. The machine belongs to the
+#    combination booted. Only 'safespace identity clear' makes room for another.
+#    One variable without the other: nothing is made (identity clear).
+# 2. Unseal SAFEmachineID into /run/safespace/identity/ (RAM; /run stays across
+#    the switch to the root; "released" lists it) and into /run/machine-id, which
+#    PID 1 takes over, and the initrd's /etc/machine-id: written in place (PID 1
+#    bind-mounts the one over the other), so systemd-networkd, started after
+#    this, asks DHCP with it. One that does not unseal is left alone: the root has a
+#    throwaway machine-id.
+# On a TPM without an active SHA-256 bank (its firmware activates SHA-1 only:
+# ThinkPad T450s) 1 and 2 happen only while safespace tpm sha1 on allows SHA-1:
+# aSSH decides it (assh tpm sha1, "bank auto"), for the host key alike.
+# 3. Always, also on errors: extend PCR 15 with "safespace-identity:sealed", so
+#    nothing unseals again in this boot. aSSH's agent finds PCR 15 so (the
+#    combination, then this) at every boot of the combination.
+# The boot never depends on this: every failure only means no identity.
+#
+# SAFESPACE_EFIVARS, SAFESPACE_RUN, SAFESPACE_PCREXTEND, SAFESPACE_CREDS,
+# SAFESPACE_IDENTITY_KEY, SAFESPACE_PCRSIG, SAFESPACE_MACHINE_ID,
+# SAFESPACE_ETC_MACHINE_ID, SAFESPACE_ASSH (and select's):
+# only for tests/run.sh.
+
+msg() { echo "safespace-identity: $*" >/dev/kmsg 2>/dev/null || echo "safespace-identity: $*" >&2; }
+
+cmdline=$(cat /proc/cmdline)
+. "${0%/*}/select"
+
+CREDS=${SAFESPACE_CREDS:-systemd-creds}
+ASSH=${SAFESPACE_ASSH:-assh}
+KEY=${SAFESPACE_IDENTITY_KEY:-${0%/*}/identity.pem}
+OUT=$SELECT_RUN/identity
+MACHINE_ID=${SAFESPACE_MACHINE_ID:-/run/machine-id}
+ETC_MACHINE_ID=${SAFESPACE_ETC_MACHINE_ID:-/etc/machine-id}
+ASSH_CONF=/etc/assh/assh.conf
+# The build's PCR key, whose signatures of PCR 11 the CA's slot 0 takes
+# (assh.conf's ASSH_PCR_KEY: appended to this initrd by lib/compose.sh, beside
+# identity.pem).
+PCR_KEY=${0%/*}/pcr.pem
+# The credential header's type for "sealed with a signed PCR policy"
+# (--with-key=tpm2-with-public-key). With plain tpm2, systemd-creds drops the
+# --tpm2-public-key* options without a word and PCR 11 is not bound at all.
+SIGNED_TYPE=5e2d5c7603724eaf843c6fb5f64098f5
+# The variables' names, the PCRs of the seal, the CA's variable: select sourced
+# settings (lib/settings.sh, from safespace.conf).
+
+close() {
+	"$SELECT_PCREXTEND" --graceful --pcr=$SAFESPACE_PCR "$SAFESPACE_SEALED_EVENT" >/dev/null 2>&1 ||
+		msg "WARNING: could not close PCR 15"
+	rm -rf "$OUT/.new"
+}
+trap close EXIT
+
+# The variables of safespace's GUID: aSSH writes them in place (never
+# removed first) and removes them (assh efivar), as select does.
+var_path() { echo "$SELECT_VARS/$1-$SAFESPACE_GUID"; }
+var_rm() { ASSH_EFIVARS=$SELECT_VARS "$ASSH" efivar rm "$1-$SAFESPACE_GUID"; }
+var_write() { ASSH_EFIVARS=$SELECT_VARS "$ASSH" efivar set --file "$2" "$1-$SAFESPACE_GUID"; } # NAME FILE
+
+name=$(cat "$SELECT_RUN/combination" 2>/dev/null)
+case $name in
+	'' | *[!a-z0-9-]*) msg "no measured combination: no identity this boot"; exit 0 ;;
+esac
+umask 077
+mkdir -p "$OUT/.new" || exit 0
+
+# The PCR bank, as aSSH's agent will read it: SHA-256, else SHA-1 where the TPM
+# has no SHA-256 bank and allows it (safespace tpm sha1 on). (No grep in the
+# initrd: sed.)
+bank=$("$ASSH" tpm sha1 --config $ASSH_CONF 2>&1 | sed -n 's/^bank auto: //p')
+case $bank in
+	sha256) ;;
+	sha1) msg "the TPM has the SHA-1 bank only, and SHA-1 is allowed (safespace tpm sha1 on): the identity uses it" ;;
+	*sha1*not\ allowed*) msg "SHA-1 is not allowed: no identity this boot (the TPM has the SHA-1 bank only: sudo safespace tpm sha1 on)"; exit 0 ;;
+	*) msg "no PCR bank to bind to (${bank:-aSSH could not tell}): no identity this boot"; exit 0 ;;
+esac
+
+# The signed expected PCR values and their key, as systemd-stub hands them to
+# the initrd.
+sig=${SAFESPACE_PCRSIG:-}
+for f in /run/systemd/tpm2-pcr-signature.json /.extra/tpm2-pcr-signature.json; do
+	[ -n "$sig" ] || { [ -s "$f" ] && sig=$f; }
+done
+[ -n "$sig" ] || { msg "no signed PCR values from the UKI: no identity this boot"; exit 0; }
+
+# A sealed credential is accepted only if it is bound to the signed policy:
+# its header says so, and it does not unseal without a signature.
+signed() { # CREDENTIAL_FILE NAME
+	[ "$(base64 -d <"$1" 2>/dev/null | head -c 16 | od -An -tx1 | tr -d ' \n')" = "$SIGNED_TYPE" ] || return 1
+	echo '{}' >"$OUT/.new/nosig.json"
+	! "$CREDS" decrypt --tpm2-signature="$OUT/.new/nosig.json" --name="$2" "$1" - >/dev/null 2>&1
+}
+
+# Value byte of a global UEFI variable (SecureBoot, SetupMode).
+global_byte() { od -An -tu1 -j4 -N1 "$SELECT_VARS/$1-$SAFESPACE_EFI_GLOBAL" 2>/dev/null | tr -d ' '; }
+
+# 1. The creation, all or nothing.
+have_mid=0 have_ca=0
+[ -e "$(var_path $SAFESPACE_MID_VAR)" ] && have_mid=1
+[ -e "$SELECT_VARS/$SAFESPACE_CA_VAR" ] && have_ca=1
+if [ $have_mid = 0 ] && [ $have_ca = 0 ]; then
+	if [ "$(global_byte SecureBoot)" != 1 ] || [ "$(global_byte SetupMode)" != 0 ]; then
+		msg "no identity: Secure Boot is off (seal the machine first)"
+	elif [ ! -s "$PCR_KEY" ]; then
+		msg "ERROR: no PCR signing key in the initrd (pcr.pem): no identity made"
+	else
+		msg "no identity yet, Secure Boot on: making it - this machine belongs to $name from now on"
+		ok=1
+		systemd-id128 new >"$OUT/.new/machine-id" 2>/dev/null || ok=0
+		if [ $ok = 1 ]; then
+			"$CREDS" encrypt --with-key=tpm2-with-public-key --tpm2-pcrs=$SAFESPACE_MID_PCRS \
+				--tpm2-public-key="$KEY" --tpm2-public-key-pcrs=$SAFESPACE_MID_SIGNED_PCRS \
+				--name=$SAFESPACE_MID_CRED "$OUT/.new/machine-id" "$OUT/.new/mid.cred" >/dev/null 2>&1 || { ok=0; msg "ERROR: sealing the machine-id failed"; }
+		fi
+		if [ $ok = 1 ]; then
+			signed "$OUT/.new/mid.cred" $SAFESPACE_MID_CRED || { ok=0; msg "ERROR: the machine-id is not bound to the signed policy"; }
+		fi
+		if [ $ok = 1 ]; then
+			var_write $SAFESPACE_MID_VAR "$OUT/.new/mid.cred" || { ok=0; msg "ERROR: cannot write $SAFESPACE_MID_VAR"; }
+		fi
+		if [ $ok = 1 ]; then
+			"$ASSH" ca create --config $ASSH_CONF \
+				--events "$SAFESPACE_PCR:$SAFESPACE_COMBINATION_EVENT$name" --events "$SAFESPACE_PCR:$SAFESPACE_SEALED_EVENT" >"$OUT/.new/ca.log" 2>&1 ||
+				{ ok=0; msg "ERROR: creating the CA failed: $(tail -1 "$OUT/.new/ca.log")"; }
+		fi
+		if [ $ok = 1 ]; then
+			msg "the identity is made, for $name: the machine-id and the CA"
+		else
+			# All or nothing: what was made goes.
+			var_rm $SAFESPACE_MID_VAR
+			if [ -e "$SELECT_VARS/$SAFESPACE_CA_VAR" ]; then
+				"$ASSH" ca remove --config $ASSH_CONF >/dev/null 2>&1
+			fi
+			msg "ERROR: no identity made"
+		fi
+	fi
+elif [ $have_mid != $have_ca ]; then
+	msg "the identity is incomplete ($SAFESPACE_MID_VAR $([ $have_mid = 1 ] && echo there || echo missing), ${SAFESPACE_CA_VAR%%-*} $([ $have_ca = 1 ] && echo there || echo missing)): nothing made; sudo safespace identity clear"
+fi
+
+# 2. The machine-id, where this is its combination.
+if [ -r "$(var_path $SAFESPACE_MID_VAR)" ]; then
+	ASSH_EFIVARS=$SELECT_VARS "$ASSH" efivar get "$SAFESPACE_MID_VAR-$SAFESPACE_GUID" >"$OUT/.new/in.cred"
+	if "$CREDS" decrypt --tpm2-signature="$sig" --name=$SAFESPACE_MID_CRED "$OUT/.new/in.cred" "$OUT/machine-id" >/dev/null 2>&1; then
+		msg "$SAFESPACE_MID_VAR released"
+		echo $SAFESPACE_MID_VAR >>"$OUT/released"
+	else
+		rm -f "$OUT/machine-id"
+		msg "$SAFESPACE_MID_VAR not released (combination $name is not this machine's, or the firmware changed)"
+	fi
+fi
+# In place, not replaced: PID 1 bind-mounts /run/machine-id over /etc/machine-id
+# (read-only); where it does not, /etc/machine-id is written itself.
+if [ -s "$OUT/machine-id" ]; then
+	{ cat "$OUT/machine-id" >"$MACHINE_ID" && chmod 0444 "$MACHINE_ID"; } || msg "WARNING: cannot hand the machine-id to PID 1"
+	[ "$(cat "$ETC_MACHINE_ID" 2>/dev/null)" = "$(cat "$OUT/machine-id")" ] || cat "$OUT/machine-id" >"$ETC_MACHINE_ID" ||
+		msg "WARNING: cannot hand the machine-id to the initrd's network"
+fi
+exit 0

@@ -1,0 +1,36 @@
+# The machine's host key, made in the TPM at every boot and certified by its CA
+# (aSSH, /etc/assh/assh.conf; SECURITY.md, "Machine identity"). sshd asks the
+# agent for every signature (/run/safespace/sshd-hostkey.conf).
+# Early: PCR 11 must hold the UKI and the initrd's phases alone (pcrphase
+# measures "sysinit" after sysinit.target), and PCR 15 the initrd's
+# measurements alone - so before systemd-pcrmachine and systemd-pcrfs-root.
+# It closes the window (PCR 15) once the key is made, also without a
+# certificate. Without a TPM 2.0, or when this fails, sshd-hostkeys.service
+# makes a throwaway key; what went wrong is on the console too.
+[Unit]
+Description=aSSH: the host key in the TPM, certified by the machine's CA
+DefaultDependencies=no
+# After the TPM, not wanting it: systemd-tpm2-generator pulls tpm2.target in where
+# the firmware found a TPM the kernel does not show yet. Wanting it here made a
+# machine without a TPM wait 90 s for /dev/tpmrm0 before sysinit.target.
+After=tpm2.target sys-firmware-efi-efivars.mount
+Before=sysinit.target sshd.service systemd-pcrmachine.service systemd-pcrfs-root.service
+ConditionPathExists=/dev/tpmrm0
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/assh agent --config /etc/assh/assh.conf
+# Never holds the boot: sshd falls back to a throwaway key.
+TimeoutStartSec=60s
+StandardError=journal+console
+ExecStartPost=/usr/bin/install -d -m 0755 /run/safespace
+# The agent's sshd lines (assh/README.md): the host key, its certificate when the
+# CA certified it, the agent, and the algorithms the TPM signs in.
+ExecStartPost=/usr/bin/install -m 0644 /run/assh/sshd.conf /run/safespace/sshd-hostkey.conf
+# A restart gets no certificate: the window is closed until the next boot.
+Restart=no
+
+[Install]
+WantedBy=sysinit.target

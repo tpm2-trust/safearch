@@ -1,0 +1,16 @@
+# The combination to boot, chosen and measured into PCR 15 once
+# (/usr/local/lib/safespace/choose): before the machine's identity, which is
+# sealed to that measurement and released before the network, and before the
+# boot paths, which require it and open the chosen combination's root.
+# Started by them (no [Install]: usb-bootdev.service, netroot.service).
+[Unit]
+Description=Choose and measure the combination to boot
+DefaultDependencies=no
+After=tpm2.target systemd-tpm2-setup-early.service
+Before=safespace-identity.service usb-bootdev.service netroot.service initrd-root-device.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/safespace/choose
