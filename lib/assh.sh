@@ -17,7 +17,8 @@ assh_build() { # OUT
 	[[ -f $src/go.mod ]] || die "assh/ is empty: git submodule update --init assh"
 	command -v go >/dev/null || die "go not found (pacman -S go): aSSH is built on the build host"
 	mkdir -p "$cache" "$(dirname "$out")"
-	(cd "$src" && env GOTOOLCHAIN=local GOFLAGS=-mod=readonly CGO_ENABLED=0 \
+	# GOWORK=off: the submodule's commit, never a go.work around this checkout.
+	(cd "$src" && env GOTOOLCHAIN=local GOWORK=off GOFLAGS=-mod=readonly CGO_ENABLED=0 \
 		GOMODCACHE="$cache/mod" GOCACHE="$cache/build" GOPATH="$cache/path" \
 		go build -trimpath -ldflags=-s -o "$out" ./cmd/assh) ||
 		die "building aSSH failed (assh/: go version $(go env GOVERSION), go.mod wants $(sed -n 's/^go //p' "$src/go.mod"))"
