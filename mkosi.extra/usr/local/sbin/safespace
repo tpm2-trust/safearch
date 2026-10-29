@@ -130,12 +130,12 @@ efivars_rw() {
 	mountpoint -q "$EFIVARS" || mount -t efivarfs efivarfs "$EFIVARS"
 	grep -q " $EFIVARS efivarfs rw" /proc/mounts || mount -o remount,rw "$EFIVARS"
 }
-# A variable of the selection's vendor GUID: read, removed (efivarfs makes them
-# immutable: chattr -i first), written (the attributes NV, BS, RT, then the value,
-# in one write).
-sel_var() { [[ -r $EFIVARS/$1-$SAFESPACE_GUID ]] && tail -c +5 "$EFIVARS/$1-$SAFESPACE_GUID" | tr -d '\000\n' || true; }
-sel_var_rm() { local f=$EFIVARS/$1-$SAFESPACE_GUID; [[ -e $f ]] || return 0; chattr -i "$f" 2>/dev/null || true; rm -f "$f"; }
-sel_var_write() { sel_var_rm "$1"; printf '\x07\x00\x00\x00%s' "$2" >"$EFIVARS/$1-$SAFESPACE_GUID"; }
+# A variable of safespace's vendor GUID, through aSSH (assh efivar): read,
+# removed (none there is no error), written in place in one write - the one
+# way every EFI variable of safespace's is.
+sel_var() { ASSH_EFIVARS=$EFIVARS "$ASSH" efivar get "$1-$SAFESPACE_GUID" 2>/dev/null | tr -d '\000\n' || true; }
+sel_var_rm() { ASSH_EFIVARS=$EFIVARS "$ASSH" efivar rm "$1-$SAFESPACE_GUID"; }
+sel_var_write() { ASSH_EFIVARS=$EFIVARS "$ASSH" efivar set "$1-$SAFESPACE_GUID" "$2"; }
 confirm() { # QUESTION
 	((CONFIRM)) || return 0
 	local answer

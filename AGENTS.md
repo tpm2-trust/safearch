@@ -118,6 +118,13 @@ the network-boot reference, SECURITY.md the applied hardening. Arch Linux only, 
 - **A selection never supplies a root hash or a layer.** The EFI variables /
   `safespace.select=` only name a combination; its layers and their hashes come from the
   signed command line, and without `safespace.root.<name>=` nothing is opened.
+- **EFI variables only through aSSH.** The selection's, the machine-id's and the CA's
+  variables are read, written and removed with `assh efivar` (and `assh ca`) - in the
+  root (`safespace`) and in the initrd (`select`, `identity`) - never by writing or
+  `rm`-ing efivarfs in a script: aSSH writes a variable in place, never removes it
+  first, lifts efivarfs' immutable mark and puts it back, and treats none there as
+  no error (aSSH's `persist`). Tests point it at a directory (`SAFESPACE_ASSH`,
+  `ASSH_EFIVARS`).
 - **Builds are kept and shipped as parts** (UKI, the layers' images, verity trees and root
   hashes, systemd-boot, partition table); no disk image is stored or shipped.
 

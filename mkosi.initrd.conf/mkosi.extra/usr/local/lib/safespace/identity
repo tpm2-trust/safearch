@@ -78,18 +78,11 @@ close() {
 }
 trap close EXIT
 
+# The variables of safespace's GUID: aSSH writes them in place (never
+# removed first) and removes them (assh efivar), as select does.
 var_path() { echo "$SELECT_VARS/$1-$SAFESPACE_GUID"; }
-var_rm() {
-	[ -e "$(var_path "$1")" ] || return 0
-	chattr -i "$(var_path "$1")" 2>/dev/null
-	rm -f "$(var_path "$1")"
-}
-# efivarfs takes a variable in one write: the attributes (NV, BS, RT), then the value.
-var_write() { # NAME FILE
-	{ printf '\007\000\000\000'; cat "$2"; } >"$OUT/.new/var" || return 1
-	var_rm "$1"
-	cat "$OUT/.new/var" >"$(var_path "$1")"
-}
+var_rm() { ASSH_EFIVARS=$SELECT_VARS "$ASSH" efivar rm "$1-$SAFESPACE_GUID"; }
+var_write() { ASSH_EFIVARS=$SELECT_VARS "$ASSH" efivar set --file "$2" "$1-$SAFESPACE_GUID"; } # NAME FILE
 
 name=$(cat "$SELECT_RUN/combination" 2>/dev/null)
 case $name in
@@ -174,7 +167,7 @@ fi
 
 # 2. The machine-id, where this is its combination.
 if [ -r "$(var_path $SAFESPACE_MID_VAR)" ]; then
-	tail -c +5 "$(var_path $SAFESPACE_MID_VAR)" >"$OUT/.new/in.cred"
+	ASSH_EFIVARS=$SELECT_VARS "$ASSH" efivar get "$SAFESPACE_MID_VAR-$SAFESPACE_GUID" >"$OUT/.new/in.cred"
 	if "$CREDS" decrypt --tpm2-signature="$sig" --name=$SAFESPACE_MID_CRED "$OUT/.new/in.cred" "$OUT/machine-id" >/dev/null 2>&1; then
 		msg "$SAFESPACE_MID_VAR released"
 		echo $SAFESPACE_MID_VAR >>"$OUT/released"

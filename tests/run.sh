@@ -54,6 +54,15 @@ need() { # TOOL...: all present, else SKIP the current test
 	for t in "$@"; do command -v "$t" >/dev/null || { skip "$CURRENT: '$t' not installed"; return 1; }; done
 }
 wanted() { ((${#ONLY[@]} == 0)) || [[ " ${ONLY[*]} " == *" $1 "* ]]; }
+# The scripts read, write and remove their EFI variables with aSSH (assh
+# efivar): the real one, built from the submodule once, is $AE.
+AE=$W/assh-efivar/assh
+efivar_tool() {
+	[[ -x $AE ]] && return 0
+	need go || return 1
+	(cd "$REPO/assh" && GOWORK=off CGO_ENABLED=0 go build -o "$AE" ./cmd/assh) >"$W/assh-efivar.log" 2>&1 ||
+		{ fail "aSSH for the EFI variables does not build ($W/assh-efivar.log)"; return 1; }
+}
 # The image's settings and assh.conf as build.sh writes them from safespace.conf's
 # defaults (lib/settings.sh): the image's scripts are tested against them.
 IMG=$W/image
@@ -562,7 +571,7 @@ if wanted upload && fixtures && [[ -z ${ONLY_SKIP:-} ]] && command -v rrsync >/d
 fi
 
 # --- netroot (initrd, the network path) ---------------------------------------------------------
-if wanted netroot && shared && need curl; then
+if wanted netroot && shared && need curl && efivar_tool; then
 	section netroot
 	NR=$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/netroot
 	S=$W/shims
@@ -583,8 +592,8 @@ if wanted netroot && shared && need curl; then
 	nr_cmd() { # CMDLINE: choose the combination (safespace-select.service), then run netroot with it (efivars in a directory of the test)
 		rm -rf "$W/systemctl.calls" "$W/veritysetup.calls" "$W/mount.calls" "$W/nr-run" "$W/sysroot"
 		mkdir -p "$EV"
-		cmdline=$1 SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$W/nr-run SAFESPACE_PCREXTEND=true sh -c 'msg() { :; }; . "$0"; select_root' "${NR%/*}/select" || return 1
-		NETROOT_CMDLINE="$1" NETROOT_DIR=$W/nr SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$W/nr-run SAFESPACE_SYSROOT=$W/sysroot \
+		cmdline=$1 SAFESPACE_EFIVARS=$EV SAFESPACE_ASSH=$AE SAFESPACE_RUN=$W/nr-run SAFESPACE_PCREXTEND=true sh -c 'msg() { :; }; . "$0"; select_root' "${NR%/*}/select" || return 1
+		NETROOT_CMDLINE="$1" NETROOT_DIR=$W/nr SAFESPACE_EFIVARS=$EV SAFESPACE_ASSH=$AE SAFESPACE_RUN=$W/nr-run SAFESPACE_SYSROOT=$W/sysroot \
 			PATH="$S:$PATH" sh "$NR" >"$W/nr.log" 2>&1
 	}
 	nr() { # ROOTHASH URL...: netroot against the servers, one combination of one layer with that hash
@@ -651,7 +660,7 @@ if wanted initrd; then
 fi
 
 # --- compose: the shipped UKI is checked, the initrd's choice of the root ---------------------
-if wanted compose && fixtures; then
+if wanted compose && fixtures && efivar_tool; then
 	section compose
 	t_fw() ( # PACKAGES...: builds_check_firmware on a manifest with these packages
 		set -Eeuo pipefail
@@ -742,7 +751,7 @@ if wanted compose && fixtures; then
 		[[ -z $2 ]] || printf '\x07\x00\x00\x00%s' "$2" >"$EV/SafespaceSelectOnce-$SG"
 		[[ -z $3 ]] || printf '\x07\x00\x00\x00%s' "$3" >"$EV/SafespaceSelect-$SG"
 		local got
-		got=$(cmdline=$1 SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$SR SAFESPACE_PCREXTEND=$PX sh -c 'msg() { :; }; . "$0"; select_root || exit 1; echo "$SELECT_NAME:$SELECT_LAYERS"' "$SEL") || return 1
+		got=$(cmdline=$1 SAFESPACE_EFIVARS=$EV SAFESPACE_ASSH=$AE SAFESPACE_RUN=$SR SAFESPACE_PCREXTEND=$PX sh -c 'msg() { :; }; . "$0"; select_root || exit 1; echo "$SELECT_NAME:$SELECT_LAYERS"' "$SEL") || return 1
 		[[ $got == "$4" ]] || { echo "got $got"; return 1; }
 	}
 	check "select: nothing set boots the first combination" t_select "$CL" "" "" "root:base"
@@ -761,7 +770,7 @@ if wanted compose && fixtures; then
 	t_select "$CL" "" containers "containers:base docker" >/dev/null
 	check "select: the choice is measured into PCR 15 before it is used" bash -c '[[ $(cat "$1") == "--graceful --pcr=15 safespace-combination:containers" ]]' _ "$W/pcrextend.log"
 	check "... and recorded in /run/safespace/combination" bash -c '[[ $(cat "$1/combination") == containers ]]' _ "$SR"
-	t_twice() { rm -rf "$SR" "$W/pcrextend.log"; cmdline=$CL SAFESPACE_EFIVARS=$EV SAFESPACE_RUN=$SR SAFESPACE_PCREXTEND=$PX sh -c 'msg() { :; }; . "$0"; select_root && select_root' "$SEL" && [[ $(wc -l <"$W/pcrextend.log") == 1 ]]; }
+	t_twice() { rm -rf "$SR" "$W/pcrextend.log"; cmdline=$CL SAFESPACE_EFIVARS=$EV SAFESPACE_ASSH=$AE SAFESPACE_RUN=$SR SAFESPACE_PCREXTEND=$PX sh -c 'msg() { :; }; . "$0"; select_root && select_root' "$SEL" && [[ $(wc -l <"$W/pcrextend.log") == 1 ]]; }
 	check "select: measured only once per boot" t_twice
 	t_failmeasure() { PCREXT_FAIL=1 t_select "$CL" "" "" "root:base"; }
 	check "select: a failing measurement does not stop the boot" t_failmeasure
@@ -807,6 +816,7 @@ if wanted compose && fixtures; then
 	# arguments of ca commands go to $W/assh.log.
 	cat >"$W/assh-stub" <<-STUB
 		#!/bin/bash
+		[[ "\$1" == efivar ]] && exec "$AE" "\$@"
 		[[ "\$1 \$2" == "tpm sha1" ]] && { echo "bank auto: \${STUB_BANK:-sha256}"; exit 0; }
 		echo "\$*" >>"$W/assh.log"
 		v=$EV/SAFEasshCA-24415b90-39be-45c0-a9a3-d547ebe28ea0
@@ -1044,7 +1054,7 @@ if wanted assh && need go; then
 		"$REPO/mkosi.extra/usr/lib/systemd/system-preset/10-safespace.preset" "$REPO/mkosi.extra/etc/ssh/sshd_config.d/10-safespace.conf" "$REPO/mkosi.extra/etc/systemd/system/sshd-hostkeys.service"
 	check "the initrd has no ssh (the host key is aSSH's, in the root)" bash -c '! grep -qE "^[[:space:]]+openssh$" <(sed -n "/^InitrdPackages=/,/^[A-Z]/p" "$1")' _ "$REPO/mkosi.conf"
 	if need swtpm; then
-		check "aSSH's own tests (swtpm)" bash -c 'cd "$1" && GOTOOLCHAIN=local go test -count=1 ./...' _ "$REPO/assh"
+		check "aSSH's own tests (swtpm)" bash -c 'cd "$1" && GOTOOLCHAIN=local GOWORK=off go test -count=1 ./...' _ "$REPO/assh"
 	fi
 fi
 
