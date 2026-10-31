@@ -21,6 +21,65 @@ configuration on the build host (2f20ca7).
 
 ---
 
+# PLAN: aSSH at 93d79df - the window in the CA's policy
+
+Status: **proposed** (2026-10-30), waiting for confirmation.
+
+## Goal
+
+Move `assh/` to aSSH 93d79df (its security fixes P1, assh/PLAN.md) and adapt safearch.
+What changes for safearch:
+
+- **The window is the CA's own.** The CA's policy reads an NV index W (0x01802915) that the
+  agent read-locks after the host key; no approval can leave it out. `ASSH_CA_WINDOW` is
+  gone; PCR 15 stays in every slot (the combination) and can still be extended at the close
+  (`ASSH_CLOSE_PCR=15`).
+- **Fail-closed.** The agent closes the window on every way out; `assh close` is meant to
+  run after the unit (`ExecStopPost=`).
+- **A new CA's window is closed in the boot that creates it** (aSSH's default): the
+  initrd's `ca create --authority-once` at the first sealed boot gives a **temporary key in
+  that boot**; the machine is certified from its second boot on (open question 1).
+- `ca remove` removes W too (identity clear, the initrd's all-or-nothing).
+- The CA file is format 4: an existing identity's CA (SAFEasshCA of format 3) is not read -
+  `safespace identity clear` and a new identity, a new `@cert-authority` line.
+
+## Steps
+
+- [ ] 1. Pin: `safearch/assh` to 93d79df (staged, as `../pin assh` does for this submodule).
+- [ ] 2. `lib/assh.conf.in`: `ASSH_CA_WINDOW` out, `ASSH_CLOSE_PCR=@PCR@` in (PCR 15 still
+       extended by the agent, as today); comments say the window is the CA's index.
+- [ ] 3. `lib/settings.sh`: the refusal of a slot without PCR 15 stays (per combination),
+       its reason without "the window".
+- [ ] 4. `assh-agent.service`: `ExecStopPost=/usr/bin/assh close --config /etc/assh/assh.conf`;
+       comments.
+- [ ] 5. The initrd's `identity`: comments (the CA signs from the next boot on, unless open
+       question 1 says otherwise).
+- [ ] 6. `tests/run.sh`: the assh.conf check (`ASSH_CLOSE_PCR=15`, no `ASSH_CA_WINDOW`),
+       the policy refusal text; `tests/vm.sh`'s expectations: the first sealed boot
+       temporary and the second certified, an agent restart "window is closed" instead of
+       "PCR 15 not as approved" (vm.sh is run later).
+- [ ] 7. README ("Machine identity", the tests table), SECURITY.md (the identity's
+       sequence, "The window", the policy row, the test row).
+- [ ] 8. `tests/run.sh`.
+
+## What breaks
+
+- Existing identities: their CA (format 3) is not read; the agent serves a temporary key
+  until `safespace identity clear` and a new identity (new `@cert-authority` line).
+- The first sealed boot no longer certifies (unless question 1 decides otherwise).
+
+## Open questions
+
+1. The first sealed boot: accept a temporary key there (aSSH's default: no CA signs in the
+   boot that made it), or add an opt-in to aSSH that leaves the creating boot's window open
+   (`ca create --window-open`, `ASSH_WINDOW_OPEN`) for safearch's initrd, where only the
+   initrd and the early root run before the agent closes it?
+2. Keep the agent extending PCR 15 at the close (`ASSH_CLOSE_PCR=15`, as today), or drop it
+   now that W closes the CA? Nothing in the root binds to PCR 15 after the identity's
+   "sealed" as far as I see; keeping it changes nothing.
+
+---
+
 # PLAN: each layer built once - the roots as verified layers, stacked by the initrd
 
 Status: **confirmed 2026-10-27** (the user: "write it. clean up old caches / produced builds
