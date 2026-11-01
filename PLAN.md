@@ -36,6 +36,9 @@ CA is open is said; the slots follow the one rule.
 - [x] E1. `identity`: a failed `sealed` extend with a TPM present ends the unit with an error,
       `FailureAction=reboot-force` (the owner's decision: no emergency shell with PCR 15 at the
       combination alone); tests with the mock extend.
+- [x] E2. `identity`: a failed `sealed` extend runs `assh close` (aSSH's ladder) first; the
+      reboot only if all of it fails. `tests/run.sh` covers both with stubs; `tests/vm.sh` forces
+      no failed extend, so neither way has run on a VM.
 - [x] E6. SECURITY.md: the CA open from `sealed` until the agent's close, accepted; the
       initrd-certified host key an option.
 - [x] F1. `IDENTITY_SLOTS="0,2,4,7+11 7+11"`; tests; `tests/vm.sh`'s expectations (an update
