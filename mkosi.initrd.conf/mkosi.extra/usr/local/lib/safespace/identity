@@ -44,10 +44,12 @@
 #    nothing unseals again in this boot. aSSH's agent finds PCR 15 so (the
 #    combination, then this) at every boot of the combination.
 # The boot does not depend on the identity: every failure of 1 and 2 only means
-# no identity. It depends on 3: an extend that fails with a TPM present ends this
-# script with an error and the machine reboots (safespace-identity.service), because
-# any root process could unseal the machine-id again otherwise. Without a TPM
-# (--graceful) there is nothing to close.
+# no identity. It depends on 3: an extend that fails with a TPM present goes down
+# aSSH's ladder (assh close: PCR 15 again, the kill switch, PCR 7): any of it holds,
+# and the boot goes on without the identity. Only when all of it fails does this
+# script end with an error and the machine reboot (safespace-identity.service),
+# because any root process could unseal the machine-id again otherwise. Without a
+# TPM (--graceful) there is nothing to close.
 #
 # SAFESPACE_EFIVARS, SAFESPACE_RUN, SAFESPACE_PCREXTEND, SAFESPACE_CREDS,
 # SAFESPACE_IDENTITY_KEY, SAFESPACE_PCRSIG, SAFESPACE_MACHINE_ID,
@@ -80,7 +82,9 @@ SIGNED_TYPE=5e2d5c7603724eaf843c6fb5f64098f5
 close() {
 	rm -rf "$OUT/.new"
 	"$SELECT_PCREXTEND" --graceful --pcr=$SAFESPACE_PCR "$SAFESPACE_SEALED_EVENT" >/dev/null 2>&1 && return
-	msg "ERROR: could not close PCR 15 ($SAFESPACE_SEALED_EVENT): the machine reboots, the machine-id would stay open to a root process"
+	msg "could not extend PCR 15 ($SAFESPACE_SEALED_EVENT): aSSH's close"
+	"$ASSH" close --config $ASSH_CONF && return
+	msg "ERROR: could not close PCR 15 by any way: the machine reboots, the machine-id would stay open to a root process"
 	exit 1
 }
 trap close EXIT

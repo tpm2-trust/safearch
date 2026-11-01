@@ -5,8 +5,8 @@
 # after this); before the network (network-pre.target: systemd-networkd, netroot),
 # so the initrd's DHCP asks with the machine's machine-id, as the running system
 # does. Nothing of it comes from the network. Without a TPM or an identity it only
-# logs; it fails only when the extend that closes PCR 15 fails, and then the machine
-# reboots at once, as systemd's own measuring units do: no network, no root and no
+# logs; it fails only when PCR 15 cannot be closed by any way of aSSH's ladder, and
+# then the machine reboots at once, as systemd's own measuring units do: no network, no root and no
 # shell with the machine-id open to unseal. A TPM that keeps failing keeps it rebooting.
 [Unit]
 Description=Make or release the machine's identity (its combination only)

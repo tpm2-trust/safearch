@@ -824,6 +824,7 @@ if wanted compose && fixtures && efivar_tool; then
 		case "\$1 \$2" in
 			"ca create") [[ -z \$STUB_ASSH_FAIL ]] || { echo "the TPM said no" >&2; exit 1; }; printf '\x07\x00\x00\x00{"ca":1}' >"\$v" ;;
 			"ca remove") rm -f "\$v" ;;
+			"close --config") [[ -z \$STUB_CLOSE_FAIL ]] || { echo "the TPM refused every way" >&2; exit 1; } ;;
 		esac
 	STUB
 	chmod +x "$W/assh-stub"
@@ -930,12 +931,17 @@ if wanted compose && fixtures && efivar_tool; then
 		[[ ! -e $EV/SAFEmachineID-$SG && ! -e $EV/$CAV ]] && grep -q "no PCR signing key in the initrd" "$IR/log"
 	}
 	check "identity: no pcr.pem in the initrd: nothing made" t_id_nokey
-	t_id_noclose() { # A FIRST: the extend fails with a TPM present
-		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" PCREXT_FAIL=1 && return 1
+	t_id_ladder() { # the extend fails with a TPM present: aSSH's ladder holds, the boot goes on
+		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" PCREXT_FAIL=1 || return 1
+		grep -q "aSSH's close" "$IR/log" && [[ $(tail -1 "$W/assh.log") == "close --config /etc/assh/assh.conf" ]] && [[ ! -e $IR/run/identity/.new ]]
+	}
+	check "identity: the extend of PCR 15 fails: aSSH's ladder closes, the script ends well" t_id_ladder
+	t_id_noclose() { # A FIRST: the extend and the ladder fail with a TPM present
+		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" PCREXT_FAIL=1 STUB_CLOSE_FAIL=1 && return 1
 		grep -q "could not close PCR 15" "$IR/log" && [[ ! -e $IR/run/identity/.new ]]
 	}
-	check "identity: the extend of PCR 15 fails: the script ends with an error, never a warning" t_id_noclose
-	t_id_noclose_none() { rm -rf "$EV"; t_id "" 1 0 "$W/sig-good.json" PCREXT_FAIL=1 && return 1; grep -q "could not close PCR 15" "$IR/log"; }
+	check "identity: the extend and every way of the ladder fail: the script ends with an error, never a warning" t_id_noclose
+	t_id_noclose_none() { rm -rf "$EV"; t_id "" 1 0 "$W/sig-good.json" PCREXT_FAIL=1 STUB_CLOSE_FAIL=1 && return 1; grep -q "could not close PCR 15" "$IR/log"; }
 	check "identity: ... also where no identity was at stake (nothing measured)" t_id_noclose_none
 	# The initrd has no grep (mkosi's Arch initrd): its scripts use sed.
 	check "identity, select: no grep (the initrd has none)" bash -c '! grep -nE "(^|[|;&(]|then|do)[[:space:]]*grep[[:space:]]" "$@"' _ "$ID" "$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/select"
