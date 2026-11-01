@@ -967,7 +967,7 @@ overview before the login, the host key in full with it. The overview is in the 
 colours, on a terminal and on the console: this boot and its host key in the identity's,
 each other line green where it holds, yellow where it waits or is weaker (no identity yet,
 SHA-1, a throwaway machine-id), red where it is missing (`NO_COLOR` switches them off). A client sees the
-slot in the certificate's key ID (`ssh -v`: `ID "safespace slot=0 pcrs=0,2,7,15
+slot in the certificate's key ID (`ssh -v`: `ID "safespace slot=0 pcrs=0,2,7
 signed=11"`). Whatever must rely on the state checks it itself (an unlock the TPM binds).
 
 The CA's file is the EFI variable `SAFEasshCA`, the machine-id's `SAFEmachineID` (nothing
@@ -1274,7 +1274,7 @@ keys is dropped without a word.
 | `RELEASE_TARGETS` | empty: stage only | where `release.sh` pushes without `--push` |
 | `EROFS_WORKERS` | all CPUs | threads for the erofs compression (`--workers` wins) |
 | `SBCTL_CONFIG` | the host's sbctl | a dedicated Secure Boot key set ([Secure Boot keys](#secure-boot-keys)) |
-| `IDENTITY_SLOTS` | `0,2,7,15+11 7,15` | aSSH's slots, in order: the PCRs as at the creation, `+11` PCR 11 signed by the build |
+| `IDENTITY_SLOTS` | `0,2,7+11 7` | aSSH's slots, in order: the PCRs as at the creation, `+11` PCR 11 signed by the build |
 | `MACHINE_ID_PCRS` | `7,15+11` | the machine-id's seal |
 | `KEY_TYPES` | `rsa2048,p256` | the CA's and the host key's types, the first the TPM takes |
 | `PCR_BANK` | `auto` | SHA-256, or SHA-1 where only that is active and allowed |
@@ -1284,8 +1284,9 @@ configured on a machine (the image is signed and read-only): `build.sh` writes
 `/etc/assh/assh.conf` (from `lib/assh.conf.in`) and `/usr/local/lib/safespace/settings`
 (the constants the image's scripts share, and the machine-id's PCRs) into the root and the
 initrd alike, and aSSH checks its file before the build goes on. `build.sh` refuses a policy
-that weakens the identity: every slot and the machine-id need PCR 7 (Secure Boot) and PCR 15
-(the combination, aSSH's window); only PCR 11 can be signed, and the machine-id needs it
+that weakens the identity: every slot and the machine-id need PCR 7 (Secure Boot), the
+machine-id PCR 15 (the combination); no slot takes PCR 15, which the CA's own policy holds
+(its open value, closed by the agent); only PCR 11 can be signed, and the machine-id needs it
 (it unseals only in the build's initrd); PCRs 0 to 22, not 16. `safespace identity` shows the
 policy an image was built with. **A changed policy applies to identities made after it**:
 the machine-id's seal is in its credential and the CA's slots were approved at its creation,

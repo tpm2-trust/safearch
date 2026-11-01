@@ -24,10 +24,12 @@
 #    SetupMode=0) with neither variable, both, or neither: a new machine-id,
 #    sealed, checked (the signed policy type; an empty signature must not
 #    unseal); then 'assh ca create' - an authority that exists for this alone
-#    approves, for the root's state as it will be (PCR 15: the combination, then
-#    "safespace-identity:sealed"), slot 0 (PCR 0, 2, 7, 15; PCR 11 signed by the
-#    build) and slot 1 (PCR 7, 15), and is gone. The machine belongs to the
-#    combination booted. Only 'safespace identity clear' makes room for another.
+#    approves slot 0 (PCR 0, 2, 7; PCR 11 signed by the build) and slot 1 (PCR
+#    7), and is gone. The CA's own policy holds PCR 15 at the root's state as
+#    it will be (--open-events: the combination, then
+#    "safespace-identity:sealed"): it signs in this combination alone, and
+#    from this boot on, until its agent extends PCR 15. The machine belongs to
+#    the combination booted. Only 'safespace identity clear' makes room for another.
 #    One variable without the other: nothing is made (identity clear).
 # 2. Unseal SAFEmachineID into /run/safespace/identity/ (RAM; /run stays across
 #    the switch to the root; "released" lists it) and into /run/machine-id, which
@@ -147,7 +149,7 @@ if [ $have_mid = 0 ] && [ $have_ca = 0 ]; then
 		fi
 		if [ $ok = 1 ]; then
 			"$ASSH" ca create --config $ASSH_CONF \
-				--events "$SAFESPACE_PCR:$SAFESPACE_COMBINATION_EVENT$name" --events "$SAFESPACE_PCR:$SAFESPACE_SEALED_EVENT" >"$OUT/.new/ca.log" 2>&1 ||
+				--open-events "$SAFESPACE_COMBINATION_EVENT$name,$SAFESPACE_SEALED_EVENT" >"$OUT/.new/ca.log" 2>&1 ||
 				{ ok=0; msg "ERROR: creating the CA failed: $(tail -1 "$OUT/.new/ca.log")"; }
 		fi
 		if [ $ok = 1 ]; then

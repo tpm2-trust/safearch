@@ -591,7 +591,7 @@ id_run() {
 # The combinations the identity steps use: the default, and another one.
 id_names() { first=${COMBOS[0]%%:*} other=${COMBOS[1]%%:*}; }
 # The login line of a probe, the certificate's key ID of slot 0 and of slot 1.
-ID_SLOT0=safespace_slot=0_pcrs=0,2,7,15_signed=11 ID_SLOT1=safespace_slot=1_pcrs=7,15
+ID_SLOT0=safespace_slot=0_pcrs=0,2,7_signed=11 ID_SLOT1=safespace_slot=1_pcrs=7
 # The identity step's first part (30-identity): the first sealed boot makes the
 # identity and is certified at once, the next boot too. What it leaves - the TPM,
 # the firmware variables, the client's @cert-authority line, the machine-id - is
@@ -615,7 +615,7 @@ step_identity() {
 	[[ -s $WORK/ca_known_hosts ]] || { result FAIL identity-first "no @cert-authority line from safespace identity"; return; }
 	mid=$(val identity-first machine_id)
 	# 2. The next boot: certified through slot 0, the same machine-id; an agent
-	# restart gets no certificate (the window is closed); no unseal from the root.
+	# restart gets no certificate (the CA is closed: PCR 15 extended); no unseal from the root.
 	id_boot identity-certified "$STICK" || return
 	id_attack "$first" >"$LOGS/identity-certified.attack" 2>&1
 	vm_ssh 'sudo sha256sum </run/assh/agent.pcrs.json; sudo systemctl restart assh-agent; sudo journalctl -b -u assh-agent -o cat | sed -n "/^Starting/,\$p" | tail -n +2; sudo sha256sum </run/assh/agent.pcrs.json' >"$LOGS/identity-restart.log" 2>&1
@@ -624,7 +624,7 @@ step_identity() {
 	cat "$LOGS/identity-certified.attack" >>"$LOGS/identity-certified.probe"
 	expect identity-certified combination="$first" identity=SAFEmachineID identity_created=0 hostkey_src=assh hostcert=yes assh_slot=0 cert_id=$ID_SLOT0 ca_login=yes unsealed=no unsealed_extended=no issue_overview=1 issue_hostkey=yes "${SEALED[@]}"
 	id_check identity-certified "the same machine-id" "[[ '$(val identity-certified machine_id)' == '$mid' ]]"
-	id_check identity-restart "an agent restart in the same boot: temporary (window closed), sshd with it, the first start's state kept" "grep -q 'TEMPORARY' '$LOGS/identity-restart.log' && grep -q 'PCR 15 not as approved' '$LOGS/identity-restart.log' && grep -q 'stays in /run/assh/agent.pcrs.json' '$LOGS/identity-restart.log' && [[ \$(grep -E '^[0-9a-f]{64}' '$LOGS/identity-restart.log' | wc -l) == 2 && \$(grep -E '^[0-9a-f]{64}' '$LOGS/identity-restart.log' | sort -u | wc -l) == 1 ]] && grep -qx ssh_after_restart=yes '$LOGS/identity-restart.probe' && grep -qx restart_ca_login=no '$LOGS/identity-restart.probe'"
+	id_check identity-restart "an agent restart in the same boot: temporary (the CA closed), sshd with it, the first start's state kept" "grep -q 'TEMPORARY' '$LOGS/identity-restart.log' && grep -q 'the CA is closed until the next boot' '$LOGS/identity-restart.log' && grep -q 'stays in /run/assh/agent.pcrs.json' '$LOGS/identity-restart.log' && [[ \$(grep -E '^[0-9a-f]{64}' '$LOGS/identity-restart.log' | wc -l) == 2 && \$(grep -E '^[0-9a-f]{64}' '$LOGS/identity-restart.log' | sort -u | wc -l) == 1 ]] && grep -qx ssh_after_restart=yes '$LOGS/identity-restart.probe' && grep -qx restart_ca_login=no '$LOGS/identity-restart.probe'"
 	echo "$mid" >"$WORK/mid"
 }
 # A further part of the identity step: a copy of what the first part left.
@@ -780,7 +780,7 @@ step_identity_sha1() {
 # boot makes the identity (slot 0 in its own state); safespace update: up to date;
 # then build B into the share: safespace update checks its signature and reboots;
 # the next boot is B's, certified through slot 0, the same CA and machine-id.
-# Another identity policy (build C, tests/vm.policy.conf: one slot 0,7,15+11, ECDSA
+# Another identity policy (build C, tests/vm.policy.conf: one slot 0,7+11, ECDSA
 # P-256 only), on a TPM and a sealed firmware of its own: the identity is made
 # under it - the certificate through that slot, an ECDSA CA and host key - and the
 # image says which policy it was built with.
@@ -794,9 +794,9 @@ step_identity_policy() {
 	vm_ssh 'sudo safespace identity' >"$LOGS/identity-policy.out" 2>&1
 	vm_stop identity-policy
 	expect identity-policy combination=root identity=SAFEmachineID identity_created=1 hostkey_src=assh hostcert=yes assh_slot=0 \
-		cert_id=safespace_slot=0_pcrs=0,7,15_signed=11 after_ca_login=yes "${SEALED[@]}" || return
+		cert_id=safespace_slot=0_pcrs=0,7_signed=11 after_ca_login=yes "${SEALED[@]}" || return
 	id_check identity-policy "ECDSA P-256: the CA and the host key; the image names its policy" \
-		"grep -q '^@cert-authority \\* ecdsa-sha2-nistp256 ' '$WORK/ca_known_hosts' && grep -q 'host key: *ecdsa-sha2-nistp256 ' '$LOGS/identity-policy.out' && grep -q 'policy: *slots 0,7,15+11; machine-id 7,15+11; keys p256; bank auto' '$LOGS/identity-policy.out'"
+		"grep -q '^@cert-authority \\* ecdsa-sha2-nistp256 ' '$WORK/ca_known_hosts' && grep -q 'host key: *ecdsa-sha2-nistp256 ' '$LOGS/identity-policy.out' && grep -q 'policy: *slots 0,7+11; machine-id 7,15+11; keys p256; bank auto' '$LOGS/identity-policy.out'"
 }
 
 step_update() {
