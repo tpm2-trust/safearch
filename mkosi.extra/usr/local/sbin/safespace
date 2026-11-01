@@ -45,9 +45,10 @@
 #   (SAFEmachineID) and aSSH's CA (SAFEasshCA; its private key never leaves the
 #   TPM), bound to the combination booted, under the policy the image was built
 #   with (safespace.conf). By default the CA certifies the host key while the
-#   firmware, Secure Boot and the combination are as at the creation and the UKI is
-#   one the build host signed (slot 0): updates need nothing. Firmware or an option
-#   ROM changed: slot 1 (Secure Boot and the combination). Nothing can approve
+#   firmware, the loaded images, Secure Boot and the combination are as at the
+#   creation and the UKI is one the build host signed (slot 0). Firmware, an option
+#   ROM or the build changed: slot 1 (Secure Boot, the combination, a UKI the build
+#   host signed): updates need nothing, and show purple. Nothing can approve
 #   another state: a new identity is 'identity clear' and a boot, and a new
 #   '@cert-authority' line for the clients.
 #
@@ -336,7 +337,7 @@ identity_show() {
 	fp=$(ssh-keygen -lf - <<<"$key" 2>/dev/null | cut -d' ' -f2) || true
 	case $st in
 		green) row "this boot" $st "host key ${fp:-?}, certified by the CA through slot 0 (firmware as at the creation, a build the build host signed)" ;;
-		purple) row "this boot" $st "host key ${fp:-?}, certified by the CA through slot $(certified_slot): the firmware or an option ROM changed, or the UKI is not the build's - check" ;;
+		purple) row "this boot" $st "host key ${fp:-?}, certified by the CA through slot $(certified_slot): the firmware, an option ROM or the build changed since the identity was made - check" ;;
 		throwaway) row "this boot" $st "host key ${fp:-?}, a throwaway one (no TPM 2.0, or aSSH did not start)" ;;
 		temporary) row "this boot" $st "host key ${fp:-?} TEMPORARY (not certified: compare its fingerprint before trusting it)"
 			row "" $st "(another combination, or Secure Boot changed: not this machine's identity)" ;;
@@ -396,7 +397,7 @@ update_cmd() {
 	[[ ,$combos, == *,"$(booted)",* ]] || die "the release $new has no combination $(booted) (it has $combos): not updating"
 	log "the server ${url%/}/ has $new (this is $cur), signed by the db key; its combinations: $combos"
 	confirm "Reboot into $new?"
-	log "rebooting into $new: the identity follows it (slot 0, the build's signature)"
+	log "rebooting into $new: the identity follows it (slot 1, the build's signature)"
 	systemctl reboot
 }
 

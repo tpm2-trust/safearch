@@ -24,8 +24,8 @@
 #    SetupMode=0) with neither variable, both, or neither: a new machine-id,
 #    sealed, checked (the signed policy type; an empty signature must not
 #    unseal); then 'assh ca create' - an authority that exists for this alone
-#    approves slot 0 (PCR 0, 2, 7; PCR 11 signed by the build) and slot 1 (PCR
-#    7), and is gone. The CA's own policy holds PCR 15 at the root's state as
+#    approves slot 0 (PCR 0, 2, 4, 7; PCR 11 signed by the build) and slot 1
+#    (PCR 7; PCR 11 signed), and is gone. The CA's own policy holds PCR 15 at the root's state as
 #    it will be (--open-events: the combination, then
 #    "safespace-identity:sealed"): it signs in this combination alone, and
 #    from this boot on, until its agent extends PCR 15. The machine belongs to
@@ -66,7 +66,7 @@ OUT=$SELECT_RUN/identity
 MACHINE_ID=${SAFESPACE_MACHINE_ID:-/run/machine-id}
 ETC_MACHINE_ID=${SAFESPACE_ETC_MACHINE_ID:-/etc/machine-id}
 ASSH_CONF=/etc/assh/assh.conf
-# The build's PCR key, whose signatures of PCR 11 the CA's slot 0 takes
+# The build's PCR key, whose signatures of PCR 11 the CA's slots take
 # (assh.conf's ASSH_PCR_KEY: appended to this initrd by lib/compose.sh, beside
 # identity.pem).
 PCR_KEY=${0%/*}/pcr.pem

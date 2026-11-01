@@ -6,8 +6,8 @@
 #
 #   green       certified through slot 0: firmware as at the creation, a build
 #               the build host signed
-#   purple      certified through slot 1: firmware or an option ROM changed, or
-#               the UKI is not the build's - check
+#   purple      certified through slot 1: firmware, an option ROM or the loaded
+#               images changed (a build's update does that) - check
 #   noidentity  sealed, no identity yet (the next boot makes it)
 #   unsealed    Secure Boot off or Setup Mode: no identity
 #   temporary   aSSH's temporary host key: the identity is another

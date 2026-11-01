@@ -76,8 +76,8 @@
 #           (also not after extending PCR 15); another combination once:
 #           temporary key, nothing released; network boot and an option ROM
 #           more (PCR 2): slot 1; another db certificate (PCR 7): temporary;
-#           the stick of a second build (B, built while A boots): slot 0 with no
-#           step, the same CA and machine-id; identity clear: the next boot a
+#           the stick of a second build (B, built while A boots): slot 1 with no
+#           step (PCR 4 moved), the same CA and machine-id; identity clear: the next boot a
 #           new CA (the old line refused) and machine-id; SAFEasshCA damaged,
 #           so the agent fails: sshd up with a throwaway key, the console says
 #           why. Beside them a new TPM with the SHA-1 bank only (as the
@@ -591,7 +591,7 @@ id_run() {
 # The combinations the identity steps use: the default, and another one.
 id_names() { first=${COMBOS[0]%%:*} other=${COMBOS[1]%%:*}; }
 # The login line of a probe, the certificate's key ID of slot 0 and of slot 1.
-ID_SLOT0=safespace_slot=0_pcrs=0,2,7_signed=11 ID_SLOT1=safespace_slot=1_pcrs=7
+ID_SLOT0=safespace_slot=0_pcrs=0,2,4,7_signed=11 ID_SLOT1=safespace_slot=1_pcrs=7_signed=11
 # The identity step's first part (30-identity): the first sealed boot makes the
 # identity and is certified at once, the next boot too. What it leaves - the TPM,
 # the firmware variables, the client's @cert-authority line, the machine-id - is
@@ -689,13 +689,13 @@ step_identity_update() {
 	local first other mid
 	id_names
 	id_branch || return
-	# 7. An update: the stick of build B (another UKI, PCR 11 other) - certified
-	# through slot 0 at once by its own signature, the same CA and machine-id,
-	# nothing done on the machine.
+	# 7. An update: the stick of build B (another UKI: PCR 11 other, and PCR 4) -
+	# certified through slot 1 at once by its own signature, the same CA and
+	# machine-id, nothing done on the machine.
 	[[ -s $STICK_B ]] || { result FAIL identity-update "no stick of the second build (see ${LOGS#"$REPO"/}/build-b.log)"; return; }
 	id_boot identity-update "$STICK_B" || return
 	vm_stop identity-update
-	expect identity-update combination="$first" pretty="safespace_${VERSION_B}_$first" identity=SAFEmachineID identity_created=0 hostcert=yes assh_slot=0 cert_id=$ID_SLOT0 ca_login=yes "${SEALED[@]}"
+	expect identity-update combination="$first" pretty="safespace_${VERSION_B}_$first" identity=SAFEmachineID identity_created=0 hostcert=yes assh_slot=1 cert_id=$ID_SLOT1 ca_login=yes "${SEALED[@]}"
 	id_check identity-update "the same machine-id after the update" "[[ '$(val identity-update machine_id)' == '$mid' ]]"
 }
 step_identity_clear() {
@@ -779,7 +779,7 @@ step_identity_sha1() {
 # share every network boot reads). A new TPM and the sealed variables: the network
 # boot makes the identity (slot 0 in its own state); safespace update: up to date;
 # then build B into the share: safespace update checks its signature and reboots;
-# the next boot is B's, certified through slot 0, the same CA and machine-id.
+# the next boot is B's, certified through slot 1 (PCR 4 moved), the same CA and machine-id.
 # Another identity policy (build C, tests/vm.policy.conf: one slot 0,7+11, ECDSA
 # P-256 only), on a TPM and a sealed firmware of its own: the identity is made
 # under it - the certificate through that slot, an ECDSA CA and host key - and the
@@ -818,7 +818,7 @@ step_update() {
 	expect update-net combination="$first" netroot=1 dhcp=machine pretty="safespace_${VERSION}_$first" identity=SAFEmachineID identity_created=1 hostcert=yes assh_slot=0 after_ca_login=yes "${COMMON[@]}"
 	id_boot update-b --netboot --tree "$RUN/share" --no-server || return
 	vm_stop update-b
-	expect update-b combination="$first" netroot=1 dhcp=machine pretty="safespace_${VERSION_B}_$first" identity=SAFEmachineID identity_created=0 hostcert=yes assh_slot=0 cert_id=$ID_SLOT0 ca_login=yes "${COMMON[@]}"
+	expect update-b combination="$first" netroot=1 dhcp=machine pretty="safespace_${VERSION_B}_$first" identity=SAFEmachineID identity_created=0 hostcert=yes assh_slot=1 cert_id=$ID_SLOT1 ca_login=yes "${COMMON[@]}"
 	id_check update-b "the same machine-id after safespace update" "[[ '$(val update-b machine_id)' == '$mid' ]]"
 }
 

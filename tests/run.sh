@@ -152,7 +152,7 @@ if wanted conf; then
 		[[ -z $2 ]] || printf '%s\n' "$2" >"$CF/extra.conf"
 		(die() { echo "$*"; exit 1; }; source "$REPO/lib/conf.sh"; conf_load "$CF" ${2:+"$CF/extra.conf"} && [[ ${!3} == "$4" ]])
 	}
-	check "conf: the defaults (safespace.conf)" t_conf "" "" IDENTITY_SLOTS "0,2,7+11 7"
+	check "conf: the defaults (safespace.conf)" t_conf "" "" IDENTITY_SLOTS "0,2,4,7+11 7+11"
 	check "conf: the host's safespace.local.conf wins" t_conf "KEY_TYPES=p256" "" KEY_TYPES p256
 	check "conf: --config wins over both" t_conf "KEY_TYPES=p256" "KEY_TYPES=rsa2048" KEY_TYPES rsa2048
 	check "conf: a value in quotes, as it stands" t_conf 'NETROOT_URL="http://a/ http://b/"' "" NETROOT_URL "http://a/ http://b/"
@@ -175,7 +175,7 @@ if wanted conf; then
 		(die() { echo "$*"; exit 1; }; source "$REPO/lib/settings.sh"
 		IDENTITY_SLOTS=$1 MACHINE_ID_PCRS=$2 KEY_TYPES=${3:-rsa2048,p256} PCR_BANK=${4:-auto}; settings_check)
 	}
-	check "policy: the default" t_policy "0,2,7+11 7" 7,15+11
+	check "policy: the default" t_policy "0,2,4,7+11 7+11" 7,15+11
 	check "policy: one slot, other PCRs" t_policy "0,1,7+11" 0,7,15+11
 	refuse "policy: a slot with PCR 15 (the CA's own: its open value, aSSH's close)" t_policy "0,2,7+11 7,15" 7,15+11
 	refuse "policy: a slot with PCR 15 signed" t_policy "0,2,7+11,15" 7,15+11
@@ -196,7 +196,7 @@ if wanted conf; then
 			$SAFESPACE_MID_VAR == SAFEmachineID && $SAFESPACE_MID_CRED == safespace-machine-id &&
 			$SAFESPACE_CA_VAR == SAFEasshCA-24415b90-39be-45c0-a9a3-d547ebe28ea0 && $SAFESPACE_PCR == 15 &&
 			$SAFESPACE_MID_PCRS == 7+15 && $SAFESPACE_MID_SIGNED_PCRS == 11 && $SAFESPACE_EFI_GLOBAL == 8be4df61-93ca-11d2-aa0d-00e098032b8c &&
-			$SAFESPACE_POLICY == "slots 0,2,7+11 7; machine-id 7,15+11; keys rsa2048,p256; bank auto" ]]' _ "$S0"
+			$SAFESPACE_POLICY == "slots 0,2,4,7+11 7+11; machine-id 7,15+11; keys rsa2048,p256; bank auto" ]]' _ "$S0"
 	check "settings: the CA's variable is assh.conf's ASSH_CA" bash -c '. "$1"; grep -qx "ASSH_CA=efi:${SAFESPACE_CA_VAR%%-*}" "$2"' _ "$S0" "$IMG/etc/assh/assh.conf"
 	t_other_policy() {
 		(HERE=$REPO; die() { echo "$*"; exit 1; }; source "$REPO/lib/settings.sh"
@@ -1049,7 +1049,7 @@ if wanted assh && need go; then
 	sed 's/^ASSH_HOSTKEY_TYPE=.*/ASSH_HOSTKEY_TYPE=ed448/' "$C" >"$W/assh-bad.conf"
 	refuse "... and refuses one aSSH does not take (an unknown key type)" bash -c 'die() { echo "$*"; exit 1; }; . "$1/lib/assh.sh"; assh_check_conf "$2" "$3"' _ "$REPO" "$AB" "$W/assh-bad.conf"
 	check "assh.conf: the CA in SAFEasshCA, its authority for the creation alone" bash -c 'grep -qx "ASSH_CA=efi:SAFEasshCA" "$1" && grep -qx "ASSH_AUTHORITY_ONCE=yes" "$1" && ! grep -q "^ASSH_AUTHORITY_TPM=" "$1"' _ "$C"
-	check "assh.conf: slot 0 = 0,2,7 + PCR 11 signed by the build, slot 1 = 7, no window (PCR 15 is the CA's own)" bash -c 'grep -qx "ASSH_CA_SLOT_0=0,2,7" "$1" && grep -qx "ASSH_CA_SLOT_0_SIGNED=11" "$1" && grep -qx "ASSH_CA_SLOT_1=7" "$1" && ! grep -q "^ASSH_CA_WINDOW\|^ASSH_WINDOW" "$1" && grep -qx "ASSH_PCR_SIGNATURE=/run/systemd/tpm2-pcr-signature.json" "$1" && [[ $(grep -c "^ASSH_CA_SLOT_[0-9]*=" "$1") == 2 ]]' _ "$C"
+	check "assh.conf: slot 0 = 0,2,4,7 + PCR 11 signed by the build, slot 1 = 7 + PCR 11 signed, no window (PCR 15 is the CA's own)" bash -c 'grep -qx "ASSH_CA_SLOT_0=0,2,4,7" "$1" && grep -qx "ASSH_CA_SLOT_0_SIGNED=11" "$1" && grep -qx "ASSH_CA_SLOT_1=7" "$1" && grep -qx "ASSH_CA_SLOT_1_SIGNED=11" "$1" && ! grep -q "^ASSH_CA_WINDOW\|^ASSH_WINDOW" "$1" && grep -qx "ASSH_PCR_SIGNATURE=/run/systemd/tpm2-pcr-signature.json" "$1" && [[ $(grep -c "^ASSH_CA_SLOT_[0-9]*=" "$1") == 2 ]]' _ "$C"
 	A=$REPO/mkosi.extra/usr/lib/systemd/system/assh-agent.service
 	check "the agent starts before systemd's PCR 15 units and sysinit (PCR 11 and 15 as the initrd left them)" \
 		bash -c 'grep -q "^Before=.*sysinit.target" "$1" && grep -q "^Before=.*systemd-pcrmachine.service" "$1" && grep -q "^Before=.*systemd-pcrfs-root.service" "$1"' _ "$A"

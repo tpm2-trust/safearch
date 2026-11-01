@@ -932,9 +932,10 @@ CA, once (`safespace` shows the line):
 @cert-authority host.example,192.0.2.10 ssh-rsa AAAA...   # in ~/.ssh/known_hosts
 ```
 
-- **Updates** keep the identity with nothing to do: the CA certifies (slot 0) while the
-  firmware, Secure Boot and the combination are as at the creation and the UKI is one the
-  build host signed - a new build carries its own signature. `sudo safespace update` on a
+- **Updates** keep the identity with nothing to do: the CA certifies (slot 1, purple: slot 0
+  also reads PCR 4, the loader and the UKI as at the creation) while Secure Boot and the
+  combination are as at the creation and the UKI is one the build host signed - a new build
+  carries its own signature. A new identity brings slot 0 back. `sudo safespace update` on a
   network-booted machine checks the server's newer release (signed by the db key) and
   reboots into it.
 - **A firmware update or a new option ROM** leaves slot 0: the CA still certifies through
@@ -1274,7 +1275,7 @@ keys is dropped without a word.
 | `RELEASE_TARGETS` | empty: stage only | where `release.sh` pushes without `--push` |
 | `EROFS_WORKERS` | all CPUs | threads for the erofs compression (`--workers` wins) |
 | `SBCTL_CONFIG` | the host's sbctl | a dedicated Secure Boot key set ([Secure Boot keys](#secure-boot-keys)) |
-| `IDENTITY_SLOTS` | `0,2,7+11 7` | aSSH's slots, in order: the PCRs as at the creation, `+11` PCR 11 signed by the build |
+| `IDENTITY_SLOTS` | `0,2,4,7+11 7+11` | aSSH's slots, in order: the PCRs as at the creation, `+11` PCR 11 signed by the build |
 | `MACHINE_ID_PCRS` | `7,15+11` | the machine-id's seal |
 | `KEY_TYPES` | `rsa2048,p256` | the CA's and the host key's types, the first the TPM takes |
 | `PCR_BANK` | `auto` | SHA-256, or SHA-1 where only that is active and allowed |
