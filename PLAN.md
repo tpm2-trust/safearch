@@ -21,6 +21,28 @@ configuration on the build host (2f20ca7).
 
 ---
 
+# PLAN: PCR 15 hardening and the one PCR rule (feat/close-pcr15)
+
+Status: **done**, `tests/run.sh` passes; `tests/vm.sh` after acknowledgement. The
+workspace's PLAN.md holds the confirmed plan (E1, E6, F1).
+
+## Goal
+
+The extend that closes PCR 15 in the initrd stops the boot when it fails; what runs while the
+CA is open is said; the slots follow the one rule.
+
+## Steps
+
+- [x] E1. `identity`: a failed `sealed` extend with a TPM present ends the unit with an error,
+      `FailureAction=reboot-force` (the owner's decision: no emergency shell with PCR 15 at the
+      combination alone); tests with the mock extend.
+- [x] E6. SECURITY.md: the CA open from `sealed` until the agent's close, accepted; the
+      initrd-certified host key an option.
+- [x] F1. `IDENTITY_SLOTS="0,2,4,7+11 7+11"`; tests; `tests/vm.sh`'s expectations (an update
+      certifies through slot 1); SECURITY.md (PCR 4).
+
+---
+
 # PLAN: aSSH's CA closes by PCR 15 in its own policy (feat/close-pcr15)
 
 Status: **done (2026-11-01)**, `tests/run.sh` 331 passed, 0 failed; `tests/vm.sh` after
