@@ -930,6 +930,13 @@ if wanted compose && fixtures && efivar_tool; then
 		[[ ! -e $EV/SAFEmachineID-$SG && ! -e $EV/$CAV ]] && grep -q "no PCR signing key in the initrd" "$IR/log"
 	}
 	check "identity: no pcr.pem in the initrd: nothing made" t_id_nokey
+	t_id_noclose() { # A FIRST: the extend fails with a TPM present
+		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" PCREXT_FAIL=1 && return 1
+		grep -q "could not close PCR 15" "$IR/log" && [[ ! -e $IR/run/identity/.new ]]
+	}
+	check "identity: the extend of PCR 15 fails: the script ends with an error, never a warning" t_id_noclose
+	t_id_noclose_none() { rm -rf "$EV"; t_id "" 1 0 "$W/sig-good.json" PCREXT_FAIL=1 && return 1; grep -q "could not close PCR 15" "$IR/log"; }
+	check "identity: ... also where no identity was at stake (nothing measured)" t_id_noclose_none
 	# The initrd has no grep (mkosi's Arch initrd): its scripts use sed.
 	check "identity, select: no grep (the initrd has none)" bash -c '! grep -nE "(^|[|;&(]|then|do)[[:space:]]*grep[[:space:]]" "$@"' _ "$ID" "$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/select"
 	check "identity: every sealing uses tpm2-with-public-key" bash -c '! grep -nE "(creds|CREDS\"?) encrypt" "$1" | grep -v "with-key=tpm2-with-public-key"' _ "$ID"
@@ -1076,6 +1083,7 @@ if wanted units && need systemd-analyze; then
 	check "initrd: both paths are enabled" test -L "$I/initrd.target.wants/usb-bootdev.service" -a -L "$I/initrd.target.wants/netroot.service"
 	check "initrd: both paths require the combination chosen before (safespace-select.service)" bash -c 'for f in usb-bootdev netroot; do grep -q "^Requires=.*safespace-select.service" "$1/$f.service" && grep -q "^After=.*safespace-select.service" "$1/$f.service" || exit 1; done' _ "$I"
 	check "initrd: the identity after the choice, before the network (network-pre.target), not after a boot path" bash -c 'f=$1/safespace-identity.service; grep -qx "Before=network-pre.target" "$f" && grep -qx "Wants=network-pre.target" "$f" && grep -q "^After=safespace-select.service" "$f" && ! grep -qE "^After=.*(netroot|usb-bootdev)" "$f"' _ "$I"
+	check "initrd: the identity's failure (PCR 15 not closed) stops the boot" bash -c 'f=$1/safespace-identity.service; grep -qx "OnFailure=emergency.target" "$f" && grep -qx "OnFailureJobMode=replace-irreversibly" "$f"' _ "$I"
 	check "initrd: netroot after the identity (DHCP as the machine)" grep -q "^After=.*safespace-identity.service" "$I/netroot.service"
 	check "initrd: both paths mount the stack before the root counts as there (initrd-root-fs.target, systemd-volatile-root)" bash -c 'for f in usb-bootdev netroot; do grep -q "^Before=.*initrd-root-fs.target.*systemd-volatile-root.service" "$1/$f.service" || exit 1; done' _ "$I"
 	check "initrd: without the stack mounted, the boot stops (no switch into an empty /sysroot)" bash -c 'grep -qx "AssertPathIsMountPoint=/sysroot" "$1/initrd-root-fs.target.d/10-safespace.conf"' _ "$I"

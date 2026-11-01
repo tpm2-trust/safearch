@@ -148,7 +148,8 @@ sequenceDiagram
 | **The released machine-id lives in RAM only**: `/run/safespace/identity/` (0700 root) and `/run/machine-id` (PID 1 takes it over) | the secret on any medium | `identity` |
 | **Updates are checked before the reboot**: `safespace update` (network-booted machines) fetches `release` and `release.p7s` from the server on the signed command line and checks the signature against the image's `db.pem` (the db key signs it at the build: `build.sh`), wants a newer version that has the booted combination, then reboots; the firmware checks the new UKI anyway, the agent the build's signature of PCR 11 | rebooting into whatever a server offers | `safespace`, `build.sh`, `lib/verify.sh` |
 | **SHA-1 only where the owner allows it**: on a TPM whose firmware activates no SHA-256 PCR bank (ThinkPad T450s) the machine-id and the host key are bound to SHA-1 values only while `safespace tpm sha1 on` has set aSSH's NV index `0x01802914` - read at every boot by aSSH, for the initrd (`assh tpm sha1`: "bank auto") and the agent (`ASSH_CA_BANK=auto`) alike, its exact shape checked; off, neither is released or certified. Where SHA-256 is active it changes nothing (see [The SHA-1 bank](#the-sha-1-bank)) | binding the identity to the weaker hash without the owner's decision | `identity`, `assh.conf`, `safespace` |
-| **The boot never depends on the TPM**: no TPM, no identity, no signature, any error → no identity (temporary or throwaway key, throwaway machine-id), the boot goes on | a TPM fault making the machine unusable | `identity`, `assh-agent.service`, `sshd-hostkeys.service` |
+| **The boot does not depend on the identity**: no TPM, no identity, no signature, any error in making or releasing it → no identity (temporary or throwaway key, throwaway machine-id), the boot goes on | a TPM fault making the machine unusable | `identity`, `assh-agent.service`, `sshd-hostkeys.service` |
+| **It depends on the close of PCR 15**: `safespace-identity:sealed` is extended on every way out of `identity`; an extend that fails with a TPM present ends the unit with an error and the boot stops in the emergency target (`OnFailure=`, irreversibly: no network, no root). Without a TPM (`--graceful`) there is nothing to close | a root process unsealing the machine-id in a boot whose PCR 15 still holds the combination alone | `identity`, `safespace-identity.service` |
 
 **What root of the identity's combination can do** (the same in every design): use the host
 key until the next reboot, on this machine only (the agent answers root); delete the identity
@@ -341,6 +342,16 @@ none.
   machine's identity ([Machine identity](#machine-identity)).
 - **An old signed build of the assigned combination still releases the identity** (same
   identity key); rotating the identity key ends that, and requires `--assign` again.
+- **The CA is open from `safespace-identity:sealed` in the initrd until the agent's close in
+  the root.** PCR 15 holds the CA's open value over the switch root, and the agent
+  (`assh-agent.service`) closes it right after the host key is made, before `sysinit.target`.
+  What runs in between is the signed image alone: the initrd's units after the identity, the
+  network of the initrd and the boot path (netroot, usb-bootdev), then the root's early units
+  (udev, tmpfiles, journald, usbguard). None of them takes input it acts on as root beyond
+  what the image's own code parses (DHCP, the verified layers, device events); an exploit
+  there could ask the CA for a certificate of its own key. Accepted. The stronger variant,
+  not done: the host key certified in the initrd, right after `sealed`, and handed over in
+  `/run`, so that the CA is closed before the network and the root.
 - **Root in the assigned combination** has the keys it runs with; the identity protects
   against other combinations, not against that root.
 

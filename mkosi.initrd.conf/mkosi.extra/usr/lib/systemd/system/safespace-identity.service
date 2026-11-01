@@ -4,8 +4,9 @@
 # enter-initrd (systemd-pcrphase-initrd measures leave-initrd when it stops,
 # after this); before the network (network-pre.target: systemd-networkd, netroot),
 # so the initrd's DHCP asks with the machine's machine-id, as the running system
-# does. Nothing of it comes from the network. Never blocks the boot: without a
-# TPM or an identity it only logs.
+# does. Nothing of it comes from the network. Without a TPM or an identity it only
+# logs; it fails only when the extend that closes PCR 15 fails, and then the boot
+# stops here: no network, no root, with the machine-id open to unseal.
 [Unit]
 Description=Make or release the machine's identity (its combination only)
 DefaultDependencies=no
@@ -14,6 +15,8 @@ Wants=network-pre.target
 Before=network-pre.target
 Before=initrd.target initrd-switch-root.target
 Conflicts=shutdown.target
+OnFailure=emergency.target
+OnFailureJobMode=replace-irreversibly
 
 [Service]
 Type=oneshot
