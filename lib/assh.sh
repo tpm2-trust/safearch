@@ -14,7 +14,9 @@
 
 assh_build() { # OUT
 	local out=$1 src=$HERE/assh cache=${SAFESPACE_GOCACHE:-$HERE/mkosi.cache/go}
-	[[ -f $src/go.mod ]] || die "assh/ is empty: git submodule update --init assh"
+	[[ -f $src/go.mod ]] || die "assh/ is empty: git submodule update --init --recursive assh"
+	# aSSH's own submodule, the go-uefi-slim module (EFI variables).
+	[[ -f $src/go-uefi-slim/go.mod ]] || die "assh/go-uefi-slim/ is empty: git submodule update --init --recursive assh"
 	command -v go >/dev/null || die "go not found (pacman -S go): aSSH is built on the build host"
 	mkdir -p "$cache" "$(dirname "$out")"
 	# GOWORK=off: the submodule's commit, never a go.work around this checkout.

@@ -21,6 +21,65 @@ configuration on the build host (2f20ca7).
 
 ---
 
+# PLAN: PCR 15 hardening and the one PCR rule (feat/close-pcr15)
+
+Status: **done**, `tests/run.sh` passes; `tests/vm.sh` after acknowledgement. The
+workspace's PLAN.md holds the confirmed plan (E1, E6, F1).
+
+## Goal
+
+The extend that closes PCR 15 in the initrd stops the boot when it fails; what runs while the
+CA is open is said; the slots follow the one rule.
+
+## Steps
+
+- [x] E1. `identity`: a failed `sealed` extend with a TPM present ends the unit with an error,
+      `FailureAction=reboot-force` (the owner's decision: no emergency shell with PCR 15 at the
+      combination alone); tests with the mock extend.
+- [x] E2. `identity`: a failed `sealed` extend runs `assh close` (aSSH's ladder) first; the
+      reboot only if all of it fails. `tests/run.sh` covers both with stubs; `tests/vm.sh` forces
+      no failed extend, so neither way has run on a VM.
+- [x] E6. SECURITY.md: the CA open from `sealed` until the agent's close, accepted; the
+      initrd-certified host key an option.
+- [x] F1. `IDENTITY_SLOTS="0,2,4,7+11 7+11"`; tests; `tests/vm.sh`'s expectations (an update
+      certifies through slot 1); SECURITY.md (PCR 4).
+
+---
+
+# PLAN: aSSH's CA closes by PCR 15 in its own policy (feat/close-pcr15)
+
+Status: **done (2026-11-01)**, `tests/run.sh` 331 passed, 0 failed; `tests/vm.sh` after
+acknowledgement. Replaces the plan "aSSH at 93d79df" (the window index W), which aSSH
+dropped (the workspace's PLAN.md: three closes tried, PCR 15 chosen).
+
+## Goal
+
+The CA's own policy holds PCR 15 at its open value - the combination as the root sees it -
+and the agent's extend ("assh-close") closes it. No window index, no `ASSH_CA_WINDOW`.
+
+## Steps
+
+- [x] 1. `assh/` at aSSH 6fd55d5 (the close in the CA's policy, the TPM open wait).
+- [x] 2. `safespace.conf`: `IDENTITY_SLOTS="0,2,7+11 7"` - no slot reads PCR 15.
+- [x] 3. `lib/settings.sh`: a slot with PCR 15 is refused (the CA's own), the machine-id's
+       seal still needs it; `lib/assh.conf.in` without `ASSH_CA_WINDOW`.
+- [x] 4. `identity`: `ca create --open-events "safespace-combination:<name>,safespace-identity:sealed"`
+       (the CA open in the creating boot, per combination) instead of `--events 15:...`.
+- [x] 5. `assh-agent.service`: `ConditionSecurity=tpm2` instead of the device node (the
+       agent waits for a node that comes late, and closes once it is there),
+       `ExecStopPost=assh close`.
+- [x] 6. SECURITY.md, README, `tests/run.sh`, `tests/vm.sh` (slot IDs, the restart message,
+       `tests/vm.policy.conf`).
+- [ ] 7. `tests/vm.sh` (after acknowledgement).
+
+## What breaks
+
+An identity made before is not certified any more: its CA's policy has no PCR 15 and its
+slots read it - `safespace identity clear`, and the next boot makes it again (new
+`@cert-authority` line for the clients). Images are rebuilt.
+
+---
+
 # PLAN: each layer built once - the roots as verified layers, stacked by the initrd
 
 Status: **confirmed 2026-10-27** (the user: "write it. clean up old caches / produced builds

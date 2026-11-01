@@ -152,7 +152,7 @@ if wanted conf; then
 		[[ -z $2 ]] || printf '%s\n' "$2" >"$CF/extra.conf"
 		(die() { echo "$*"; exit 1; }; source "$REPO/lib/conf.sh"; conf_load "$CF" ${2:+"$CF/extra.conf"} && [[ ${!3} == "$4" ]])
 	}
-	check "conf: the defaults (safespace.conf)" t_conf "" "" IDENTITY_SLOTS "0,2,7,15+11 7,15"
+	check "conf: the defaults (safespace.conf)" t_conf "" "" IDENTITY_SLOTS "0,2,4,7+11 7+11"
 	check "conf: the host's safespace.local.conf wins" t_conf "KEY_TYPES=p256" "" KEY_TYPES p256
 	check "conf: --config wins over both" t_conf "KEY_TYPES=p256" "KEY_TYPES=rsa2048" KEY_TYPES rsa2048
 	check "conf: a value in quotes, as it stands" t_conf 'NETROOT_URL="http://a/ http://b/"' "" NETROOT_URL "http://a/ http://b/"
@@ -175,19 +175,20 @@ if wanted conf; then
 		(die() { echo "$*"; exit 1; }; source "$REPO/lib/settings.sh"
 		IDENTITY_SLOTS=$1 MACHINE_ID_PCRS=$2 KEY_TYPES=${3:-rsa2048,p256} PCR_BANK=${4:-auto}; settings_check)
 	}
-	check "policy: the default" t_policy "0,2,7,15+11 7,15" 7,15+11
-	check "policy: one slot, other PCRs" t_policy "0,1,7,15+11" 0,7,15+11
-	refuse "policy: a slot without PCR 15 (the combination, the window)" t_policy "0,2,7+11 7,15" 7,15+11
-	refuse "policy: a slot without PCR 7 (Secure Boot)" t_policy "0,2,7,15+11 2,15" 7,15+11
-	refuse "policy: the machine-id without PCR 15" t_policy "7,15" 7+11
-	refuse "policy: the machine-id without PCR 7" t_policy "7,15" 15+11
-	refuse "policy: the machine-id without PCR 11 signed (it would unseal in a root)" t_policy "7,15" 7,15
-	refuse "policy: a signed PCR other than 11" t_policy "7,15+4" 7,15+11
-	refuse "policy: PCR 16 (any process resets it)" t_policy "7,15,16" 7,15+11
-	refuse "policy: PCR 23" t_policy "7,15,23" 7,15+11
-	refuse "policy: a PCR twice" t_policy "7,15,7" 7,15+11
+	check "policy: the default" t_policy "0,2,4,7+11 7+11" 7,15+11
+	check "policy: one slot, other PCRs" t_policy "0,1,7+11" 0,7,15+11
+	refuse "policy: a slot with PCR 15 (the CA's own: its open value, aSSH's close)" t_policy "0,2,7+11 7,15" 7,15+11
+	refuse "policy: a slot with PCR 15 signed" t_policy "0,2,7+11,15" 7,15+11
+	refuse "policy: a slot without PCR 7 (Secure Boot)" t_policy "0,2,7+11 2" 7,15+11
+	refuse "policy: the machine-id without PCR 15" t_policy "7" 7+11
+	refuse "policy: the machine-id without PCR 7" t_policy "7" 15+11
+	refuse "policy: the machine-id without PCR 11 signed (it would unseal in a root)" t_policy "7" 7,15
+	refuse "policy: a signed PCR other than 11" t_policy "7+4" 7,15+11
+	refuse "policy: PCR 16 (any process resets it)" t_policy "7,16" 7,15+11
+	refuse "policy: PCR 23" t_policy "7,23" 7,15+11
+	refuse "policy: a PCR twice" t_policy "7,2,7" 7,15+11
 	refuse "policy: no slot" t_policy "" 7,15+11
-	refuse "policy: a slot that is no PCR list" t_policy "7,15;x" 7,15+11
+	refuse "policy: a slot that is no PCR list" t_policy "7;x" 7,15+11
 	refuse "policy: an unknown bank" t_policy "7,15" 7,15+11 rsa2048 sha384
 	S0=$IMG/usr/local/lib/safespace/settings
 	check "settings: every constant the image's scripts share, and the policy" bash -c '. "$1"
@@ -195,13 +196,13 @@ if wanted conf; then
 			$SAFESPACE_MID_VAR == SAFEmachineID && $SAFESPACE_MID_CRED == safespace-machine-id &&
 			$SAFESPACE_CA_VAR == SAFEasshCA-24415b90-39be-45c0-a9a3-d547ebe28ea0 && $SAFESPACE_PCR == 15 &&
 			$SAFESPACE_MID_PCRS == 7+15 && $SAFESPACE_MID_SIGNED_PCRS == 11 && $SAFESPACE_EFI_GLOBAL == 8be4df61-93ca-11d2-aa0d-00e098032b8c &&
-			$SAFESPACE_POLICY == "slots 0,2,7,15+11 7,15; machine-id 7,15+11; keys rsa2048,p256; bank auto" ]]' _ "$S0"
+			$SAFESPACE_POLICY == "slots 0,2,4,7+11 7+11; machine-id 7,15+11; keys rsa2048,p256; bank auto" ]]' _ "$S0"
 	check "settings: the CA's variable is assh.conf's ASSH_CA" bash -c '. "$1"; grep -qx "ASSH_CA=efi:${SAFESPACE_CA_VAR%%-*}" "$2"' _ "$S0" "$IMG/etc/assh/assh.conf"
 	t_other_policy() {
 		(HERE=$REPO; die() { echo "$*"; exit 1; }; source "$REPO/lib/settings.sh"
-		IDENTITY_SLOTS="0,7,15+11" MACHINE_ID_PCRS="0,7,15+11" KEY_TYPES=p256 PCR_BANK=sha256; settings_write "$W/image2") &&
+		IDENTITY_SLOTS="0,7+11" MACHINE_ID_PCRS="0,7,15+11" KEY_TYPES=p256 PCR_BANK=sha256; settings_write "$W/image2") &&
 		C2=$W/image2/etc/assh/assh.conf &&
-		[[ $(grep "^ASSH_CA_SLOT_\|^ASSH_CA_TYPE\|^ASSH_HOSTKEY_TYPE\|^ASSH_CA_BANK" "$C2" | tr "\n" " ") == "ASSH_CA_BANK=sha256 ASSH_CA_SLOT_0=0,7,15 ASSH_CA_SLOT_0_SIGNED=11 ASSH_CA_TYPE=p256 ASSH_HOSTKEY_TYPE=p256 " ]] &&
+		[[ $(grep "^ASSH_CA_SLOT_\|^ASSH_CA_TYPE\|^ASSH_HOSTKEY_TYPE\|^ASSH_CA_BANK" "$C2" | tr "\n" " ") == "ASSH_CA_BANK=sha256 ASSH_CA_SLOT_0=0,7 ASSH_CA_SLOT_0_SIGNED=11 ASSH_CA_TYPE=p256 ASSH_HOSTKEY_TYPE=p256 " ]] &&
 		(. "$W/image2/usr/local/lib/safespace/settings"; [[ $SAFESPACE_MID_PCRS == 0+7+15 && $SAFESPACE_MID_SIGNED_PCRS == 11 ]])
 	}
 	check "settings: another policy reaches assh.conf (slots, key types, bank) and the machine-id's seal" t_other_policy
@@ -823,6 +824,7 @@ if wanted compose && fixtures && efivar_tool; then
 		case "\$1 \$2" in
 			"ca create") [[ -z \$STUB_ASSH_FAIL ]] || { echo "the TPM said no" >&2; exit 1; }; printf '\x07\x00\x00\x00{"ca":1}' >"\$v" ;;
 			"ca remove") rm -f "\$v" ;;
+			"close --config") [[ -z \$STUB_CLOSE_FAIL ]] || { echo "the TPM refused every way" >&2; exit 1; } ;;
 		esac
 	STUB
 	chmod +x "$W/assh-stub"
@@ -848,7 +850,7 @@ if wanted compose && fixtures && efivar_tool; then
 	t_id_first() {
 		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" &&
 			[[ -e $EV/SAFEmachineID-$SG && -e $EV/$CAV ]] &&
-			[[ $(cat "$W/assh.log") == "ca create --config /etc/assh/assh.conf --events 15:safespace-combination:containers --events 15:safespace-identity:sealed" ]] &&
+			[[ $(cat "$W/assh.log") == "ca create --config /etc/assh/assh.conf --open-events safespace-combination:containers,safespace-identity:sealed" ]] &&
 			[[ -s $IR/machine-id ]] && cmp -s "$IR/machine-id" "$IR/run/identity/machine-id" &&
 			[[ $(cat "$IR/run/identity/released") == SAFEmachineID ]] &&
 			[[ $(tail -1 "$W/pcrextend.log") == "--graceful --pcr=15 safespace-identity:sealed" ]]
@@ -929,6 +931,18 @@ if wanted compose && fixtures && efivar_tool; then
 		[[ ! -e $EV/SAFEmachineID-$SG && ! -e $EV/$CAV ]] && grep -q "no PCR signing key in the initrd" "$IR/log"
 	}
 	check "identity: no pcr.pem in the initrd: nothing made" t_id_nokey
+	t_id_ladder() { # the extend fails with a TPM present: aSSH's ladder holds, the boot goes on
+		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" PCREXT_FAIL=1 || return 1
+		grep -q "aSSH's close" "$IR/log" && [[ $(tail -1 "$W/assh.log") == "close --config /etc/assh/assh.conf" ]] && [[ ! -e $IR/run/identity/.new ]]
+	}
+	check "identity: the extend of PCR 15 fails: aSSH's ladder closes, the script ends well" t_id_ladder
+	t_id_noclose() { # A FIRST: the extend and the ladder fail with a TPM present
+		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" PCREXT_FAIL=1 STUB_CLOSE_FAIL=1 && return 1
+		grep -q "could not close PCR 15" "$IR/log" && [[ ! -e $IR/run/identity/.new ]]
+	}
+	check "identity: the extend and every way of the ladder fail: the script ends with an error, never a warning" t_id_noclose
+	t_id_noclose_none() { rm -rf "$EV"; t_id "" 1 0 "$W/sig-good.json" PCREXT_FAIL=1 STUB_CLOSE_FAIL=1 && return 1; grep -q "could not close PCR 15" "$IR/log"; }
+	check "identity: ... also where no identity was at stake (nothing measured)" t_id_noclose_none
 	# The initrd has no grep (mkosi's Arch initrd): its scripts use sed.
 	check "identity, select: no grep (the initrd has none)" bash -c '! grep -nE "(^|[|;&(]|then|do)[[:space:]]*grep[[:space:]]" "$@"' _ "$ID" "$REPO/mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/select"
 	check "identity: every sealing uses tpm2-with-public-key" bash -c '! grep -nE "(creds|CREDS\"?) encrypt" "$1" | grep -v "with-key=tpm2-with-public-key"' _ "$ID"
@@ -1041,7 +1055,7 @@ if wanted assh && need go; then
 	sed 's/^ASSH_HOSTKEY_TYPE=.*/ASSH_HOSTKEY_TYPE=ed448/' "$C" >"$W/assh-bad.conf"
 	refuse "... and refuses one aSSH does not take (an unknown key type)" bash -c 'die() { echo "$*"; exit 1; }; . "$1/lib/assh.sh"; assh_check_conf "$2" "$3"' _ "$REPO" "$AB" "$W/assh-bad.conf"
 	check "assh.conf: the CA in SAFEasshCA, its authority for the creation alone" bash -c 'grep -qx "ASSH_CA=efi:SAFEasshCA" "$1" && grep -qx "ASSH_AUTHORITY_ONCE=yes" "$1" && ! grep -q "^ASSH_AUTHORITY_TPM=" "$1"' _ "$C"
-	check "assh.conf: slot 0 = 0,2,7,15 + PCR 11 signed by the build, slot 1 = 7,15, window 15" bash -c 'grep -qx "ASSH_CA_SLOT_0=0,2,7,15" "$1" && grep -qx "ASSH_CA_SLOT_0_SIGNED=11" "$1" && grep -qx "ASSH_CA_SLOT_1=7,15" "$1" && grep -qx "ASSH_CA_WINDOW=15" "$1" && grep -qx "ASSH_PCR_SIGNATURE=/run/systemd/tpm2-pcr-signature.json" "$1" && [[ $(grep -c "^ASSH_CA_SLOT_[0-9]*=" "$1") == 2 ]]' _ "$C"
+	check "assh.conf: slot 0 = 0,2,4,7 + PCR 11 signed by the build, slot 1 = 7 + PCR 11 signed, no window (PCR 15 is the CA's own)" bash -c 'grep -qx "ASSH_CA_SLOT_0=0,2,4,7" "$1" && grep -qx "ASSH_CA_SLOT_0_SIGNED=11" "$1" && grep -qx "ASSH_CA_SLOT_1=7" "$1" && grep -qx "ASSH_CA_SLOT_1_SIGNED=11" "$1" && ! grep -q "^ASSH_CA_WINDOW\|^ASSH_WINDOW" "$1" && grep -qx "ASSH_PCR_SIGNATURE=/run/systemd/tpm2-pcr-signature.json" "$1" && [[ $(grep -c "^ASSH_CA_SLOT_[0-9]*=" "$1") == 2 ]]' _ "$C"
 	A=$REPO/mkosi.extra/usr/lib/systemd/system/assh-agent.service
 	check "the agent starts before systemd's PCR 15 units and sysinit (PCR 11 and 15 as the initrd left them)" \
 		bash -c 'grep -q "^Before=.*sysinit.target" "$1" && grep -q "^Before=.*systemd-pcrmachine.service" "$1" && grep -q "^Before=.*systemd-pcrfs-root.service" "$1"' _ "$A"
@@ -1075,6 +1089,7 @@ if wanted units && need systemd-analyze; then
 	check "initrd: both paths are enabled" test -L "$I/initrd.target.wants/usb-bootdev.service" -a -L "$I/initrd.target.wants/netroot.service"
 	check "initrd: both paths require the combination chosen before (safespace-select.service)" bash -c 'for f in usb-bootdev netroot; do grep -q "^Requires=.*safespace-select.service" "$1/$f.service" && grep -q "^After=.*safespace-select.service" "$1/$f.service" || exit 1; done' _ "$I"
 	check "initrd: the identity after the choice, before the network (network-pre.target), not after a boot path" bash -c 'f=$1/safespace-identity.service; grep -qx "Before=network-pre.target" "$f" && grep -qx "Wants=network-pre.target" "$f" && grep -q "^After=safespace-select.service" "$f" && ! grep -qE "^After=.*(netroot|usb-bootdev)" "$f"' _ "$I"
+	check "initrd: the identity's failure (PCR 15 not closed) reboots, no shell" bash -c 'f=$1/safespace-identity.service; grep -qx "FailureAction=reboot-force" "$f" && ! grep -q "^OnFailure=" "$f"' _ "$I"
 	check "initrd: netroot after the identity (DHCP as the machine)" grep -q "^After=.*safespace-identity.service" "$I/netroot.service"
 	check "initrd: both paths mount the stack before the root counts as there (initrd-root-fs.target, systemd-volatile-root)" bash -c 'for f in usb-bootdev netroot; do grep -q "^Before=.*initrd-root-fs.target.*systemd-volatile-root.service" "$1/$f.service" || exit 1; done' _ "$I"
 	check "initrd: without the stack mounted, the boot stops (no switch into an empty /sysroot)" bash -c 'grep -qx "AssertPathIsMountPoint=/sysroot" "$1/initrd-root-fs.target.d/10-safespace.conf"' _ "$I"

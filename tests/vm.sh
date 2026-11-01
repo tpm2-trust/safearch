@@ -76,8 +76,8 @@
 #           (also not after extending PCR 15); another combination once:
 #           temporary key, nothing released; network boot and an option ROM
 #           more (PCR 2): slot 1; another db certificate (PCR 7): temporary;
-#           the stick of a second build (B, built while A boots): slot 0 with no
-#           step, the same CA and machine-id; identity clear: the next boot a
+#           the stick of a second build (B, built while A boots): slot 1 with no
+#           step (PCR 4 moved), the same CA and machine-id; identity clear: the next boot a
 #           new CA (the old line refused) and machine-id; SAFEasshCA damaged,
 #           so the agent fails: sshd up with a throwaway key, the console says
 #           why. Beside them a new TPM with the SHA-1 bank only (as the
@@ -591,7 +591,7 @@ id_run() {
 # The combinations the identity steps use: the default, and another one.
 id_names() { first=${COMBOS[0]%%:*} other=${COMBOS[1]%%:*}; }
 # The login line of a probe, the certificate's key ID of slot 0 and of slot 1.
-ID_SLOT0=safespace_slot=0_pcrs=0,2,7,15_signed=11 ID_SLOT1=safespace_slot=1_pcrs=7,15
+ID_SLOT0=safespace_slot=0_pcrs=0,2,4,7_signed=11 ID_SLOT1=safespace_slot=1_pcrs=7_signed=11
 # The identity step's first part (30-identity): the first sealed boot makes the
 # identity and is certified at once, the next boot too. What it leaves - the TPM,
 # the firmware variables, the client's @cert-authority line, the machine-id - is
@@ -615,7 +615,7 @@ step_identity() {
 	[[ -s $WORK/ca_known_hosts ]] || { result FAIL identity-first "no @cert-authority line from safespace identity"; return; }
 	mid=$(val identity-first machine_id)
 	# 2. The next boot: certified through slot 0, the same machine-id; an agent
-	# restart gets no certificate (the window is closed); no unseal from the root.
+	# restart gets no certificate (the CA is closed: PCR 15 extended); no unseal from the root.
 	id_boot identity-certified "$STICK" || return
 	id_attack "$first" >"$LOGS/identity-certified.attack" 2>&1
 	vm_ssh 'sudo sha256sum </run/assh/agent.pcrs.json; sudo systemctl restart assh-agent; sudo journalctl -b -u assh-agent -o cat | sed -n "/^Starting/,\$p" | tail -n +2; sudo sha256sum </run/assh/agent.pcrs.json' >"$LOGS/identity-restart.log" 2>&1
@@ -624,7 +624,7 @@ step_identity() {
 	cat "$LOGS/identity-certified.attack" >>"$LOGS/identity-certified.probe"
 	expect identity-certified combination="$first" identity=SAFEmachineID identity_created=0 hostkey_src=assh hostcert=yes assh_slot=0 cert_id=$ID_SLOT0 ca_login=yes unsealed=no unsealed_extended=no issue_overview=1 issue_hostkey=yes "${SEALED[@]}"
 	id_check identity-certified "the same machine-id" "[[ '$(val identity-certified machine_id)' == '$mid' ]]"
-	id_check identity-restart "an agent restart in the same boot: temporary (window closed), sshd with it, the first start's state kept" "grep -q 'TEMPORARY' '$LOGS/identity-restart.log' && grep -q 'PCR 15 not as approved' '$LOGS/identity-restart.log' && grep -q 'stays in /run/assh/agent.pcrs.json' '$LOGS/identity-restart.log' && [[ \$(grep -E '^[0-9a-f]{64}' '$LOGS/identity-restart.log' | wc -l) == 2 && \$(grep -E '^[0-9a-f]{64}' '$LOGS/identity-restart.log' | sort -u | wc -l) == 1 ]] && grep -qx ssh_after_restart=yes '$LOGS/identity-restart.probe' && grep -qx restart_ca_login=no '$LOGS/identity-restart.probe'"
+	id_check identity-restart "an agent restart in the same boot: temporary (the CA closed), sshd with it, the first start's state kept" "grep -q 'TEMPORARY' '$LOGS/identity-restart.log' && grep -q 'the CA is closed until the next boot' '$LOGS/identity-restart.log' && grep -q 'stays in /run/assh/agent.pcrs.json' '$LOGS/identity-restart.log' && [[ \$(grep -E '^[0-9a-f]{64}' '$LOGS/identity-restart.log' | wc -l) == 2 && \$(grep -E '^[0-9a-f]{64}' '$LOGS/identity-restart.log' | sort -u | wc -l) == 1 ]] && grep -qx ssh_after_restart=yes '$LOGS/identity-restart.probe' && grep -qx restart_ca_login=no '$LOGS/identity-restart.probe'"
 	echo "$mid" >"$WORK/mid"
 }
 # A further part of the identity step: a copy of what the first part left.
@@ -689,13 +689,13 @@ step_identity_update() {
 	local first other mid
 	id_names
 	id_branch || return
-	# 7. An update: the stick of build B (another UKI, PCR 11 other) - certified
-	# through slot 0 at once by its own signature, the same CA and machine-id,
-	# nothing done on the machine.
+	# 7. An update: the stick of build B (another UKI: PCR 11 other, and PCR 4) -
+	# certified through slot 1 at once by its own signature, the same CA and
+	# machine-id, nothing done on the machine.
 	[[ -s $STICK_B ]] || { result FAIL identity-update "no stick of the second build (see ${LOGS#"$REPO"/}/build-b.log)"; return; }
 	id_boot identity-update "$STICK_B" || return
 	vm_stop identity-update
-	expect identity-update combination="$first" pretty="safespace_${VERSION_B}_$first" identity=SAFEmachineID identity_created=0 hostcert=yes assh_slot=0 cert_id=$ID_SLOT0 ca_login=yes "${SEALED[@]}"
+	expect identity-update combination="$first" pretty="safespace_${VERSION_B}_$first" identity=SAFEmachineID identity_created=0 hostcert=yes assh_slot=1 cert_id=$ID_SLOT1 ca_login=yes "${SEALED[@]}"
 	id_check identity-update "the same machine-id after the update" "[[ '$(val identity-update machine_id)' == '$mid' ]]"
 }
 step_identity_clear() {
@@ -779,8 +779,8 @@ step_identity_sha1() {
 # share every network boot reads). A new TPM and the sealed variables: the network
 # boot makes the identity (slot 0 in its own state); safespace update: up to date;
 # then build B into the share: safespace update checks its signature and reboots;
-# the next boot is B's, certified through slot 0, the same CA and machine-id.
-# Another identity policy (build C, tests/vm.policy.conf: one slot 0,7,15+11, ECDSA
+# the next boot is B's, certified through slot 1 (PCR 4 moved), the same CA and machine-id.
+# Another identity policy (build C, tests/vm.policy.conf: one slot 0,7+11, ECDSA
 # P-256 only), on a TPM and a sealed firmware of its own: the identity is made
 # under it - the certificate through that slot, an ECDSA CA and host key - and the
 # image says which policy it was built with.
@@ -794,9 +794,9 @@ step_identity_policy() {
 	vm_ssh 'sudo safespace identity' >"$LOGS/identity-policy.out" 2>&1
 	vm_stop identity-policy
 	expect identity-policy combination=root identity=SAFEmachineID identity_created=1 hostkey_src=assh hostcert=yes assh_slot=0 \
-		cert_id=safespace_slot=0_pcrs=0,7,15_signed=11 after_ca_login=yes "${SEALED[@]}" || return
+		cert_id=safespace_slot=0_pcrs=0,7_signed=11 after_ca_login=yes "${SEALED[@]}" || return
 	id_check identity-policy "ECDSA P-256: the CA and the host key; the image names its policy" \
-		"grep -q '^@cert-authority \\* ecdsa-sha2-nistp256 ' '$WORK/ca_known_hosts' && grep -q 'host key: *ecdsa-sha2-nistp256 ' '$LOGS/identity-policy.out' && grep -q 'policy: *slots 0,7,15+11; machine-id 7,15+11; keys p256; bank auto' '$LOGS/identity-policy.out'"
+		"grep -q '^@cert-authority \\* ecdsa-sha2-nistp256 ' '$WORK/ca_known_hosts' && grep -q 'host key: *ecdsa-sha2-nistp256 ' '$LOGS/identity-policy.out' && grep -q 'policy: *slots 0,7+11; machine-id 7,15+11; keys p256; bank auto' '$LOGS/identity-policy.out'"
 }
 
 step_update() {
@@ -818,7 +818,7 @@ step_update() {
 	expect update-net combination="$first" netroot=1 dhcp=machine pretty="safespace_${VERSION}_$first" identity=SAFEmachineID identity_created=1 hostcert=yes assh_slot=0 after_ca_login=yes "${COMMON[@]}"
 	id_boot update-b --netboot --tree "$RUN/share" --no-server || return
 	vm_stop update-b
-	expect update-b combination="$first" netroot=1 dhcp=machine pretty="safespace_${VERSION_B}_$first" identity=SAFEmachineID identity_created=0 hostcert=yes assh_slot=0 cert_id=$ID_SLOT0 ca_login=yes "${COMMON[@]}"
+	expect update-b combination="$first" netroot=1 dhcp=machine pretty="safespace_${VERSION_B}_$first" identity=SAFEmachineID identity_created=0 hostcert=yes assh_slot=1 cert_id=$ID_SLOT1 ca_login=yes "${COMMON[@]}"
 	id_check update-b "the same machine-id after safespace update" "[[ '$(val update-b machine_id)' == '$mid' ]]"
 }
 

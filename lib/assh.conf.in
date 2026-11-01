@@ -15,17 +15,16 @@ ASSH_AUTHORITY_ONCE=yes
 ASSH_CA_REF="safespace identity"
 # The PCR bank (safespace.conf's PCR_BANK).
 ASSH_CA_BANK=@PCR_BANK@
-# The slots, tried in order (safespace.conf's IDENTITY_SLOTS). PCR 15 holds the
-# combination (the initrd's select, then identity's "sealed"): every slot is per
-# combination.
+# The slots, tried in order (safespace.conf's IDENTITY_SLOTS). PCR 15 is not in
+# them: the CA's own policy holds it at its open value - the combination as the
+# root sees it (select's "safespace-combination:<name>", identity's "sealed"),
+# given at the creation (identity: ca create --open-events) - so the CA is per
+# combination, and closed once its agent extends PCR 15.
 @SLOTS@
 # The build's PCR signing key (in the initrd, where the CA is made: lib/compose.sh
 # appends it) and its signatures of the booted UKI, as systemd hands them over.
 ASSH_PCR_KEY=/usr/local/lib/safespace/pcr.pem
 ASSH_PCR_SIGNATURE=/run/systemd/tpm2-pcr-signature.json
-# PCR 15 is also the window: the agent extends it once the host key is
-# certified, so the CA signs nothing more until the next boot.
-ASSH_CA_WINDOW=@PCR@
 ASSH_KEY_ID=safespace
 # The PCR state at the agent's start.
 ASSH_STATE=/run/assh/agent.pcrs.json

@@ -25,7 +25,9 @@ SETTINGS_EFI_GLOBAL=8be4df61-93ca-11d2-aa0d-00e098032b8c
 SETTINGS_CA_VAR=SAFEasshCA
 SETTINGS_ASSH_GUID=24415b90-39be-45c0-a9a3-d547ebe28ea0
 # The combination's PCR: measured once (select: "safespace-combination:<name>"),
-# closed after the identity ("safespace-identity:sealed"); aSSH's window too.
+# closed after the identity ("safespace-identity:sealed"). aSSH's CA is open
+# while it holds exactly these two (ca create --open-events) and closed by its
+# agent's extend ("assh-close").
 SETTINGS_PCR=15
 SETTINGS_COMBINATION_EVENT=safespace-combination:
 SETTINGS_SEALED_EVENT=safespace-identity:sealed
@@ -35,11 +37,12 @@ SETTINGS_OVERLAY=ro,metacopy=off,redirect_dir=off,index=off
 # The inventory ID: the machine-id hashed for this application (machine-id(5)).
 SETTINGS_APP_ID=eda1fc8c35e94e2087addff88d0b4e91
 
-# settings_pcrs WHAT SPEC: SPEC ("PCR,PCR...+PCR") into _PLAIN and _SIGNED
-# (comma separated), refused unless it holds PCR 7 and the combination's, and
-# signs only PCR 11. WHAT names it in the message.
+# settings_pcrs WHAT SPEC [slot]: SPEC ("PCR,PCR...+PCR") into _PLAIN and
+# _SIGNED (comma separated), refused unless it holds PCR 7, and signs only PCR
+# 11. The machine-id's seal must hold the combination's PCR; a slot of aSSH's
+# CA must not (the CA's policy holds it). WHAT names it in the message.
 settings_pcrs() {
-	local what=$1 spec=$2 p seen=,
+	local what=$1 spec=$2 kind=${3:-} p seen=,
 	[[ $spec =~ ^([0-9]+(,[0-9]+)*)(\+([0-9]+(,[0-9]+)*))?$ ]] ||
 		die "$what: '$spec' is not PCR,PCR,...[+PCR] (safespace.conf)"
 	_PLAIN=${BASH_REMATCH[1]} _SIGNED=${BASH_REMATCH[4]}
@@ -50,8 +53,13 @@ settings_pcrs() {
 		seen+=$p,
 	done
 	[[ ,$_PLAIN, == *,7,* ]] || die "$what: without PCR 7 (Secure Boot as at the creation) it holds with Secure Boot off"
-	[[ ,$_PLAIN, == *,$SETTINGS_PCR,* ]] ||
-		die "$what: without PCR $SETTINGS_PCR (the combination, aSSH's window) it is not per combination, and signs after the window closed"
+	if [[ $kind == slot ]]; then
+		[[ ,$_PLAIN,$_SIGNED, != *,$SETTINGS_PCR,* ]] ||
+			die "$what: PCR $SETTINGS_PCR is the CA's own (its open value: the combination; aSSH's close), not a slot's"
+	else
+		[[ ,$_PLAIN, == *,$SETTINGS_PCR,* ]] ||
+			die "$what: without PCR $SETTINGS_PCR (the combination) it is not per combination"
+	fi
 	[[ -z $_SIGNED || $_SIGNED == 11 ]] ||
 		die "$what: only PCR 11 can be signed (the build signs the UKI's PCR 11; systemd-stub hands over nothing else)"
 	return 0
@@ -62,7 +70,7 @@ settings_check() {
 	read -ra slots <<<"$IDENTITY_SLOTS"
 	((${#slots[@]})) || die "IDENTITY_SLOTS: no slot (safespace.conf)"
 	for s in "${slots[@]}"; do
-		settings_pcrs "IDENTITY_SLOTS, slot $n" "$s"
+		settings_pcrs "IDENTITY_SLOTS, slot $n" "$s" slot
 		n=$((n + 1))
 	done
 	settings_pcrs MACHINE_ID_PCRS "$MACHINE_ID_PCRS"
@@ -83,7 +91,7 @@ settings_write() { # DIR
 	settings_check
 	read -ra list <<<"$IDENTITY_SLOTS"
 	for s in "${list[@]}"; do
-		settings_pcrs slot "$s"
+		settings_pcrs slot "$s" slot
 		slots+="ASSH_CA_SLOT_$n=$_PLAIN"$'\n'
 		[[ -z $_SIGNED ]] || slots+="ASSH_CA_SLOT_${n}_SIGNED=$_SIGNED"$'\n'
 		n=$((n + 1))

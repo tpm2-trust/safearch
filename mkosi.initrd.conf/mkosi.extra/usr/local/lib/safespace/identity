@@ -24,10 +24,12 @@
 #    SetupMode=0) with neither variable, both, or neither: a new machine-id,
 #    sealed, checked (the signed policy type; an empty signature must not
 #    unseal); then 'assh ca create' - an authority that exists for this alone
-#    approves, for the root's state as it will be (PCR 15: the combination, then
-#    "safespace-identity:sealed"), slot 0 (PCR 0, 2, 7, 15; PCR 11 signed by the
-#    build) and slot 1 (PCR 7, 15), and is gone. The machine belongs to the
-#    combination booted. Only 'safespace identity clear' makes room for another.
+#    approves slot 0 (PCR 0, 2, 4, 7; PCR 11 signed by the build) and slot 1
+#    (PCR 7; PCR 11 signed), and is gone. The CA's own policy holds PCR 15 at the root's state as
+#    it will be (--open-events: the combination, then
+#    "safespace-identity:sealed"): it signs in this combination alone, and
+#    from this boot on, until its agent extends PCR 15. The machine belongs to
+#    the combination booted. Only 'safespace identity clear' makes room for another.
 #    One variable without the other: nothing is made (identity clear).
 # 2. Unseal SAFEmachineID into /run/safespace/identity/ (RAM; /run stays across
 #    the switch to the root; "released" lists it) and into /run/machine-id, which
@@ -41,7 +43,13 @@
 # 3. Always, also on errors: extend PCR 15 with "safespace-identity:sealed", so
 #    nothing unseals again in this boot. aSSH's agent finds PCR 15 so (the
 #    combination, then this) at every boot of the combination.
-# The boot never depends on this: every failure only means no identity.
+# The boot does not depend on the identity: every failure of 1 and 2 only means
+# no identity. It depends on 3: an extend that fails with a TPM present goes down
+# aSSH's ladder (assh close: PCR 15 again, the kill switch, PCR 7): any of it holds,
+# and the boot goes on without the identity. Only when all of it fails does this
+# script end with an error and the machine reboot (safespace-identity.service),
+# because any root process could unseal the machine-id again otherwise. Without a
+# TPM (--graceful) there is nothing to close.
 #
 # SAFESPACE_EFIVARS, SAFESPACE_RUN, SAFESPACE_PCREXTEND, SAFESPACE_CREDS,
 # SAFESPACE_IDENTITY_KEY, SAFESPACE_PCRSIG, SAFESPACE_MACHINE_ID,
@@ -60,7 +68,7 @@ OUT=$SELECT_RUN/identity
 MACHINE_ID=${SAFESPACE_MACHINE_ID:-/run/machine-id}
 ETC_MACHINE_ID=${SAFESPACE_ETC_MACHINE_ID:-/etc/machine-id}
 ASSH_CONF=/etc/assh/assh.conf
-# The build's PCR key, whose signatures of PCR 11 the CA's slot 0 takes
+# The build's PCR key, whose signatures of PCR 11 the CA's slots take
 # (assh.conf's ASSH_PCR_KEY: appended to this initrd by lib/compose.sh, beside
 # identity.pem).
 PCR_KEY=${0%/*}/pcr.pem
@@ -72,9 +80,12 @@ SIGNED_TYPE=5e2d5c7603724eaf843c6fb5f64098f5
 # settings (lib/settings.sh, from safespace.conf).
 
 close() {
-	"$SELECT_PCREXTEND" --graceful --pcr=$SAFESPACE_PCR "$SAFESPACE_SEALED_EVENT" >/dev/null 2>&1 ||
-		msg "WARNING: could not close PCR 15"
 	rm -rf "$OUT/.new"
+	"$SELECT_PCREXTEND" --graceful --pcr=$SAFESPACE_PCR "$SAFESPACE_SEALED_EVENT" >/dev/null 2>&1 && return
+	msg "could not extend PCR 15 ($SAFESPACE_SEALED_EVENT): aSSH's close"
+	"$ASSH" close --config $ASSH_CONF && return
+	msg "ERROR: could not close PCR 15 by any way: the machine reboots, the machine-id would stay open to a root process"
+	exit 1
 }
 trap close EXIT
 
@@ -147,7 +158,7 @@ if [ $have_mid = 0 ] && [ $have_ca = 0 ]; then
 		fi
 		if [ $ok = 1 ]; then
 			"$ASSH" ca create --config $ASSH_CONF \
-				--events "$SAFESPACE_PCR:$SAFESPACE_COMBINATION_EVENT$name" --events "$SAFESPACE_PCR:$SAFESPACE_SEALED_EVENT" >"$OUT/.new/ca.log" 2>&1 ||
+				--open-events "$SAFESPACE_COMBINATION_EVENT$name,$SAFESPACE_SEALED_EVENT" >"$OUT/.new/ca.log" 2>&1 ||
 				{ ok=0; msg "ERROR: creating the CA failed: $(tail -1 "$OUT/.new/ca.log")"; }
 		fi
 		if [ $ok = 1 ]; then
