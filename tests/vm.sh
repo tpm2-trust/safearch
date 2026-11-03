@@ -59,7 +59,9 @@
 #           one boot; SECOND again (persistent); clear -> FIRST. Side by side,
 #           every further combination in a VM of its own, its
 #           SafespaceSelectOnce written into a copy of the sealed variables
-#           (virt-fw-vars): that root opened, the variable deleted.
+#           (virt-fw-vars): that root opened, the variable deleted. A SafespaceSelect
+#           this build does not have: the first boots, safespace select says so,
+#           no identity made.
 #           A combination that is the first plus the group debug must have the
 #           first one's setuid/setgid files, file capabilities and enabled
 #           units (debug adds packages, nothing else). Every boot with Secure
@@ -549,6 +551,16 @@ step_select_once() { # INDEX
 	sel_boot "select-$n" "$combo" "! test -e /sys/firmware/efi/efivars/SafespaceSelectOnce-$SELECT_GUID"
 }
 
+# A preselection this build does not have, in a VM of its own: the first boots, the
+# machine says so, and no identity is made for a combination nobody chose.
+step_select_stale() {
+	if ! fw_var_set "$RUN/sealed-vars.fd" "$WORK/sealed-vars.fd" SafespaceSelect "$SELECT_GUID" not-in-this-build "$LOGS/select-stale.vars.log"; then
+		result FAIL select-stale "could not write SafespaceSelect (see ${LOGS#"$REPO"/}/select-stale.vars.log)"
+		return
+	fi
+	sel_boot select-stale "${COMBOS[0]}" "sudo safespace select | grep -q \"'not-in-this-build' is not in this build\" && ! test -e /sys/firmware/efi/efivars/SAFEmachineID-$SELECT_GUID"
+}
+
 # The machine identity (SECURITY.md, "Machine identity"), on a TPM of its own (swtpm,
 # test-vm.sh --tpm: its state stays in the step's work directory, like a real TPM)
 # and a copy of the sealed firmware of seal. The initrd makes it at the first sealed
@@ -736,12 +748,14 @@ step_identity_fails() {
 		{ result FAIL identity-agent-fails "could not damage SAFEasshCA (see ${LOGS#"$REPO"/}/identity-broken.vars.log)"; return; }
 	id_boot identity-agent-fails "$STICK" || return
 	vm_ssh 'sudo journalctl -b -u sshd-hostkeys -u assh-agent -o cat' >"$LOGS/identity-agent-fails.journal" 2>&1
+	vm_ssh 'sudo safespace identity clear --yes; ls /sys/firmware/efi/efivars | grep -c -E "^(SAFEasshCA|SAFEmachineID)-" || true' >"$LOGS/identity-agent-fails.clear" 2>&1
 	vm_stop identity-agent-fails
 	# assh-agent failed: the one failed unit, the system degraded.
 	expect identity-agent-fails combination="$first" hostkey_src=throwaway ca_login=no secure_boot=enabled* path_var=set usb_bootdev=1 \
 		root_ok=yes verity=verified state=degraded failed=1 lockdown=integrity slim=ok
 	# StandardOutput=journal+console: the journal here (the VM's /dev/console is its screen).
 	id_check identity-agent-fails "the fallback says the host key is a throwaway one, and why" "grep -q 'ssh host key: THROWAWAY (aSSH did not start' '$LOGS/identity-agent-fails.journal' && grep -q 'SAFEasshCA' '$LOGS/identity-agent-fails.journal'"
+	id_check identity-agent-fails "identity clear removes a CA it cannot read" "tail -1 '$LOGS/identity-agent-fails.clear' | grep -qx 0"
 }
 step_identity_sha1() {
 	local first other mid
@@ -897,6 +911,7 @@ if wants select; then
 		KEY=20-select result FAIL select "no sealed firmware variables (the step seal failed)"
 	else
 		job 20-select step_select
+		job 19-select-stale step_select_stale
 		for ((i = 2; i < ${#COMBOS[@]}; i++)); do
 			job "$((19 + i))-select-${COMBOS[i]%%:*}" step_select_once "$i"
 		done

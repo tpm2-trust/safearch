@@ -148,10 +148,11 @@ confirm() { # QUESTION
 select_show() {
 	row combinations "" "${NAMES[*]}"
 	row booted "$(identity_state)" "$(booted)"
-	local p o
-	p=$(sel_var $SAFESPACE_SELECT_VAR) o=$(sel_var $SAFESPACE_SELECT_ONCE_VAR)
+	local p o f
+	p=$(sel_var $SAFESPACE_SELECT_VAR) o=$(sel_var $SAFESPACE_SELECT_ONCE_VAR) f=$(select_fallback)
 	row preselected "" "${p:-$FIRST (none set)}"
 	[[ -z $o ]] || row "next boot" noidentity "$o (once)"
+	[[ -z $f ]] || row fallback none "'$f' is not in this build: this boot took the first; while it is set: sudo safespace select --default, or select another"
 }
 
 select_cmd() {
@@ -320,7 +321,9 @@ identity_show() {
 		row machine-id noidentity "throwaway (no identity)"
 	fi
 	if [[ ! -e $CA_VAR ]]; then
-		if sealed; then
+		if [[ -n $(select_fallback) ]]; then
+			row identity noidentity "none: a boot that fell back makes none; the next without a fallback does"
+		elif sealed; then
 			row identity noidentity "none yet: the next boot makes it"
 		else
 			row identity none "none: Secure Boot is not on (sudo safespace seal, then switch it on)"

@@ -30,7 +30,8 @@
 #    "safespace-identity:sealed"): it signs in this combination alone, and
 #    from this boot on, until its agent extends PCR 15. The machine belongs to
 #    the combination booted. Only 'safespace identity clear' makes room for another.
-#    One variable without the other: nothing is made (identity clear).
+#    One variable without the other: nothing is made (identity clear). Nor on a boot
+#    that fell back from a stale preselection (select): nobody chose this combination.
 # 2. Unseal SAFEmachineID into /run/safespace/identity/ (RAM; /run stays across
 #    the switch to the root; "released" lists it) and into /run/machine-id, which
 #    PID 1 takes over, and the initrd's /etc/machine-id: written in place (PID 1
@@ -137,7 +138,10 @@ have_mid=0 have_ca=0
 [ -e "$(var_path $SAFESPACE_MID_VAR)" ] && have_mid=1
 [ -e "$SELECT_VARS/$SAFESPACE_CA_VAR" ] && have_ca=1
 if [ $have_mid = 0 ] && [ $have_ca = 0 ]; then
-	if [ "$(global_byte SecureBoot)" != 1 ] || [ "$(global_byte SetupMode)" != 0 ]; then
+	if [ -e "$SELECT_RUN/combination-fallback" ]; then
+		# The machine would belong to a combination nobody chose.
+		msg "no identity made: this boot fell back from a preselection this build does not have"
+	elif [ "$(global_byte SecureBoot)" != 1 ] || [ "$(global_byte SetupMode)" != 0 ]; then
 		msg "no identity: Secure Boot is off (seal the machine first)"
 	elif [ ! -s "$PCR_KEY" ]; then
 		msg "ERROR: no PCR signing key in the initrd (pcr.pem): no identity made"

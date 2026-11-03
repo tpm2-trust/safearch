@@ -7,8 +7,11 @@ if [[ $- == *i* && -t 1 ]]; then
 	# In subshells: nothing of state.sh stays in the login shell.
 	(
 		. /usr/local/lib/safespace/state.sh || exit
-		st=$(identity_state) c=$(state_colour "$st") n='\e[0m'
+		st=$(identity_state) c=$(state_colour "$st") n='\e[0m' f=$(select_fallback)
+		[[ -z $f ]] || printf '\e[1;31m%s: the preselection %s is not in this build, the first combination booted: safespace select shows it\e[0m\n' "$__safespace_c" "$f"
+		[[ -z $f || $st != noidentity ]] || st=noidentity-fallback
 		case $st in
+			noidentity-fallback) printf "${c}%s: no identity: a boot that fell back makes none${n}\n" "$__safespace_c" ;;
 			green) printf "${c}%s: the machine's identity, certified through slot 0 (firmware as at the creation, a signed build)${n}\n" "$__safespace_c" ;;
 			purple)
 				printf "${c}%s: the machine's identity, certified through slot %s: the firmware, an option ROM or the build changed since the identity was made${n}\n" "$__safespace_c" "$(certified_slot)"

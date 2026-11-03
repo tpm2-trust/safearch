@@ -33,7 +33,7 @@ block of the root as it is read.
 | **No extension images** (`systemd.sysext=0`, `systemd.confext=0`, `rd.` variants; units masked in the system and the initrd) | sysext/confext images on the unverified ESP overlaying `/usr` or `/etc` | `mkosi.conf`, `mkosi.extra/`, `mkosi.initrd.conf/mkosi.extra/` |
 | **Strict credentials** (`systemd.credentials_boot_policy=strict`) | credentials "encrypted" with the null key from the ESP (e.g. a planted `systemd.extra-unit.*` = root code) | `mkosi.conf` |
 | **Signed expected PCR 11 values** (own PCR key, not the db key) | lets the TPM bind secrets to "a signed safespace UKI booted"; rotating one key doesn't touch the other | `mkosi.conf` `SignExpectedPcr=` |
-| **Combinations:** the EFI variables / `safespace.select=` only *name* a combination; its layers and their hashes come from the signed command line; an unknown name, or a combination naming a layer without a hash, stops the boot; without `safespace.root.<name>=` on the command line nothing is opened (no `roothash=` fallback) | choosing an unsigned root, or composing another stack, through the selection | `mkosi.initrd.conf/.../select` |
+| **Combinations:** the EFI variables / `safespace.select=` only *name* a combination; its layers and their hashes come from the signed command line; a variable naming a combination this build does not have boots the first, measured under the first's name, said on the console, in `safespace` and at the login, and makes no new identity (it gives nothing the variable could not choose anyway); an unknown `safespace.select=`, or a combination naming a layer without a hash, stops the boot; without `safespace.root.<name>=` on the command line nothing is opened (no `roothash=` fallback) | choosing an unsigned root, or composing another stack, through the selection | `mkosi.initrd.conf/.../select` |
 
 ## Running kernel
 
@@ -256,6 +256,7 @@ yes`) logs in or is refused in every boot.
 | In it: decrypt the machine-id with the UKI's signatures, also after `systemd-pcrextend --pcr=15 safespace-combination:root` | refused |
 | … `systemctl restart assh-agent` | temporary key ("PCR 15 not as approved": the window), sshd restarted with it, the client refused, the state of the boot's first start kept |
 | `containers` once | temporary key, machine-id not released (another one), nothing made; its root can't unseal; the login says TEMPORARY |
+| A new machine, `SafespaceSelect` naming a combination the build does not have | the first combination boots, `safespace select` says so, no identity made |
 | Network boot, same firmware variables and TPM | slot 1: PCR 0 differs (test-vm.sh starts OVMF with other fw_cfg settings for a network boot) |
 | An option ROM more (an e1000e NIC: PCR 2) | slot 1 (`safespace slot=1 pcrs=7,15`), the login purple |
 | Another certificate added to db (`virt-fw-vars --add-db`: PCR 7) | temporary key, machine-id not released, nothing made |
@@ -263,7 +264,7 @@ yes`) logs in or is refused in every boot.
 | `safespace select containers` without a terminal | the identity stays (`select` asks only on a terminal) |
 | `safespace select containers --clear-identity`, back to `root`, then a boot | the identity removed; the next boot makes a new one: a new CA (the old line refused), a new machine-id, slot 0 |
 | The console before the login (`agetty --show-issue`), certified and temporary | the `safespace` overview with the host key sshd serves in full |
-| `SAFEasshCA` damaged (the agent fails) | sshd up with a throwaway key; the console says why |
+| `SAFEasshCA` damaged (the agent fails) | sshd up with a throwaway key; the console says why; `safespace identity clear` removes it |
 | A new TPM with the SHA-1 bank only | nothing made, the temporary key; `safespace tpm sha1 on`, a boot: the identity made on SHA-1, slot 0; `tpm sha1 off`: neither released nor certified |
 | **`safespace update`** on a network-booted machine (the identity made in that boot path) | "up to date" while the server has A; with B in the share: B's `release` checked against `db.pem`, reboot; B's boot slot 0, the same CA and machine-id |
 | The stick boot without a TPM (step `stick`) | throwaway ed25519 host key (`sshd-hostkeys.service`) |
@@ -317,7 +318,7 @@ boot share PCR 0.
 `tests/run.sh` (no root): manipulated, unsigned and foreign-signed releases, wrong partition
 tables, combinations with a changed root or a forged `COMBINATIONS=`, releases with a
 db-signed UKI that lacks the lockdown or is single-root, every refusal of `compose_check`,
-the selection order and its missing fallback, the selection measured exactly once, the
+the selection order, a stale preselection's fallback, no `roothash=` fallback, the selection measured exactly once, the
 composed UKI's identity signature (only `enter-initrd`), the rrsync confinement, the units' sandbox syntax, the initrd only calling programs it
 contains. `tests/vm.sh` (QEMU): in every boot the root is `verified`, lockdown is
 `integrity`, no unit failed; stick read-only, sealing, booting with enforced Secure Boot, every

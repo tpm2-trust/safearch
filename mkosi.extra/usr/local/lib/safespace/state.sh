@@ -27,6 +27,11 @@ MID_VAR=$EFIVARS/$SAFESPACE_MID_VAR-$SAFESPACE_GUID
 # lines, or sshd-hostkeys.service's throwaway key).
 STATUS=${SAFESPACE_RUNDIR:-/run}/assh/status
 SSHD_HOSTKEY=${SAFESPACE_RUNDIR:-/run}/safespace/sshd-hostkey.conf
+# The preselection this boot could not follow (the initrd's select).
+FALLBACK=${SAFESPACE_RUNDIR:-/run}/safespace/combination-fallback
+
+# The name of that preselection; "" for none.
+select_fallback() { cat "$FALLBACK" 2>/dev/null || true; }
 
 # Value byte of a global UEFI variable (after the 4-byte attribute header);
 # "" where the firmware has none (no Secure Boot), also under pipefail.

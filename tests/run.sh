@@ -761,13 +761,21 @@ if wanted compose && fixtures && efivar_tool; then
 	check "select: SafespaceSelectOnce wins over SafespaceSelect" t_select "$CL" root containers "root:base"
 	check "... and is deleted" test ! -e "$EV/SafespaceSelectOnce-$SG"
 	check "select: safespace.select= on the command line wins" t_select "$CL safespace.select=containers" root "" "containers:base docker"
-	refuse "select: an unknown name stops the boot" t_select "$CL" "" nope ""
+	check "select: a preselection this build does not have boots the first" t_select "$CL" "" nope "root:base"
+	check "... recorded for the root and identity" bash -c '[[ $(cat "$1/combination-fallback") == nope ]]' _ "$SR"
+	check "... and only the first is measured" bash -c '[[ $(cat "$1") == "--graceful --pcr=15 safespace-combination:root" ]]' _ "$W/pcrextend.log"
+	check "select: ... a SafespaceSelectOnce likewise" t_select "$CL" nope containers "root:base"
+	check "... and it is deleted" test ! -e "$EV/SafespaceSelectOnce-$SG"
+	t_no_fallback() { t_select "$CL" "" containers "containers:base docker" && test ! -e "$SR/combination-fallback"; }
+	check "select: a preselection this build has records no fallback" t_no_fallback
+	refuse "select: an unknown safespace.select= stops the boot (the signed command line is wrong)" t_select "$CL safespace.select=nope" "" "" ""
+	refuse "select: a fallback whose first combination has a layer without hash stops the boot" t_select "ro safespace.layer.base=$H1 safespace.root.root=base,xfce" "" nope ""
 	check "select: a variable that is no name is ignored" t_select "$CL" "" 'x;rm' "root:base"
 	check "select: a variable cannot name layers (only a combination of the signed command line)" t_select "$CL" "" "base,docker" "root:base"
 	refuse "select: a combination naming a layer without a signed root hash stops the boot" t_select "$CL safespace.root.evil=base,xfce" "" evil ""
 	refuse "select: ... and one with an empty layer in its chain" t_select "$CL safespace.root.evil=base,,docker" "" evil ""
 	refuse "select: roothash= alone stops the boot (no fallback)" t_select "ro roothash=$H1" "" "" ""
-	refuse "select: a variable cannot add a root (no hash of its own)" t_select "$CL" "" "x$H1" ""
+	check "select: a variable cannot add a root (no hash of its own): the first boots" t_select "$CL" "" "x$H1" "root:base"
 	t_select "$CL" "" containers "containers:base docker" >/dev/null
 	check "select: the choice is measured into PCR 15 before it is used" bash -c '[[ $(cat "$1") == "--graceful --pcr=15 safespace-combination:containers" ]]' _ "$W/pcrextend.log"
 	check "... and recorded in /run/safespace/combination" bash -c '[[ $(cat "$1/combination") == containers ]]' _ "$SR"
@@ -775,8 +783,8 @@ if wanted compose && fixtures && efivar_tool; then
 	check "select: measured only once per boot" t_twice
 	t_failmeasure() { PCREXT_FAIL=1 t_select "$CL" "" "" "root:base"; }
 	check "select: a failing measurement does not stop the boot" t_failmeasure
-	t_unknown_measured() { t_select "$CL" "" nope ""; test -e "$W/pcrextend.log"; }
-	refuse "select: an unknown name is not measured" t_unknown_measured
+	t_unknown_measured() { t_select "$CL safespace.select=nope" "" "" ""; test -e "$W/pcrextend.log"; }
+	refuse "select: an unknown safespace.select= is not measured" t_unknown_measured
 	t_unhashed_measured() { t_select "$CL safespace.root.evil=base,xfce" "" evil ""; test -e "$W/pcrextend.log"; }
 	refuse "select: ... nor a combination with a layer without hash" t_unhashed_measured
 	t_chosen() { # CMDLINE (after a choice of containers): what the boot paths take
@@ -834,6 +842,7 @@ if wanted compose && fixtures && efivar_tool; then
 		printf '\x06\x00\x00\x00\x0'"$2" >"$EV/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
 		printf '\x06\x00\x00\x00\x0'"$3" >"$EV/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c"
 		[[ -z $1 ]] || echo "$1" >"$IR/run/combination"
+		[[ -z ${T_FALLBACK:-} ]] || echo "$T_FALLBACK" >"$IR/run/combination-fallback"
 		# PID 1's /etc/machine-id: a bind mount of /run/machine-id (here: a hard link)
 		[[ -z ${T_BIND:-} ]] || { echo uninitialized >"$IR/machine-id" && ln "$IR/machine-id" "$IR/etc-machine-id"; }
 		env "${@:5}" \
@@ -867,6 +876,10 @@ if wanted compose && fixtures && efivar_tool; then
 	check "identity: Secure Boot off: nothing made (and PCR 15 closed)" t_id_sboff
 	t_id_setup() { rm -rf "$EV"; t_id containers 1 1 "$W/sig-good.json"; [[ ! -e $EV/SAFEmachineID-$SG && ! -e $EV/$CAV ]]; }
 	check "identity: Setup Mode: nothing made" t_id_setup
+	t_id_fallback() { rm -rf "$EV"; T_FALLBACK=nope t_id root 1 0 "$W/sig-good.json"; [[ ! -e $EV/SAFEmachineID-$SG && ! -e $EV/$CAV && ! -e $IR/machine-id && ! -e $W/assh.log ]] && grep -q 'identity:sealed' "$W/pcrextend.log"; }
+	check "identity: a boot that fell back from a stale preselection: nothing made (and PCR 15 closed)" t_id_fallback
+	t_id_fallback_own() { rm -rf "$EV"; t_id root 1 0 "$W/sig-good.json" && cp "$IR/machine-id" "$W/mid-fb" && T_FALLBACK=nope t_id root 1 0 "$W/sig-good.json" && cmp -s "$IR/machine-id" "$W/mid-fb"; }
+	check "identity: ... an identity of the first combination is released as usual" t_id_fallback_own
 	t_id_other() {
 		rm -rf "$EV"; t_id containers 1 0 "$W/sig-good.json" || return 1
 		local h=$(var_hash SAFEmachineID)
@@ -964,6 +977,8 @@ if wanted compose && fixtures && efivar_tool; then
 	check "state: Secure Boot off: unsealed" t_state 0 0 0 'key=x\ncertified=no\n' unsealed
 	check "state: Setup Mode: unsealed" t_state 1 1 0 'key=x\ncertified=no\n' unsealed
 	check "state: no status of aSSH: throwaway" t_state 1 0 1 - throwaway
+	t_state_fallback() { mkdir -p "$SR2/safespace" && echo nope >"$SR2/safespace/combination-fallback"; [[ $(SAFESPACE_EFIVARS=$SE SAFESPACE_RUNDIR=$SR2 bash -c 'set -Eeuo pipefail; . "$1"; select_fallback' _ "$ST") == nope ]] || return 1; rm "$SR2/safespace/combination-fallback"; [[ -z $(SAFESPACE_EFIVARS=$SE SAFESPACE_RUNDIR=$SR2 bash -c 'set -Eeuo pipefail; . "$1"; select_fallback' _ "$ST") ]]; }
+	check "state: the fallback's name, none without one" t_state_fallback
 	t_novars() { # firmware without Secure Boot: no variables, and safespace runs under pipefail
 		rm -rf "$SE" "$SR2"; mkdir -p "$SE" "$SR2/assh"; echo certified=no >"$SR2/assh/status"
 		[[ $(SAFESPACE_EFIVARS=$SE SAFESPACE_RUNDIR=$SR2 bash -c 'set -Eeuo pipefail; . "$1"; sb=$(var_byte SecureBoot); identity_state' _ "$ST") == unsealed ]]

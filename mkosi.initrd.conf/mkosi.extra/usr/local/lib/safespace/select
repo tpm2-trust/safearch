@@ -15,10 +15,14 @@
 # (set with safespace select on the running system). The variables only name a
 # combination; its layers and their root hashes always come from the signed
 # command line, so a changed variable can select another signed combination,
-# never an unsigned layer or another stack. An unknown name, or a combination
-# naming a layer without a hash, stops the boot: a wrong preselection must not
-# go unnoticed. Without any safespace.root.* there is nothing to open: the boot
-# stops too (roothash= is never used, so no other root hash can come into play).
+# never an unsigned layer or another stack. A variable naming a combination this
+# build does not have (renamed, removed) boots the first, as without a selection:
+# the name is recorded in /run/safespace/combination-fallback, so the wrong
+# preselection does not go unnoticed (safespace, the login) and identity makes no
+# new identity on it. What only the signed command line can get wrong stops the
+# boot: an unknown safespace.select=, a combination naming a layer without a hash,
+# no safespace.root.* at all (roothash= is never used, so no other root hash can
+# come into play).
 #
 # The decided name is measured into PCR 15 ("safespace-combination:<name>")
 # before it is used, and recorded in /run/safespace/combination: the machine's
@@ -79,6 +83,14 @@ select_layers() { # NAME
 	done
 }
 
+# NAME among the combinations on the signed command line ($names).
+select_known() { # NAME
+	case " $names " in
+		*" $1 "*) return 0 ;;
+	esac
+	return 1
+}
+
 select_root() {
 	SELECT_NAME="" SELECT_LAYERS=""
 	names=$(printf '%s\n' "$cmdline" | tr ' ' '\n' | sed -n 's/^safespace\.root\.\([a-z][a-z0-9-]*\)=[a-z][a-z0-9,-]*$/\1/p' | tr '\n' ' ')
@@ -99,6 +111,13 @@ select_root() {
 	case $want in
 		*[!a-z0-9-]*) msg "ERROR: invalid combination name '$want' ($from)"; return 1 ;;
 	esac
+	if [ "$from" != "the command line" ] && ! select_known "$want"; then
+		msg "WARNING: $from names '$want', which is not in this build (it has: $names): booting the first; sudo safespace select --default, or select another"
+		mkdir -p "$SELECT_RUN" && printf '%s\n' "$want" >"$SELECT_RUN/combination-fallback" ||
+			msg "WARNING: cannot record the fallback"
+		from="$from names '$want', not in this build: the first"
+		want=${names%% *}
+	fi
 	select_layers "$want" || { msg "($from)"; return 1; }
 	SELECT_NAME=$want
 	msg "combination $want ($from), layers $SELECT_LAYERS"
