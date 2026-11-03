@@ -309,11 +309,13 @@ all combinations and keeps Arch's name.
 So a machine is sealed once on the default (`safespace seal`), then preselected. The variable
 only **names** a combination; its root hash always comes from the signed command line, so
 whoever can write the variable (root on the machine, or the firmware setup without a
-password) can choose between the signed roots, never boot an unsigned one. An unknown name
-stops the boot with a message instead of falling back silently: renaming a combination in
-`COMBINATIONS` stops machines preselected to the old name (`safespace select --default`
-before the update). The choice is measured into the TPM (PCR 15): only the combination a
-sealed machine belongs to gets its identity ([Machine identity](#machine-identity)).
+password) can choose between the signed roots, never boot an unsigned one. A variable naming
+a combination this build does not have (renamed or removed in `COMBINATIONS`) boots the first
+combination, and says so on the console, in `safespace` and at the login until the variable is
+changed (`safespace select --default`, or another name). Such a boot makes no new identity. An
+unknown `safespace.select=` still stops the boot: that is the signed command line itself. The
+choice is measured into the TPM (PCR 15): only the combination a sealed machine belongs to gets
+its identity ([Machine identity](#machine-identity)).
 
 Tested by `tests/run.sh` (sections `compose`: the composed UKI and every check of
 `compose_check`, the selection order; `netroot`: only the selected root downloaded; `stick`,
@@ -649,7 +651,7 @@ tests/vm.sh --no-build --jobs 2      # at most two VMs at a time
 | `net` | UEFI HTTP boot of the share | `netroot` opened the root, no `usb-bootdev`, no `LoaderDevicePartUUID`, `verified`, `running` |
 | `seal` | Setup Mode → `safespace seal` → the sealed firmware | Secure Boot `enabled (user)`, `verified`, `running` |
 | `net-sb` | network boot with enforced Secure Boot | Secure Boot enabled, `verified`, `running` |
-| `select` | on the sealed firmware, one VM, one boot after the other: no selection, `safespace select <second>`, `once <first>`, the second again (persistent), `clear`, the first again. Side by side, every further combination in a VM of its own: `SafespaceSelectOnce=<name>` written into a copy of the sealed variables (`virt-fw-vars`) | the booted combination's name (the initrd's choice, `/usr/lib/safespace/combination`, `PRETTY_NAME`, the login banner) and groups (`/usr/lib/safespace/groups`; the docker command exactly with the docker group); a preset `SafespaceSelectOnce` deleted by the initrd; `debug` has exactly the default's setuid/setgid files, file capabilities and enabled units; each Secure Boot enabled and `verified` |
+| `select` | on the sealed firmware, one VM, one boot after the other: no selection, `safespace select <second>`, `once <first>`, the second again (persistent), `clear`, the first again. Side by side, every further combination in a VM of its own: `SafespaceSelectOnce=<name>` written into a copy of the sealed variables (`virt-fw-vars`) | the booted combination's name (the initrd's choice, `/usr/lib/safespace/combination`, `PRETTY_NAME`, the login banner) and groups (`/usr/lib/safespace/groups`; the docker command exactly with the docker group); a preset `SafespaceSelectOnce` deleted by the initrd; a `SafespaceSelect` the build does not have: the first boots, `safespace select` says so, no identity made; `debug` has exactly the default's setuid/setgid files, file capabilities and enabled units; each Secure Boot enabled and `verified` |
 | `identity` | on a TPM of its own (swtpm, `test-vm.sh --tpm`) and a copy of the sealed firmware, the first two boots first, then each further case side by side on a copy of their TPM and variables, with a client that trusts only the CA (`@cert-authority`, `StrictHostKeyChecking yes`): the first sealed boot, the default again, `containers` once, over the network, an option ROM more (PCR 2), another db certificate (PCR 7), the stick of a second build (B, built while A boots), `safespace identity clear`, the agent failing; beside them a new TPM with the SHA-1 bank only (`--tpm-banks sha1`); last `safespace update` on a network boot (B into the share) | first boot: the initrd makes the machine-id and the CA at once, certified through slot 0 in the same boot; the default again: slot 0, the same machine-id, an agent restart gets no certificate (window closed; sshd restarts with it, the first state is kept), its root can't unseal the machine-id (also not after extending PCR 15); `containers`: temporary key, nothing released; network, PCR 2: slot 1; PCR 7: temporary; build B: slot 0 with no step, the same CA and machine-id; identity clear: the next boot a new CA (the old line refused) and machine-id; the agent failing: the throwaway key, the reason on the console; SHA-1 only: without `safespace tpm sha1 on` nothing made, with it the identity on SHA-1, after `tpm sha1 off` neither; `safespace update`: up to date, then B checked and booted, slot 0, the same CA and machine-id; build C (`tests/vm.policy.conf`: one slot `0,7,15+11`, `KEY_TYPES=p256`) on a new TPM: the identity made under that policy - certified through that slot, an ECDSA CA and host key, `safespace identity` names the policy ([Machine identity](#machine-identity)) |
 
 **Kept apart from everything real**, in `mkosi.test/vm/` (gitignored): the test user

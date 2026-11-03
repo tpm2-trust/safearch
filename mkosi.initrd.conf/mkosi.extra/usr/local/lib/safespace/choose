@@ -3,8 +3,9 @@
 # script), once, before anything uses it: the machine's identity (released
 # before the network, so DHCP asks as the machine) and the boot path
 # (usb-bootdev or netroot, which open the chosen one's root). Started by
-# safespace-select.service. An unknown or missing combination stops the boot:
-# both boot paths require this.
+# safespace-select.service. No combination to open stops the boot (a preselection
+# this build does not have only falls back to the first: select): both boot paths
+# require this.
 
 msg() {
 	echo "safespace-select: $*" >/dev/kmsg 2>/dev/null

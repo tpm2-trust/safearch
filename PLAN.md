@@ -21,6 +21,36 @@ configuration on the build host (2f20ca7).
 
 ---
 
+# PLAN: a stale preselection boots the first combination
+
+Status: **done**, `tests/run.sh` 348 passed, 0 failed; `tests/vm.sh` after acknowledgement.
+
+## Goal
+
+A `SafespaceSelect` or `SafespaceSelectOnce` naming a combination this build does not have
+no longer stops the boot: the first combination boots, and the wrong preselection stays
+visible. Replaces the stop documented in `select`, README and SECURITY.md.
+
+## Steps
+
+- [x] 1. `select`: an unknown name from a variable boots the first combination (measured under
+      its own name), recorded in `/run/safespace/combination-fallback`.
+- [x] 2. `identity`: no new identity on such a boot; an existing one of the first combination
+      is released as usual.
+- [x] 3. `safespace`, `state.sh`, the login: say so.
+- [x] 4. `tests/run.sh`; a stale-variable boot in `tests/vm.sh`.
+- [x] 5. README, SECURITY.md.
+
+Still stopping the boot: an unknown `safespace.select=`, a chain with a malformed entry or a
+layer without a hash, no `safespace.root.*`, a dm-verity refusal. Failures after the choice
+(a download, too little RAM) are out of scope: PCR 15 is already extended by then.
+
+## What breaks
+
+Nothing to redo on a machine. A stale preselection no longer stops the boot.
+
+---
+
 # PLAN: PCR 15 hardening and the one PCR rule (feat/close-pcr15)
 
 Status: **done**, `tests/run.sh` passes; `tests/vm.sh` after acknowledgement. The
