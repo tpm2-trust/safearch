@@ -45,4 +45,4 @@ mkosi.initrd.conf/mkosi.extra/usr/local/lib/safespace/settings
 mkosi.test/
 
 # Not part of this repository: a separate checkout lives here locally.
-/tpm2-kira/
+/kira/
