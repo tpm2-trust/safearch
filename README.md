@@ -901,8 +901,14 @@ network alike), see [Secure Boot keys](#secure-boot-keys).
 
 1. Firmware setup: "Reset to Setup Mode" or "Clear Secure Boot keys". Boot the stick (Secure
    Boot can't be enforced without keys, so it boots).
-2. `sudo safespace seal`: shows what's enrolled now and what will be enrolled, asks for YES,
-   writes db, KEK and finally PK (writing PK ends Setup Mode).
+2. `sudo safespace seal`: shows what's enrolled now and what will be enrolled - each
+   certificate with its SHA-256 fingerprint -, asks for YES, writes db, KEK and finally PK
+   (writing PK ends Setup Mode). **Compare the fingerprints with those `build.sh` printed
+   at the end of the build before you answer.** A machine in Setup Mode boots any stick,
+   and a stick enrolls the keys it carries: nothing else tells a stick of yours from one
+   that came from another server or was changed on the way (`burn.sh` writes what it is
+   given; the build is what establishes the trust). A subject line can be copied, a
+   fingerprint cannot.
 3. Reboot, check that Secure Boot is enabled in the firmware setup, and set a firmware
    password.
 

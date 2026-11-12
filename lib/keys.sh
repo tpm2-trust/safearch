@@ -82,6 +82,16 @@ keys_mkosi_args() {
 
 keys_fingerprint() { openssl x509 -in "$1" -noout -fingerprint -sha256 | cut -d= -f2; }
 
+# The exported certificates' SHA-256 fingerprints, as `safespace seal` shows
+# them before it enrolls: a subject can be copied, a fingerprint cannot. What
+# the build prints is what the owner compares with at the machine.
+keys_fingerprints() { # DIR
+	local k
+	for k in PK KEK db; do
+		printf '  %-4s SHA-256 %s\n' "$k" "$(keys_fingerprint "$1/$k.pem")"
+	done
+}
+
 # Every signed build ships the public half of the keys it is signed with, so
 # safespace seal can enroll them on a machine in Setup Mode. Written anew on
 # every build, so the image can never carry the keys of another key set.

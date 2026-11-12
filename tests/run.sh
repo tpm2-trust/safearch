@@ -403,6 +403,17 @@ if wanted keys && fixtures && need cert-to-efi-sig-list sign-efi-sig-list; then
 		keys_export "$W/export"
 	)
 	check "dedicated sbctl key set: load and export" t_export
+	t_fingerprints() {
+		local out k
+		out=$(source "$REPO/lib/keys.sh"; keys_fingerprints "$W/export") || return 1
+		for k in PK KEK db; do
+			grep -qx "  $(printf '%-4s' $k) SHA-256 $(openssl x509 -in "$KD/$k/$k.pem" -noout -fingerprint -sha256 | cut -d= -f2)" <<<"$out" || return 1
+		done
+		# seal computes them the same way, and the build prints them.
+		grep -q 'SHA-256 %s.*-fingerprint -sha256' "$REPO/mkosi.extra/usr/local/sbin/safespace" &&
+			grep -q '^keys_fingerprints "\$DB_EXPORT"' "$REPO/build.sh"
+	}
+	check "the keys' SHA-256 fingerprints: the build prints what seal shows" t_fingerprints
 	check "export holds exactly the public files" bash -c '[[ $(ls "$1" | tr "\n" " ") == "db-append.auth db.auth db.pem GUID KEK-append.auth KEK.auth KEK.pem PK.auth PK.pem " ]]' _ "$W/export"
 	refuse "no private key in the export" grep -rq 'PRIVATE KEY' "$W/export"
 	ac() { [[ $(python3 -I "$REPO/tests/lib/authcheck.py" "$W/export/$1.auth" "$2" "$KD/$3/$3.pem") == *"['$4']" ]]; }
