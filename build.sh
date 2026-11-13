@@ -395,4 +395,6 @@ if [[ -n ${SUDO_UID:-} ]]; then
 	chown -R "$SUDO_UID:$SUDO_GID" "$OUTDIR"
 fi
 log "Build $BUILD in ${OUTDIR#"$HERE"/} (${COMBO_NAMES[*]})"
+log "Its Secure Boot keys - 'safespace seal' shows these fingerprints before it enrolls; compare them there:"
+keys_fingerprints "$DB_EXPORT"
 log "Next: ./release.sh --build $BUILD (to the distribution servers), sudo ./burn.sh $BUILD /dev/sdX (a stick)"
